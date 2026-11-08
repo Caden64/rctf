@@ -8,23 +8,29 @@ set -u
 . "$EDGE/lib/assert.sh"
 PIDS=()
 AGENT_PID=
+AGENT_TICKS=
+AGENT_EXE=
 TRAEFIK_PID=
+TRAEFIK_TICKS=
+TRAEFIK_EXE=
 IDA=
 IDB=
 IDC=
 
-kill_matching() { # unique instance id -> its firecracker pids only
-  local id=$1 p
-  for p in $(pgrep -f "firecracker.*--id $id" 2>/dev/null || true); do
-    kill -9 "$p" 2>/dev/null || true
-  done
-}
+# 80 random bits per id, so two concurrent runs can never share an id (and a
+# leaked process from one run can never be matched by the other). Still within
+# the 16-32 lowercase-alphanumeric instance-id contract.
+rand_hex() { od -An -N10 -tx1 /dev/urandom | tr -d ' \n'; }
+
+# Every child is signalled only after its identity is verified, and every one
+# is waited for: no `pkill`/`pgrep` name patterns, because `unshare -Urn` does
+# not isolate PIDs and this machine runs other suites concurrently.
 cleanup() {
   set +e
-  [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null
-  [ -n "$TRAEFIK_PID" ] && kill "$TRAEFIK_PID" 2>/dev/null
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
-  for id in $IDA $IDB $IDC; do kill_matching "$id"; done
+  kill_verified "$AGENT_PID" "$AGENT_TICKS" "$AGENT_EXE" "$RUN/agent/agent.yaml"
+  kill_verified "$TRAEFIK_PID" "$TRAEFIK_TICKS" "$TRAEFIK_EXE" "$RUN/agent/traefik-static.yml"
+  for pid in "${PIDS[@]}"; do kill_child "$pid"; done
+  reap_firecracker "$RUN/agent/state" "$RUN"
 }
 trap cleanup EXIT INT TERM
 
@@ -98,6 +104,8 @@ providers:
 EOF
 "$TRAEFIK" --configFile="$RUN/agent/traefik-static.yml" \
   >>"$RUN/logs/traefik.log" 2>&1 & TRAEFIK_PID=$!
+TRAEFIK_TICKS=$(proc_start_ticks "$TRAEFIK_PID" 2>/dev/null || true)
+TRAEFIK_EXE=$(proc_exe_basename "$TRAEFIK_PID" 2>/dev/null || true)
 
 # --- real agent (direct mode; jailer needs real root) ----------------------
 cat >"$RUN/agent/agent.yaml" <<EOF
@@ -133,6 +141,8 @@ network:
 EOF
 ( cd "$REPO" && exec bun apps/firecracker-instancer/src/agent/index.ts "$RUN/agent/agent.yaml" ) \
   >>"$RUN/logs/agent.log" 2>&1 & AGENT_PID=$!
+AGENT_TICKS=$(proc_start_ticks "$AGENT_PID" 2>/dev/null || true)
+AGENT_EXE=$(proc_exe_basename "$AGENT_PID" 2>/dev/null || true)
 
 for i in $(seq 1 80); do
   api -f http://127.0.0.1:7001/v1/info >/dev/null 2>&1 && break
@@ -149,10 +159,9 @@ for i in $(seq 1 40); do
   sleep 0.25
 done
 
-STAMP=$(date +%s)
-IDA="edgea${STAMP}aa"
-IDB="edgeb${STAMP}bb"
-IDC="edgec${STAMP}cc"
+IDA="edgea$(rand_hex)"
+IDB="edgeb$(rand_hex)"
+IDC="edgec$(rand_hex)"
 EXP=$(( ($(date +%s) + 900) * 1000 ))
 
 spec() { # id team hostprefix egress probe_host scan_peer

@@ -101,3 +101,56 @@ The team-isolation control flushed `inet rctf_fc` and the same in-guest probe th
 - Jailer mode, Traefik/TLS, `egress: true` masquerade and public DNAT from outside the
   namespace remain out of scope (see `README.md`).
 - Only the pinned versions above were exercised.
+
+## Re-review hardening (2026-11-08, run 5)
+
+A review found that the smoke harness treated any non-zero `grep`/`ip`/`nft` as "absent",
+accepted any `*REACHED*` in team A's isolation control, matched Firecracker/agent processes by
+name while `unshare -Urn` shares the host PID namespace, and did not include the second VM or
+the Python listener in cleanup. This revision changes the harness (no product code):
+
+- instance ids carry 80 random bits from `/dev/urandom`; the run dir is also unique per PID;
+- cleanup signals the agent, both VMs, the Python listener and every helper only after
+  re-verifying the recorded start ticks, executable and this run's directory in argv, then
+  waits for each; the Firecracker sweep is restricted to argv containing the run dir. The
+  agent/VMs are no longer matched with `pgrep`/`pkill`;
+- flag absence is asserted only after every scan target is proven to exist and readable and
+  `grep` exits 0/1; a missing path or grep error is inconclusive. Tap and nft absence inspect
+  the `ip`/`nft` exit status first; a failed listing fails the check instead of looking like
+  "nothing left";
+- the isolation control flushes the rules and requires **both** guests to report exactly
+  `peer=REACHED host=REACHED` (bounded polling, no fixed sleep); any other line fails;
+- `selftest.sh` runs first with 10 mutation cases (nonexistent scan target, failing `ip` and
+  `nft` stubs, a genuine missing table, and `kill_verified` with mismatched ticks/exe/argv).
+
+| | |
+| --- | --- |
+| Date | 2026-11-08 15:04 (America/Denver, MST) |
+| Command | `deploy/firecracker/smoke/run.sh` |
+| Artifacts | read-only `~/.cache/rctf-fc-smoke` (Firecracker v1.17.0, kernel 6.1.155) |
+| Run dir | `/run/user/1000/fcs1794175894367886` |
+| Checks | **24 passed, 0 failed** |
+| SELFTEST | **10 passed, 0 failed** |
+| Exit code | **0** |
+
+```
+SELFTEST 1 PASS mutation caught: a nonexistent scan target is inconclusive (exit 2), never 'flag absent'
+SELFTEST 3 PASS mutation caught: a failing 'ip -o link show' cannot prove the tap is absent (exit 2)
+SELFTEST 4 PASS mutation caught: a failing nft cannot prove a table is absent (exit 2)
+SELFTEST 6 PASS mutation caught: a failing nft cannot prove the lease rules are gone (exit 2)
+SELFTEST 7c PASS mutation caught: kill_verified ignores a PID whose argv lacks this run's marker
+SELFTEST 7d PASS kill_verified terminates the process when start ticks, exe and argv marker all match
+...
+  PASS: control: with rules removed BOTH guests reach peer and host (probes are sensitive)
+  PASS: firecracker process gone (recorded pid/start-ticks identity no longer matches)
+  PASS: tap removed
+  PASS: nft rules for the lease removed
+RESULT: 24 passed, 0 failed
+SELFTEST RESULT: 10 passed, 0 failed
+```
+
+The control output was `probe A after flush: peer=REACHED host=REACHED | probe B after flush:
+peer=REACHED host=REACHED`, and `state=running after 2s` for the first boot. After the run no
+agent, Firecracker or Python helper referencing the run dir remained; the run dir was
+inspected and removed. This is one post-change run; the earlier run above is kept as the
+historical baseline.

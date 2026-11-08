@@ -4,10 +4,11 @@
 # the durable reuse quarantine.
 set -u
 : "${RUN:?}" "${EDGE:?}" "${REPO:?}"
+. "$EDGE/lib/assert.sh"
 PIDS=()
 cleanup() {
   set +e
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
+  for pid in "${PIDS[@]}"; do kill_child "$pid"; done
 }
 trap cleanup EXIT INT TERM
 

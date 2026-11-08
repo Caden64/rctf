@@ -42,9 +42,13 @@ only read.
 
 Run directory: `$XDG_RUNTIME_DIR/fce<epoch><pid>` (short, because Firecracker/Traefik unix
 socket paths must stay below 108 bytes). The whole run is bounded by `EDGE_TIMEOUT` (default
-900 s) at the outer level and by per-phase timeouts. Cleanup kills only PIDs the scripts
-started and destroys each phase's network namespace; the run dir is removed unless a check
-failed or `KEEP_RUN=1`.
+900 s) at the outer level and by per-phase timeouts. Instance ids carry 80 random bits from
+`/dev/urandom`, so two concurrent runs cannot share one. Cleanup never kills by name pattern
+(`unshare -Urn` does not isolate PIDs): every process is signalled only after its recorded
+start ticks, executable basename and this run's unique directory in argv still match, and
+each is waited for. That covers Firecracker (from the agent state handles plus a `/proc`
+sweep limited to argv containing the run dir), the agent, Traefik, all listeners and every
+helper. The run dir is removed unless a check failed or `KEEP_RUN=1`.
 
 ## Topology
 
@@ -121,10 +125,20 @@ real `nft`; "guests" are veth peers in network namespaces with the lease MAC/add
 what makes raw frame injection possible without modifying a Firecracker rootfs. Every packet
 still crosses the real kernel forwarding hooks with the real rules. Checks:
 
+- **6.0** a correctly sourced UDP packet from guest A is forwarded while the rules are
+  installed (positive control: the forwarding path and the sniffer are live).
 - **6.1/6.2** a UDP packet from guest A with guest B's source IP is dropped; after flushing
-  the inet table the identical packet is observed at the upstream (control).
-- **6.3/6.4** an Ethernet frame from guest A with guest B's source MAC is dropped; the flushed
-  control is forwarded.
+  the inet table the identical packet is observed at the upstream (control). The spoof
+  probes run with **egress enabled**, so the general "no new flows" denial and the final
+  `fctap*` drop cannot be the reason the packet disappears. The IP filter's sensitivity is
+  proven separately: an otherwise-allowed path is inserted immediately before the final tap
+  drop, the spoof is still dropped (**6.1b**), deleting **only** the IP anti-spoof rule by
+  handle lets the identical packet through (**6.1c**), and restoring the real ruleset blocks
+  it again (**6.1d**).
+- **6.3/6.4** an Ethernet frame from guest A with guest B's source MAC is dropped; the
+  flushed control is forwarded. With egress enabled the lease's own source IP is otherwise
+  accepted, so deleting **only** the Ethernet anti-spoof rule by handle must let the identical
+  frame through (**6.3a**) and restoring the ruleset must block it again (**6.3b**).
 - **6.5/6.6** an ARP reply with guest B's MAC (existing neighbour made `stale`) does not
   overwrite the host's neighbour entry; with the ARP table flushed it does (control).
 - **6.7** a legitimate ARP request is still learned with the rules installed (positive
@@ -142,14 +156,19 @@ still crosses the real kernel forwarding hooks with the real rules. Checks:
   crash or truncated report fails the check instead of looking like "no open ports".
 - **5.6–5.12** the dangerous reuse path: long-lived DNAT flow + unrelated flow on the same
   destination port, then the real release steps (fenced ruleset, interface removal, real
-  `flushConntrack`), then a **new lease reusing the exact same `/30`, MAC-independent guest
-  address, public port and client source port**. The guest flow must still be tracked after
-  the fence and tap removal and immediately before the flush (**5.6a**); the flush must exit
-  0; only then is the old tuple asserted gone (**5.7**). Every `conntrack -L` here must exit 0
-  and parse as a listing — in particular **5.9** cannot treat a failed command as "no
-  inherited state". The unrelated flow survives, and the new guest is reached. Quarantine is 0
-  in this phase *on purpose* so the path that quarantine protects can be executed; the real
-  120 s quarantine is covered by phase `agent` and `lifecycle`.
+  `flushConntrack`), then a **new lease reusing the exact same `/30`, guest address, public
+  port and client source port**. The old tuple is asserted field-by-field
+  (`203.0.113.2:55555 -> 203.0.113.1:24001 = 10.200.0.2:9001`, **5.6b**) and must still be
+  tracked after the fence and tap removal, immediately before the flush (**5.6a**); the flush
+  must exit 0; only then is the old tuple asserted gone (**5.7**). After reuse, the
+  replacement guest serves a **distinguishable** service on the same mapped guest port
+  (`:9001`, identity `A2`) and the client binds source port **55555** explicitly: the request
+  must return the new identity (**5.10**) and `conntrack -L` must show the **identical** 5-tuple
+  as a fresh entry (**5.11**). Every `conntrack -L` here must exit 0 and parse as a listing —
+  in particular **5.9** cannot treat a failed command as "no inherited state". The unrelated
+  flow survives, and the new guest is reached. Quarantine is 0 in this phase *on purpose* so
+  the path that quarantine protects can be executed; the real 120 s quarantine is covered by
+  phase `agent` and `lifecycle`.
 
 ### `phase-lifecycle` — real NetworkManager at scale (check 8)
 
@@ -165,8 +184,14 @@ entries exist before release.
 - **8.6** after release: no taps, no DNAT/masquerade/fctap rules, no Traefik files.
 - **8.7** no conntrack entry for any released guest address.
 - **8.8** ten `/30` indexes and ten ports in the durable quarantine with future deadlines.
-- **8.9** a restart-like `restore([])` followed by allocation does **not** hand back any
-  quarantined index or port.
+- **8.9** a restart-like recovery runs in a **fresh bun process**: a new
+  `createNetworkManager` loads the existing quarantine file from disk, calls `restore([])`
+  and allocates. No quarantined index or port may come back. Using the already-running
+  manager object would hide a regression where startup ignores the persisted file, so the
+  check runs out-of-process.
+- **8.10** mutation control: the same fresh process pointed at a quarantine path that does
+  not exist **does** hand back a released index and port, proving 8.9 is sensitive to the
+  on-disk quarantine rather than passing vacuously.
 
 Every `nft`, `conntrack` and `ip` listing in this phase must exit 0; after teardown the only
 accepted non-zero is a genuinely missing table (named in the check text as
@@ -194,9 +219,12 @@ correct case to PASS):
 - **5** `conntrack_ip_absent` accepts only a successful, parseable `conntrack -L`: a failing
   command, exit-0 garbage, and a listing that contains the IP are each rejected; a successful
   empty listing proves absence.
+- **6** `kill_verified` (used by every cleanup path) refuses to signal a PID whose recorded
+  start ticks, executable or argv run marker disagree, and only terminates the process when
+  all three match.
 
 The selftest emits `SELFTEST <id> PASS/FAIL` lines (counted separately from `CHECK`) and makes
-`run.sh` exit non-zero on any failure. It now has 16 checks.
+`run.sh` exit non-zero on any failure. It now has 20 checks.
 
 ## What is real vs simulated
 
@@ -252,6 +280,7 @@ lib/phase-veth.sh          checks 5.6-5.12, 6.x, 7.2/7.3 with raw frames
 lib/phase-lifecycle.sh     check 8: real NetworkManager, 10 concurrent leases
 lib/assert.sh              shared fail-closed conntrack/probe/port assertions
 lib/lifecycle.ts           the NetworkManager assertions (imports the real modules)
+lib/lifecycle-restart.ts   fresh-process restart simulation for 8.9/8.10
 lib/net-tools.ts           render the real ruleset / run the real conntrack flush
 lib/guest-start            guest service: identity HTTP, hold listener, probe loop
                            (`scan=blocked` vs `scan=error`, EDGE_PROBE_ONCE for selftest)

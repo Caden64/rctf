@@ -5,16 +5,17 @@
 # to modify a Firecracker rootfs; every packet still crosses the real kernel
 # forwarding path with the real rules the agent installs.
 #
-# Checks: anti-spoof (IP, MAC, ARP) with flushed-rules controls, nmap from a
-# guest, and conntrack reuse safety when a /30 + public port are handed to a new
-# instance (real flushConntrack, same source tuple).
+# Checks: anti-spoof (IP, MAC, ARP) with an egress-enabled positive control and
+# per-filter rule-deletion mutations, nmap from a guest, and conntrack reuse
+# safety when a /30 + public port are handed to a new instance (real
+# flushConntrack, the exact same source tuple).
 set -u
 : "${RUN:?}" "${EDGE:?}" "${REPO:?}"
 . "$EDGE/lib/assert.sh"
 PIDS=()
 cleanup() {
   set +e
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
+  for pid in "${PIDS[@]}"; do kill_child "$pid"; done
 }
 trap cleanup EXIT INT TERM
 
@@ -25,6 +26,7 @@ note() { printf 'NOTE %s\n' "$*"; }
 A_ID="vetha$(printf '%011d' 1)"
 B_ID="vethb$(printf '%011d' 2)"
 A2_ID="vethc$(printf '%011d' 3)"
+A_TAP=fctap0
 A_IP=10.200.0.2
 B_IP=10.200.0.6
 A_MAC=02:00:00:00:0a:02
@@ -156,8 +158,8 @@ cat >"$RUN/out/veth-config.json" <<'JSON'
   "tcpSslEntrypoint": "websecure"
 }
 JSON
-lease_json() { # id tap host guest mac "guestPort:publicPort[,guestPort:publicPort]"
-  local id=$1 tap=$2 host=$3 guest=$4 mac=$5 exposes=$6
+lease_json() { # id tap host guest mac egress "guestPort:publicPort[,guestPort:publicPort]"
+  local id=$1 tap=$2 host=$3 guest=$4 mac=$5 egress=$6 exposes=$7
   local ex='[]' pp='{}' i=0 part g pub
   local IFS=,
   for part in $exposes; do
@@ -168,9 +170,9 @@ lease_json() { # id tap host guest mac "guestPort:publicPort[,guestPort:publicPo
     i=$((i + 1))
   done
   jq -nc --arg id "$id" --arg tap "$tap" --arg host "$host" --arg guest "$guest" \
-    --arg mac "$mac" --argjson ex "$ex" --argjson pp "$pp" \
+    --arg mac "$mac" --argjson ex "$ex" --argjson pp "$pp" --argjson eg "$egress" \
     '{instanceId:$id,tapName:$tap,hostIp:$host,guestIp:$guest,prefixLength:30,
-      guestMac:$mac,expose:$ex,publicPorts:$pp,publicHostnames:{},egress:false}'
+      guestMac:$mac,expose:$ex,publicPorts:$pp,publicHostnames:{},egress:$eg}'
 }
 render_apply() { # fenced-id-or-empty
   local fenced="$1"
@@ -179,9 +181,9 @@ render_apply() { # fenced-id-or-empty
     printf '{"config":'
     cat "$RUN/out/veth-config.json"
     printf ',"leases":['
-    lease_json "$A_ID" fctap0 10.200.0.1 "$A_IP" "$A_MAC" "8080:$A_PUB,9001:$A_HOLD"
+    lease_json "$A_ID" fctap0 10.200.0.1 "$A_IP" "$A_MAC" true "8080:$A_PUB,9001:$A_HOLD"
     printf ','
-    lease_json "$B_ID" fctap1 10.200.0.5 "$B_IP" "$B_MAC" "8080:$B_PUB"
+    lease_json "$B_ID" fctap1 10.200.0.5 "$B_IP" "$B_MAC" true "8080:$B_PUB"
     printf ']'
     if [ -n "$fenced" ]; then printf ',"fenced":["%s"]' "$fenced"; fi
     printf '}'
@@ -202,6 +204,47 @@ note "installed rules: $(nft list table inet rctf_fc | grep -c 'fctap') tap refe
 # ===========================================================================
 # 6. anti-spoof with flushed-rules controls
 # ===========================================================================
+# ===========================================================================
+# 6. anti-spoof
+#
+# The spoof probes run with egress ENABLED on both leases. With egress disabled
+# the general "no new flows" rule plus the final `iifname "fctap*" drop` would
+# block the packets even if the MAC/IP anti-spoof rules were removed, so the
+# probes would not be sensitive to those rules. Egress enabled removes the
+# first blocker; the selective mutations below prove each filter is still what
+# stops the spoof in the otherwise-allowed path.
+# ===========================================================================
+fwd_rule_handle() { # exact rule text -> handle in chain forward
+  nft -a list chain inet rctf_fc forward |
+    grep -F -- "$1" | sed -n 's/.*# handle \([0-9]*\).*/\1/p' | tail -1
+}
+insert_before_tap_drop() { # nft rule expressions...
+  local idx
+  idx=$(nft -a list chain inet rctf_fc forward | awk '
+    /^[[:space:]]+.*# handle [0-9]+$/ {
+      n++
+      if (index($0, "iifname \"fctap*\" drop")) { print n; exit }
+    }')
+  [ -n "$idx" ] || return 1
+  nft add rule inet rctf_fc forward position "$idx" "$@"
+}
+
+note "-- 6.0 positive control: a correctly sourced packet from guest A is forwarded"
+nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+  "$RUN/out/sniff-legit.json" --dport 9996 >/dev/null 2>&1 & SN=$!
+sleep 0.3
+LEGIT_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$A_IP" 203.0.114.3 9996 LEGIT-PACKET >/dev/null || LEGIT_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$LEGIT_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+  fail 6.0 "positive-control probe failed (send=$LEGIT_RC sniff=$SN_RC); the forwarding path is not proven"
+elif grep -q '"payload": "LEGIT-PACKET"' "$RUN/out/sniff-legit.json" 2>/dev/null; then
+  pass 6.0 "a correctly sourced packet from guest A is forwarded with the rules installed (positive control)"
+else
+  fail 6.0 "a correctly sourced packet from guest A was NOT forwarded with the rules installed; later 'dropped' results would be meaningless"
+fi
+
 note "-- 6.1 spoofed source IP from guest A (claims guest B's address)"
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
   "$RUN/out/sniff-ip-blocked.json" --dport 9998 >/dev/null 2>&1 & SN=$!
@@ -217,7 +260,64 @@ elif [ "$SN_RC" -ne 0 ]; then
 elif [ -s "$RUN/out/sniff-ip-blocked.json" ]; then
   fail 6.1 "spoofed IP packet reached upstream: $(cat "$RUN/out/sniff-ip-blocked.json")"
 else
-  pass 6.1 "packet with saddr $B_IP from guest A was dropped (upstream saw none; probe exit 0)"
+  pass 6.1 "packet with saddr $B_IP from guest A was dropped (upstream saw none; probe exit 0; egress enabled)"
+fi
+
+# Selective mutation: give the spoofed packet an otherwise-allowed path just
+# before the final tap drop. With the IP filter installed it must still be
+# dropped (proves the filter, not the final drop, is doing the work); deleting
+# ONLY that filter by handle must let the identical packet through.
+IP_HANDLE=$(fwd_rule_handle "iifname \"$A_TAP\" ip saddr != $A_IP drop")
+if ! insert_before_tap_drop iifname "$A_TAP" ip saddr "$B_IP" accept; then
+  fail 6.1b "could not install the otherwise-allowed path for the selective IP mutation"
+elif [ -z "$IP_HANDLE" ]; then
+  fail 6.1b "could not find the forward IP anti-spoof rule handle"
+else
+  nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+    "$RUN/out/sniff-ip-select-before.json" --dport 9998 >/dev/null 2>&1 & SN=$!
+  sleep 0.3
+  SPOOF_RC=0
+  nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP-SELECT >/dev/null || SPOOF_RC=$?
+  SN_RC=0
+  wait $SN || SN_RC=$?
+  if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+    fail 6.1b "selective IP-mutation probe failed (send=$SPOOF_RC sniff=$SN_RC)"
+  elif [ -s "$RUN/out/sniff-ip-select-before.json" ]; then
+    fail 6.1b "the spoofed-IP packet bypassed the IP filter even though only an otherwise-allowed path was added"
+  else
+    pass 6.1b "control: with an otherwise-allowed path present the IP filter alone still drops the spoofed source $B_IP"
+  fi
+
+  nft delete rule inet rctf_fc forward handle "$IP_HANDLE" || fail 6.1c "could not delete only the forward IP anti-spoof rule (handle $IP_HANDLE)"
+  nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+    "$RUN/out/sniff-ip-select-deleted.json" --dport 9998 >/dev/null 2>&1 & SN=$!
+  sleep 0.3
+  SPOOF_RC=0
+  nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP-SELECT2 >/dev/null || SPOOF_RC=$?
+  SN_RC=0
+  wait $SN || SN_RC=$?
+  if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+    fail 6.1c "selective IP-mutation probe failed (send=$SPOOF_RC sniff=$SN_RC)"
+  elif grep -q '"ip_src": "10.200.0.6"' "$RUN/out/sniff-ip-select-deleted.json" 2>/dev/null; then
+    pass 6.1c "selective mutation: deleting ONLY the IP anti-spoof rule lets the identical spoofed-IP packet through"
+  else
+    fail 6.1c "deleting only the IP anti-spoof rule did not let the spoofed-IP packet through; the assertion is not sensitive to that rule"
+  fi
+  apply_full
+  nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+    "$RUN/out/sniff-ip-select-restored.json" --dport 9998 >/dev/null 2>&1 & SN=$!
+  sleep 0.3
+  SPOOF_RC=0
+  nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP-SELECT3 >/dev/null || SPOOF_RC=$?
+  SN_RC=0
+  wait $SN || SN_RC=$?
+  if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+    fail 6.1d "restored-rules probe failed (send=$SPOOF_RC sniff=$SN_RC)"
+  elif [ -s "$RUN/out/sniff-ip-select-restored.json" ]; then
+    fail 6.1d "the spoofed-IP packet still passed after restoring the ruleset"
+  else
+    pass 6.1d "restoring the real ruleset blocks the same spoofed-IP packet again"
+  fi
 fi
 
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 3 \
@@ -253,7 +353,48 @@ elif [ "$SN_RC" -ne 0 ]; then
 elif [ -s "$RUN/out/sniff-mac-blocked.json" ]; then
   fail 6.3 "frame with ether saddr $B_MAC reached upstream: $(cat "$RUN/out/sniff-mac-blocked.json")"
 else
-  pass 6.3 "frame with ether saddr $B_MAC from guest A was dropped (probe exit 0)"
+  pass 6.3 "frame with ether saddr $B_MAC from guest A was dropped (probe exit 0; egress enabled)"
+fi
+
+# Selective mutation: with egress enabled, a frame whose source IP is the
+# lease address is otherwise accepted by the egress rule. Delete ONLY the
+# Ethernet-source filter and the identical frame must be forwarded.
+MAC_HANDLE=$(fwd_rule_handle "iifname \"$A_TAP\" ether saddr != $A_MAC drop")
+if [ -z "$MAC_HANDLE" ]; then
+  fail 6.3a "could not find the forward Ethernet anti-spoof rule handle"
+else
+  nft delete rule inet rctf_fc forward handle "$MAC_HANDLE" || fail 6.3a "could not delete only the forward MAC anti-spoof rule (handle $MAC_HANDLE)"
+  nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+    "$RUN/out/sniff-mac-select-deleted.json" --dport 9999 >/dev/null 2>&1 & SN=$!
+  sleep 0.3
+  SPOOF_RC=0
+  nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" eth eth0 "$B_MAC" "$OUT_MAC" \
+    "$A_IP" 203.0.114.3 9999 SPOOF-MAC-SELECT >/dev/null || SPOOF_RC=$?
+  SN_RC=0
+  wait $SN || SN_RC=$?
+  if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+    fail 6.3a "selective MAC-mutation probe failed (send=$SPOOF_RC sniff=$SN_RC)"
+  elif grep -q '"payload": "SPOOF-MAC-SELECT"' "$RUN/out/sniff-mac-select-deleted.json" 2>/dev/null; then
+    pass 6.3a "selective mutation: deleting ONLY the Ethernet anti-spoof rule lets the identical spoofed-MAC frame through"
+  else
+    fail 6.3a "deleting only the Ethernet anti-spoof rule did not let the spoofed-MAC frame through; the assertion is not sensitive to that rule"
+  fi
+  apply_full
+  nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
+    "$RUN/out/sniff-mac-select-restored.json" --dport 9999 >/dev/null 2>&1 & SN=$!
+  sleep 0.3
+  SPOOF_RC=0
+  nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" eth eth0 "$B_MAC" "$OUT_MAC" \
+    "$A_IP" 203.0.114.3 9999 SPOOF-MAC-SELECT2 >/dev/null || SPOOF_RC=$?
+  SN_RC=0
+  wait $SN || SN_RC=$?
+  if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+    fail 6.3b "restored-rules probe failed (send=$SPOOF_RC sniff=$SN_RC)"
+  elif [ -s "$RUN/out/sniff-mac-select-restored.json" ]; then
+    fail 6.3b "the spoofed-MAC frame still passed after restoring the ruleset"
+  else
+    pass 6.3b "restoring the real ruleset blocks the same spoofed-MAC frame again"
+  fi
 fi
 
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 3 \
@@ -390,6 +531,13 @@ apply_full
 # ===========================================================================
 note "-- 5.6 long-lived DNAT flow, release flush, and reuse of the same /30/port"
 conntrack -F >/dev/null 2>&1 || true
+tuple_line() { # sport dport -> the matching conntrack line (first)
+  conntrack_list | grep -F "sport=$1 " | grep -F "dport=$2 " | head -1
+}
+tuple_exact() { # line src dst sport dport rsrc rdst rsport rdport
+  printf '%s' "$1" |
+    grep -qF "src=$2 dst=$3 sport=$4 dport=$5 src=$6 dst=$7 sport=$8 dport=$9"
+}
 nsenter -t "$OUT_PID" -n python3 "$EDGE/lib/hold_client.py" 203.0.113.1 "$A_HOLD" 55555 60 \
   >"$RUN/out/hold-a.log" 2>&1 & HOLD_A=$!
 PIDS+=("$HOLD_A")
@@ -406,6 +554,12 @@ elif echo "$CT" | grep -q "$A_IP" && echo "$CT" | grep -q "dst=203.0.114.3.*dpor
 else
   fail 5.6 "expected conntrack entries missing; hold logs: $(cat "$RUN/out/hold-a.log" "$RUN/out/hold-unrelated.log" | tr '\n' ' '); ct: $(echo "$CT" | head -3 | tr '\n' ' ')"
 fi
+ORIG_LINE=$(tuple_line 55555 "$A_HOLD")
+if tuple_exact "$ORIG_LINE" 203.0.113.2 203.0.113.1 55555 "$A_HOLD" "$A_IP" 203.0.113.2 9001 55555; then
+  pass 5.6b "the old flow has the exact tuple 203.0.113.2:55555 -> 203.0.113.1:$A_HOLD = $A_IP:9001"
+else
+  fail 5.6b "the old flow tuple is not the expected one: '${ORIG_LINE:-<missing>}'"
+fi
 
 # Release step (a): fence, then drop the interface, then the REAL flush.
 render_apply "$A_ID" | nft -f -
@@ -417,10 +571,12 @@ ip link del fctap0 2>/dev/null || true
 HOLD_STATE=$(cat "$RUN/out/hold-a.log" 2>/dev/null | tr '\n' ' ')
 if ! conntrack_has_ip "$A_IP"; then
   fail 5.6a "the guest flow vanished after fence/tap removal, before the flush (hold='$HOLD_STATE'); the flush is not proven"
+elif ! tuple_exact "$(tuple_line 55555 "$A_HOLD")" 203.0.113.2 203.0.113.1 55555 "$A_HOLD" "$A_IP" 203.0.113.2 9001 55555; then
+  fail 5.6a "the exact old tuple changed before the flush: '$(tuple_line 55555 "$A_HOLD")'"
 elif ! echo "$HOLD_STATE" | grep -q connected; then
   fail 5.6a "hold socket was not connected before the flush (hold='$HOLD_STATE')"
 else
-  pass 5.6a "the guest flow is still tracked after the fenced ruleset and tap removal, immediately before the flush (hold socket open)"
+  pass 5.6a "the exact old tuple is still tracked after the fenced ruleset and tap removal, immediately before the flush (hold socket open)"
 fi
 FLUSH_RC=0
 bun "$EDGE/lib/net-tools.ts" flush "$A_IP" >"$RUN/out/flush-a.log" 2>&1 || FLUSH_RC=$?
@@ -466,14 +622,20 @@ sysctl -qw net.ipv4.conf.fctap0.arp_accept=1 2>/dev/null || true
 nsenter -t "$GA2_PID" -n python3 -m http.server 8080 --bind 0.0.0.0 \
   --directory "$RUN/out/guestA2" >"$RUN/out/httpA2.log" 2>&1 & HTTPA2=$!
 PIDS+=("$HTTPA2")
+# Same mapped guest port as the old hold service (:9001), but a different
+# service identity, so "the reuse reached the NEW guest" is observable on the
+# exact port that the old tuple used.
+nsenter -t "$GA2_PID" -n python3 -m http.server 9001 --bind 0.0.0.0 \
+  --directory "$RUN/out/guestA2" >"$RUN/out/httpA2-hold.log" 2>&1 & HTTPA2HOLD=$!
+PIDS+=("$HTTPA2HOLD")
 sleep 0.7
 {
   printf '{"config":'
   cat "$RUN/out/veth-config.json"
   printf ',"leases":['
-  lease_json "$A2_ID" fctap0 10.200.0.1 "$A_IP" "$A2_MAC" "8080:$A_PUB,9001:$A_HOLD"
+  lease_json "$A2_ID" fctap0 10.200.0.1 "$A_IP" "$A2_MAC" true "8080:$A_PUB,9001:$A_HOLD"
   printf ','
-  lease_json "$B_ID" fctap1 10.200.0.5 "$B_IP" "$B_MAC" "8080:$B_PUB"
+  lease_json "$B_ID" fctap1 10.200.0.5 "$B_IP" "$B_MAC" true "8080:$B_PUB"
   printf ']}'
 } >"$RUN/out/veth-reuse-spec.json"
 bun "$EDGE/lib/net-tools.ts" render "$RUN/out/veth-reuse-spec.json" | nft -f -
@@ -486,20 +648,26 @@ elif echo "$CT" | grep -q "$A_IP"; then
 else
   pass 5.9 "reused /30 has no inherited conntrack state before the new instance is contacted (conntrack -L exit 0)"
 fi
-BODY=$(nsenter -t "$OUT_PID" -n curl -sS -m 5 "http://203.0.113.1:$A_PUB/id.txt" 2>/dev/null || true)
-if [ "$BODY" = A2 ]; then
-  pass 5.10 "same public port + /30 now reaches the NEW guest (identity '$BODY')"
+# Reopen the EXACT old 5-tuple (same client address/port, same public port) on
+# the reused /30. The replacement service on guest :9001 answers with a
+# different identity, and the conntrack entry must show the identical original
+# and reply tuples - not merely "some flow to the new guest".
+NEW_BODY=$(nsenter -t "$OUT_PID" -n curl -sS -m 5 --local-port 55555 \
+  "http://203.0.113.1:$A_HOLD/id.txt" 2>/dev/null || true)
+if [ "$NEW_BODY" = A2 ]; then
+  pass 5.10 "the exact old client port 55555 / public port $A_HOLD now reaches the NEW guest (identity '$NEW_BODY')"
 else
-  fail 5.10 "reused port reached '$BODY' instead of the new guest A2"
+  fail 5.10 "reused port reached '$NEW_BODY' instead of the new guest A2"
 fi
 CT_RC=0
 CT=$(conntrack_list) || CT_RC=$?
+NEW_LINE=$(tuple_line 55555 "$A_HOLD")
 if [ "$CT_RC" -ne 0 ]; then
   fail 5.11 "conntrack -L failed (exit $CT_RC); the new flow is not proven"
-elif echo "$CT" | grep -q "$A_IP"; then
-  pass 5.11 "the new flow through the reused /30 is a fresh conntrack entry (conntrack -L exit 0)"
+elif tuple_exact "$NEW_LINE" 203.0.113.2 203.0.113.1 55555 "$A_HOLD" "$A_IP" 203.0.113.2 9001 55555; then
+  pass 5.11 "the reused flow has the identical 5-tuple (203.0.113.2:55555 -> 203.0.113.1:$A_HOLD = $A_IP:9001) as a FRESH entry"
 else
-  fail 5.11 "no conntrack entry for the new guest after a successful request"
+  fail 5.11 "no fresh conntrack entry with the exact reused tuple (got '${NEW_LINE:-<missing>}')"
 fi
 if [ "$CT_RC" -ne 0 ]; then
   fail 5.12 "conntrack -L failed (exit $CT_RC); survival of the unrelated flow is not proven"

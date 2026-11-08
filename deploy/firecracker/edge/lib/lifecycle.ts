@@ -12,7 +12,7 @@
  * create the conntrack entries is a veth peer in a child netns (its pid comes
  * from OUTSIDE_PID).
  */
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createNetworkManager } from '../../../../apps/firecracker-instancer/src/agent/net'
 import { bunCommandRunner } from '../../../../apps/firecracker-instancer/src/util/exec'
 const run = (argv: string[], options?: { timeoutMs?: number }) =>
@@ -45,6 +45,11 @@ const config = {
   httpsEntrypoint: 'websecure',
   tcpSslEntrypoint: 'websecure',
 }
+
+// Persisted so the restart simulation can construct a NEW manager in a NEW bun
+// process with exactly this configuration (including the quarantine file).
+const configPath = `${RUN}/lifecycle/config.json`
+writeFileSync(configPath, JSON.stringify(config))
 
 let passes = 0
 let failures = 0
@@ -323,22 +328,91 @@ try {
 }
 check('8.8', quarantineOk, quarantineDetail)
 
-// Restart-like recovery: a new manager instance (restore([])) must load the
-// durable quarantine and not hand a released /30 or port straight back out.
-await manager.restore([])
-const reuse = await manager.allocate({
-  instanceId: `life${'y'.repeat(12)}`,
-  egress: false,
-  expose: [{ kind: 'tcp', hostPrefix: 'reuse', port: 8080 }],
-})
-const reusePort = Object.values(reuse.publicPorts)[0]!
+// Restart-like recovery: a FRESH manager in a FRESH bun process (its
+// constructor loads the quarantine file from disk, then restore([]) runs) must
+// not hand a released /30 or port straight back out. Using the already-running
+// manager would hide a regression where startup ignores the persisted file.
+interface FreshLease {
+  tapName: string
+  guestIp: string
+  publicPorts: Record<string, number>
+}
+const runFreshManager = async (
+  instanceId: string,
+  quarantineOverride?: string
+): Promise<{ code: number; lease?: FreshLease; text: string }> => {
+  const argv = [
+    process.execPath,
+    `${EDGE}/lib/lifecycle-restart.ts`,
+    configPath,
+    instanceId,
+  ]
+  if (quarantineOverride !== undefined) argv.push(quarantineOverride)
+  const proc = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  const text = `${stdout.trim()}\n${stderr.trim()}`.trim()
+  try {
+    const parsed = JSON.parse(stdout.trim().split('\n').pop() ?? '') as FreshLease
+    if (typeof parsed.tapName !== 'string') throw new Error('bad shape')
+    return { code, lease: parsed, text }
+  } catch {
+    return { code, text }
+  }
+}
+
+const normal = await runFreshManager(`life${'1'.repeat(12)}`)
+const normalPort =
+  normal.lease === undefined
+    ? undefined
+    : Object.values(normal.lease.publicPorts)[0]
 check(
   '8.9',
-  !releasedIndexes.has(Number(reuse.tapName.slice('fctap'.length))) &&
-    !releasedPorts.has(reusePort),
-  `post-restart allocation honours quarantine: ${reuse.tapName} ${reuse.guestIp} port ${reusePort}`
+  normal.code === 0 &&
+    normal.lease !== undefined &&
+    normalPort !== undefined &&
+    !releasedIndexes.has(
+      Number(normal.lease.tapName.slice('fctap'.length))
+    ) &&
+    !releasedPorts.has(normalPort),
+  normal.lease === undefined
+    ? `fresh-process restart simulation failed (exit ${normal.code}): ${normal.text}`
+    : `post-restart allocation in a fresh process honours the on-disk quarantine: ${
+        normal.lease.tapName
+      } ${normal.lease.guestIp} port ${normalPort}`
 )
-await manager.release(reuse.instanceId)
+
+// Mutation: the same fresh process pointed at a quarantine file that does not
+// exist must hand back a released index or port. That proves 8.9 is sensitive
+// to the persisted quarantine (a startup that ignores it cannot pass).
+const ignoredQuarantine = `${RUN}/lifecycle/ignored-quarantine.json`
+const mutation = await runFreshManager(
+  `life${'2'.repeat(12)}`,
+  ignoredQuarantine
+)
+const mutationPort =
+  mutation.lease === undefined
+    ? undefined
+    : Object.values(mutation.lease.publicPorts)[0]
+const mutationReused =
+  mutation.lease !== undefined &&
+  mutationPort !== undefined &&
+  (releasedIndexes.has(
+    Number(mutation.lease.tapName.slice('fctap'.length))
+  ) ||
+    releasedPorts.has(mutationPort))
+check(
+  '8.10',
+  mutation.code === 0 && mutationReused,
+  mutation.lease === undefined
+    ? `mutation control failed to run (exit ${mutation.code}): ${mutation.text}`
+    : `mutation control: a fresh manager that cannot see the quarantine file DOES reuse ${
+        mutation.lease.tapName
+      } port ${mutationPort}, so 8.9 is sensitive to the persisted state`
+)
 
 console.log(`RESULT lifecycle: ${passes} passed, ${failures} failed`)
 process.exit(failures === 0 ? 0 : 1)

@@ -10,7 +10,7 @@ ARTIFACTS=${SMOKE_ARTIFACTS:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-fc-smoke}
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "/dev/kvm is not accessible" >&2; exit 2; }
 command -v bun >/dev/null || { echo "bun is required on PATH" >&2; exit 2; }
 # Unix socket paths are limited to 107 bytes, so keep the run dir short (XDG_RUNTIME_DIR is a tmpfs).
-export RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fcs$(date +%s)
+export RUN=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fcs$(date +%s)$$
 mkdir -p "$RUN"/{state,run,jailer,traefik}
 cat > "$RUN/agent.yaml" <<YAML
 hostId: smoke1

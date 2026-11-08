@@ -13,7 +13,7 @@ mkdir -p "$ST"
 PIDS=()
 cleanup() {
   set +e
-  for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null; done
+  for pid in "${PIDS[@]}"; do kill_child "$pid"; done
 }
 trap cleanup EXIT INT TERM
 
@@ -203,6 +203,40 @@ if CONNTRACK_BIN="$ST/ct-present/conntrack" conntrack_has_ip 10.99.99.99; then
   st_pass 5e "presence is still detected in a valid listing"
 else
   st_fail 5e "presence was not detected in a valid listing"
+fi
+
+# ===========================================================================
+# 6. verified cleanup: `unshare -Urn` shares the host PID namespace, so
+#    signalling must require the recorded start ticks + executable + run-dir
+#    marker. Mutation: each mismatching component must leave the victim alive;
+#    the fully matching identity must kill it.
+# ===========================================================================
+sleep 30 &
+VICTIM=$!
+VICTIM_TICKS=$(proc_start_ticks "$VICTIM")
+kill_verified "$VICTIM" "$((VICTIM_TICKS + 1))" sleep 30
+if proc_start_ticks "$VICTIM" 2>/dev/null | grep -qx "$VICTIM_TICKS"; then
+  st_pass 6 "mutation caught: mismatched start ticks are not signalled"
+else
+  st_fail 6 "kill_verified killed a PID with mismatched start ticks"
+fi
+kill_verified "$VICTIM" "$VICTIM_TICKS" not-this-exe 30
+if proc_start_ticks "$VICTIM" 2>/dev/null | grep -qx "$VICTIM_TICKS"; then
+  st_pass 6b "mutation caught: a mismatched executable is not signalled"
+else
+  st_fail 6b "kill_verified killed a PID with a mismatched executable"
+fi
+kill_verified "$VICTIM" "$VICTIM_TICKS" sleep no-such-run-dir-marker
+if proc_start_ticks "$VICTIM" 2>/dev/null | grep -qx "$VICTIM_TICKS"; then
+  st_pass 6c "mutation caught: a PID whose argv lacks the run marker is not signalled"
+else
+  st_fail 6c "kill_verified killed a PID whose argv marker did not match"
+fi
+kill_verified "$VICTIM" "$VICTIM_TICKS" sleep 30
+if proc_start_ticks "$VICTIM" 2>/dev/null | grep -qx "$VICTIM_TICKS"; then
+  st_fail 6d "kill_verified did not terminate a fully matching PID"
+else
+  st_pass 6d "kill_verified terminates the process only when ticks, exe and argv marker all match"
 fi
 
 printf 'RESULT selftest: %d passed, %d failed\n' "$passes" "$failures"

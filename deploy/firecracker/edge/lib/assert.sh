@@ -1,8 +1,8 @@
 #!/bin/bash
 # Shared assertions for the edge harness. Sourced by phase-agent.sh,
-# phase-veth.sh and selftest.sh. Every helper returns 0 only when the
-# assertion really holds; an unparseable probe or a dead tool is a failure,
-# never an implicit "blocked/closed".
+# phase-veth.sh, phase-lifecycle.sh and selftest.sh. Every helper returns 0 only
+# when the assertion really holds; an unparseable probe or a dead tool is a
+# failure, never an implicit "blocked/closed".
 #
 # The helpers are intentionally small and side-effect free so selftest.sh can
 # run them against deliberately broken inputs and prove that they fail.
@@ -113,4 +113,101 @@ nmap_report_complete() { # exit-code greppable-output "port,port,..."
 nmap_scan_blocked() { # exit-code greppable-output "port,port,..."
   nmap_report_complete "$@" || return 1
   ! printf '%s\n' "$2" | grep -Eq '/(open|open\|filtered)/'
+}
+
+# --- process identity (cleanup only) ---------------------------------------
+# `unshare -Urn` does NOT create a PID namespace, so a harness that kills by
+# name can kill another run's processes. Cleanup therefore only ever signals a
+# PID whose recorded identity still matches: /proc/<pid>/stat start ticks (the
+# same field the VM driver persists), the executable basename, and an argv
+# marker that is unique to this run (the run directory).
+proc_start_ticks() { # pid -> ticks on stdout; non-zero when gone/unreadable
+  local stat
+  [ -r "/proc/$1/stat" ] || return 1
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  [ -n "$stat" ] || return 1
+  printf '%s' "${stat#*) }" | awk '{print $20}'
+}
+
+proc_ppid() { # pid -> parent pid
+  local stat
+  stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+  printf '%s' "${stat#*) }" | awk '{print $2}'
+}
+
+proc_cmdline() { # pid -> argv joined by spaces
+  tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true
+}
+
+proc_exe_basename() { # pid -> basename of the resolved executable
+  local exe
+  exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+  printf '%s\n' "${exe##*/}"
+}
+
+# Signal only when every identity component matches. Returns 0 when the process
+# was gone or was safely signalled; never signals a recycled/foreign PID.
+kill_verified() { # pid ticks exe-basename argv-marker
+  local pid=$1 ticks=$2 exe=$3 marker=$4 i
+  [ -n "$pid" ] || return 0
+  [ -d "/proc/$pid" ] || return 0
+  [ "$(proc_start_ticks "$pid" 2>/dev/null)" = "$ticks" ] || return 0
+  [ "$(proc_exe_basename "$pid" 2>/dev/null)" = "$exe" ] || return 0
+  proc_cmdline "$pid" | grep -qF -- "$marker" || return 0
+  kill "$pid" 2>/dev/null || true
+  for i in $(seq 1 40); do
+    [ -d "/proc/$pid" ] || {
+      wait "$pid" 2>/dev/null || true
+      return 0
+    }
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+# Kill a direct child of this shell, after proving it is still our child (a
+# child PID cannot be recycled before it is reaped) and waiting for exit.
+kill_child() { # pid
+  local pid=$1 i
+  [ -n "$pid" ] || return 0
+  [ -d "/proc/$pid" ] || return 0
+  [ "$(proc_ppid "$pid" 2>/dev/null)" = "$$" ] || {
+    wait "$pid" 2>/dev/null || true
+    return 0
+  }
+  kill "$pid" 2>/dev/null || true
+  for i in $(seq 1 40); do
+    [ -d "/proc/$pid" ] || {
+      wait "$pid" 2>/dev/null || true
+      return 0
+    }
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
+# Reap every Firecracker process that belongs to this run: first the handles
+# recorded in the agent state files (pid + start ticks + exe + argv), then a
+# /proc sweep restricted to firecracker executables whose argv contains this
+# run directory. Never kills by name pattern across runs.
+reap_firecracker() { # state-dir run-dir
+  local state_dir=$1 run_dir=$2 d pid ticks p
+  for d in "$state_dir"/*.json; do
+    [ -e "$d" ] || continue
+    pid=$(jq -r '.vm.pid // empty' "$d" 2>/dev/null || true)
+    ticks=$(jq -r '.vm.pidStartTicks // empty' "$d" 2>/dev/null || true)
+    [ -n "$pid" ] && [ -n "$ticks" ] || continue
+    kill_verified "$pid" "$ticks" firecracker "$run_dir"
+  done
+  for p in /proc/[0-9]*; do
+    pid=${p#/proc/}
+    [ "$(proc_exe_basename "$pid" 2>/dev/null)" = firecracker ] || continue
+    proc_cmdline "$pid" | grep -qF -- "$run_dir" || continue
+    ticks=$(proc_start_ticks "$pid" 2>/dev/null) || continue
+    kill_verified "$pid" "$ticks" firecracker "$run_dir"
+  done
 }

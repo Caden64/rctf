@@ -270,3 +270,75 @@ SELFTEST RESULT: 16 passed, 0 failed
 
 This is one post-change run; the earlier three-run table above is kept as the historical
 baseline. The `KEEP_RUN=1` directory was inspected and is listed under Leftovers above.
+
+## Re-review hardening (2026-11-08, run 5)
+
+A second review found four substantive gaps:
+
+1. cleanup matched Firecracker by `pgrep -f "firecracker.*--id $id"` while ids had second
+   resolution, so two concurrent runs could collide and `unshare -Urn` does not isolate PIDs;
+2. the anti-spoof probes ran with `egress:false`, so the general egress denial and the final
+   tap drop blocked the spoofs even without the dedicated MAC/IP rules, and the flushed-table
+   controls removed those alternative blockers too;
+3. the "post-restart quarantine" check (8.9) called `restore([])` on the already-running
+   manager, so ignoring the persisted quarantine at startup would still pass;
+4. the conntrack-reuse claim did not exercise the exact old 5-tuple (the replacement request
+   used a different destination port and curl's ephemeral source port).
+
+The harness now:
+
+- generates 80 random bits per instance id and never kills by name. Cleanup signals a process
+  only after re-verifying the recorded `/proc/<pid>/stat` start ticks, the executable basename
+  and this run's unique directory in argv, then waits. Firecracker is reaped from the agent's
+  state handles plus a `/proc` sweep restricted to argv containing the run dir; the second VM,
+  listeners and all helpers are included;
+- runs the 6.x spoof probes with **egress enabled**, adds a legitimate-packet positive control
+  (**6.0**), and proves filter sensitivity by deleting **only** the IP rule (**6.1b–6.1d**: an
+  otherwise-allowed path is present, the baseline drop is still the filter, deleting the rule
+  by handle forwards the identical packet, restoring blocks it) or **only** the Ethernet rule
+  (**6.3a/6.3b**);
+- simulates 8.9 in a **fresh bun process** whose constructor loads the quarantine file, then
+  `restore([])` and allocate (**8.9**), and adds **8.10** where the same fresh process pointed
+  at a nonexistent quarantine file *does* reuse a released index/port, proving 8.9 is
+  sensitive to the persisted state;
+- reuses the exact old tuple: the replacement guest serves a distinguishable identity on the
+  same mapped guest port, the client binds source port 55555, and the exact original/reply
+  tuples are asserted before the flush (**5.6b/5.6a**) and again as a fresh entry after reuse
+  (**5.11**).
+
+| | |
+| --- | --- |
+| Date | 2026-11-08 15:15 (America/Denver, MST) |
+| Command | `KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
+| Run dir | `/run/user/1000/fce1794176189383796` |
+| selftest | **20 passed / 0 failed**, exit 0 |
+| phase agent | **30 passed / 0 failed**, exit 0 |
+| phase veth | **26 passed / 0 failed**, exit 0 |
+| phase lifecycle | **10 passed / 0 failed**, exit 0 |
+| CHECK total | **66 passed, 0 failed** |
+| Exit code | **0** |
+
+There were no `FAIL` lines. After the run, no agent, Traefik, Firecracker, `unshare` or helper
+process referencing the run dir remained (`ps` sweep empty), and the run dir was inspected and
+removed.
+
+```
+  6.0 PASS a correctly sourced packet from guest A is forwarded with the rules installed (positive control)
+  6.1b PASS control: with an otherwise-allowed path present the IP filter alone still drops the spoofed source 10.200.0.6
+  6.1c PASS selective mutation: deleting ONLY the IP anti-spoof rule lets the identical spoofed-IP packet through
+  6.1d PASS restoring the real ruleset blocks the same spoofed-IP packet again
+  6.3a PASS selective mutation: deleting ONLY the Ethernet anti-spoof rule lets the identical spoofed-MAC frame through
+  6.3b PASS restoring the real ruleset blocks the same spoofed-MAC frame again
+  5.6b PASS the old flow has the exact tuple 203.0.113.2:55555 -> 203.0.113.1:24001 = 10.200.0.2:9001
+  5.10 PASS the exact old client port 55555 / public port 24001 now reaches the NEW guest (identity 'A2')
+  5.11 PASS the reused flow has the identical 5-tuple (203.0.113.2:55555 -> 203.0.113.1:24001 = 10.200.0.2:9001) as a FRESH entry
+  8.9 PASS post-restart allocation in a fresh process honours the on-disk quarantine: fctap10 10.201.0.42 port 25010
+  8.10 PASS mutation control: a fresh manager that cannot see the quarantine file DOES reuse fctap0 port 25000, so 8.9 is sensitive to the persisted state
+```
+
+The old exact tuple was asserted field-by-field after the fenced ruleset and tap removal and
+immediately before the real flush, then the same fields reappeared as a fresh entry after the
+new guest was contacted. All 20 mutation selftests (including the new `kill_verified` identity
+cases 6/6b/6c/6d) passed in the same run.
+
+This is one post-change run; the earlier runs above are kept as historical evidence.

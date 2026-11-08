@@ -44,21 +44,37 @@ script is "root", so it can create real tap devices, a dummy uplink and real nft
 is visible to or can reach the host's network. The run directory lives under `$XDG_RUNTIME_DIR` (a tmpfs)
 and is short on purpose: Firecracker rejects unix socket paths longer than 107 bytes.
 
+`unshare -Urn` does **not** create a PID namespace, so the harness never kills by process name. Instance
+ids carry 80 random bits from `/dev/urandom`; cleanup signals the agent, both VMs, the Python listener and
+every helper only after re-verifying the recorded `/proc/<pid>/stat` start ticks, the executable and this
+run's unique directory in argv, then waits for each to exit. A concurrent run on the same machine is never
+touched.
+
 ## What it verifies (24 checks)
 
 - The agent starts with the real `VmDriver` and `NetworkManager`, and preflight reports `accepting: true`.
 - A real kernel boots under KVM in about 2 seconds, `ip=` autoconfiguration works, and the reference guest
   `init` (the one in `../guest/`) fetches the **MMDS v2** document and exports the flag and environment.
 - The flag reaches the guest service byte-for-byte, and appears nowhere on the host: not in the agent state
-  directory, the Traefik directory, the agent log, or the per-instance rootfs disk image.
+  directory, the Traefik directory, the agent log, or the per-instance rootfs disk image. Absence is only
+  asserted after every scan target is proven to exist and be readable, and `grep` itself must exit 0/1;
+  a missing file or a grep error is reported as inconclusive, never as "flag absent".
 - The real `nft` accepts the rendered `inet` and `arp` rulesets; anti-spoof rules are present.
-- `kill -9` of the agent does not kill the VM; the restarted agent re-adopts it as `running` and keeps its tap.
+- `kill -9` of the agent does not kill the VM (the recorded pid + start-tick identity still matches); the
+  restarted agent re-adopts it as `running` and keeps its tap.
 - A duplicate create is idempotent and a changed spec is rejected with 409.
 - **Team isolation measured from inside the guests:** two VMs each hold only their own flag, neither can reach
-  the other or a listener on the host side of its tap, and a **control** (flushing the rules) shows the same
-  probe then succeeds, so the "blocked" result is not a false negative.
+  the other or a listener on the host side of its tap, and a **control** (flushing the rules) requires
+  **both** guests to report exactly `peer=REACHED host=REACHED` (bounded polling), so a broken peer or
+  host probe cannot make the "blocked" result look meaningful.
 - Delete removes the process, tap, run directory and nftables rules, and the deleted id is fenced against a
-  late re-create (409).
+  late re-create (409). The tap and nft absence checks inspect the `ip`/`nft` exit status first: a failed
+  listing fails the check instead of looking like "nothing left".
+
+`selftest.sh` (run first, in the same namespace) is a 10-case mutation proof of these helpers: a
+nonexistent scan target or a failing `ip`/`nft` stub must be rejected as inconclusive, a genuine
+"table does not exist" is accepted, and `kill_verified` must ignore a PID whose start ticks, executable
+or argv run marker disagree. Its `SELFTEST` failures also fail the run.
 
 ## What it does NOT verify
 
