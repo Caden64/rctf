@@ -43,6 +43,12 @@ const harness = (opts: {
   timers?: FakeTimers
   path?: string
   dir?: string
+  /**
+   * Deterministic monotonic RTT source. Defaults to a counter that advances by
+   * 1ms per call, so each probe measures a 1ms RTT (slack 1ms).
+   */
+  rttNow?: () => number
+  newId?: () => string
 }): Harness => {
   const dir = opts.dir ?? testDir()
   if (opts.dir === undefined) dirs.push(dir)
@@ -61,12 +67,16 @@ const harness = (opts: {
   })
   for (const agent of Object.values(opts.agents)) agent.setClock(clock.now)
   let sequence = 0
+  let monotonic = 0
+  const rttNow = opts.rttNow ?? (() => ++monotonic)
   const service = createControllerService(config, {
     clients: opts.agents,
     now: clock.now,
     logger: logs.asLogger(),
-    newId: () => `i${(sequence++).toString(36).padStart(23, '0')}`,
+    newId:
+      opts.newId ?? (() => `i${(sequence++).toString(36).padStart(23, '0')}`),
     timers,
+    rttNow,
   })
   return {
     dir,
@@ -118,6 +128,28 @@ const hostSkew = (path: string, hostId: string): number => {
     .get(hostId) as { clock_skew_ms: number } | null
   db.close()
   return row?.clock_skew_ms ?? 0
+}
+
+const hostClock = (
+  path: string,
+  hostId: string
+): { skew: number; rtt: number | null; state: string } => {
+  const db = new Database(path, { readonly: true })
+  const row = db
+    .query(
+      'SELECT clock_skew_ms, clock_rtt_ms, clock_state FROM hosts WHERE id = ?'
+    )
+    .get(hostId) as {
+    clock_skew_ms: number
+    clock_rtt_ms: number | null
+    clock_state: string
+  } | null
+  db.close()
+  return {
+    skew: row?.clock_skew_ms ?? 0,
+    rtt: row?.clock_rtt_ms ?? null,
+    state: row?.clock_state ?? 'unknown',
+  }
 }
 
 const capacity = (instances: number, memMiB = 4096): AgentCapacity => ({
@@ -263,9 +295,10 @@ describe('controller service', () => {
 
   test('ambiguous timeout with a VM keeps row/reservation and adopt on reconcile', async () => {
     const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
-    agents['host-a']!.createMode = 'create-then-unreachable'
     const h = harness({ agents })
+    await h.start()
     try {
+      agents['host-a']!.createMode = 'create-then-unreachable'
       const details = await h.service.create(makeCreateRequest('team-1'))
       expect(details.status).toBe('starting')
       expect(rowState(h.path, 'team-1')).toBe('creating')
@@ -273,7 +306,7 @@ describe('controller service', () => {
       expect(agents['host-a']!.instances.size).toBe(1)
 
       agents['host-a']!.createMode = 'ok'
-      await h.start()
+      await h.timers.trigger(2)
       expect(rowState(h.path, 'team-1')).toBe('running')
       const resolved = await h.service.get({
         teamId: 'team-1',
@@ -288,9 +321,10 @@ describe('controller service', () => {
 
   test('ambiguous timeout with no VM is fenced and freed only after the agent confirms', async () => {
     const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
-    agents['host-a']!.createMode = 'unreachable'
     const h = harness({ agents, config: { createFenceSeconds: 5 } })
+    await h.start()
     try {
+      agents['host-a']!.createMode = 'unreachable'
       const details = await h.service.create(makeCreateRequest('team-1'))
       expect(details.status).toBe('starting')
       expect(rowState(h.path, 'team-1')).toBe('creating')
@@ -299,7 +333,7 @@ describe('controller service', () => {
       agents['host-a']!.createMode = 'ok'
       agents['host-a']!.deleteUnreachable = true
       h.clock.t += 6000
-      await h.start()
+      await h.timers.trigger(2)
       expect(rowState(h.path, 'team-1')).toBe('deleting')
       expect((await h.service.listHosts())[0]!.reserved.instances).toBe(1)
 
@@ -402,6 +436,7 @@ describe('controller service', () => {
       clock,
       config: { createFenceSeconds: 5 },
     })
+    await first.service.start()
     agents['host-a']!.createMode = 'create-then-unreachable'
     await first.service.create(makeCreateRequest('team-1'))
     agents['host-a']!.createMode = 'ok'
@@ -619,6 +654,8 @@ describe('controller service', () => {
         path: h.path,
       })
       expect((await reopened.service.listHosts())[0]!.health).toBe('draining')
+      // A restarted controller has no clock sample yet: probe before placing.
+      await reopened.service.start()
       await reopened.service.undrainHost('host-a')
       await reopened.service.create(makeCreateRequest('team-1'))
       expect((await reopened.service.listHosts())[0]!.reserved.instances).toBe(
@@ -727,12 +764,13 @@ describe('controller service', () => {
       'host-a': new FakeAgent('host-a', HOST_CAPACITY),
       'host-b': new FakeAgent('host-b', HOST_CAPACITY),
     }
-    agents['host-a']!.createMode = 'create-then-internal-error'
     const h = harness({
       agents,
       hosts: [makeHost('host-a'), makeHost('host-b')],
     })
+    await h.start()
     try {
+      agents['host-a']!.createMode = 'create-then-internal-error'
       const details = await h.service.create(makeCreateRequest('team-1'))
       expect(details.status).toBe('starting')
       expect(rowState(h.path, 'team-1')).toBe('creating')
@@ -742,7 +780,7 @@ describe('controller service', () => {
       expect(agents['host-b']!.createCount()).toBe(0)
 
       agents['host-a']!.createMode = 'ok'
-      await h.start()
+      await h.timers.trigger(2)
       expect(rowState(h.path, 'team-1')).toBe('running')
       expect(agents['host-a']!.instances.size).toBe(1)
       expect(agents['host-b']!.instances.size).toBe(0)
@@ -827,6 +865,56 @@ describe('controller service', () => {
     }
   })
 
+  test('a maxLifetime cap lowered across a restart is grandfathered', async () => {
+    const dir = testDir()
+    dirs.push(dir)
+    const clock = new FakeClock()
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const first = harness({
+      agents,
+      dir,
+      clock,
+      config: { maxLifetimeSeconds: 600 },
+    })
+    await first.service.start()
+    await first.service.create(
+      makeCreateRequest('team-1', { timeoutMilliseconds: 600_000 })
+    )
+    const created = clock.t
+    const oldDeadline = rowExpiry(first.path, 'team-1')!
+    expect(oldDeadline).toBe(created + 600_000)
+    await first.service.stop()
+
+    // Restart with a much lower cap.
+    const second = harness({
+      agents,
+      dir,
+      clock,
+      path: first.path,
+      config: { maxLifetimeSeconds: 60 },
+      newId: () => 'j' + 'a'.repeat(23),
+    })
+    await second.service.start()
+    try {
+      clock.t = created + 1000
+      // An extend never shortens the grandfathered deadline...
+      await second.service.extend({
+        teamId: 'team-1',
+        challengeIntegrationId: 'chal-1',
+        timeoutMilliseconds: 120_000,
+      })
+      expect(rowExpiry(second.path, 'team-1')).toBe(oldDeadline)
+
+      // ...while a new create gets the new, lower cap.
+      await second.service.create(
+        makeCreateRequest('team-2', { timeoutMilliseconds: 120_000 })
+      )
+      expect(rowExpiry(second.path, 'team-2')).toBe(clock.t + 60_000)
+    } finally {
+      await second.service.stop()
+    }
+  })
+
   test('competing out-of-order extends never shorten the deadline', async () => {
     const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
     const h = harness({ agents })
@@ -837,24 +925,43 @@ describe('controller service', () => {
       )
       const id = [...agents['host-a']!.instances.keys()][0]!
       h.clock.t += 1000
+      const longDeadline = h.clock.t + 30_000
 
-      await h.service.extend({
+      // The long extend's PATCH is applied by the agent first, but its network
+      // completion is held. A shorter extend started later completes first:
+      // the responses are genuinely reordered.
+      const hold = agents['host-a']!.holdNextExtend()
+      const longPending = h.service.extend({
         teamId: 'team-1',
         challengeIntegrationId: 'chal-1',
         timeoutMilliseconds: 30_000,
       })
-      const longDeadline = rowExpiry(h.path, 'team-1')!
-      expect(longDeadline).toBe(h.clock.t + 30_000)
-
-      // A later (out-of-order) shorter push must not shorten the row or agent.
-      await h.service.extend({
-        teamId: 'team-1',
-        challengeIntegrationId: 'chal-1',
-        timeoutMilliseconds: 5000,
-      })
+      await hold.captured
       expect(rowExpiry(h.path, 'team-1')).toBe(longDeadline)
+
+      let shortCompleted = false
+      const shortPending = h.service
+        .extend({
+          teamId: 'team-1',
+          challengeIntegrationId: 'chal-1',
+          timeoutMilliseconds: 5000,
+        })
+        .then(result => {
+          shortCompleted = true
+          return result
+        })
+      const shortResult = await shortPending
+      expect(shortCompleted).toBe(true)
+      expect(shortResult.status).toBe('running')
+
+      hold.release()
+      const longResult = await longPending
+      expect(longResult.status).toBe('running')
+
+      expect(rowExpiry(h.path, 'team-1')).toBe(longDeadline)
+      // +1ms is the conservative RTT/2 slack of the 1ms sample.
       expect(agents['host-a']!.instances.get(id)!.expiresAtMs).toBe(
-        longDeadline
+        longDeadline + 1
       )
     } finally {
       await h.service.stop()
@@ -883,6 +990,43 @@ describe('controller service', () => {
     }
   })
 
+  test('stop halts every loop first and bounds held ticks by one deadline', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents, config: { shutdownTimeoutSeconds: 0.05 } })
+    await h.start()
+    try {
+      let release!: () => void
+      agents['host-a']!.infoHold = new Promise<void>(resolve => {
+        release = resolve
+      })
+      const heartbeat = h.timers.trigger(0)
+      await Bun.sleep(2)
+      expect(h.timers.size).toBe(3)
+
+      const started = Date.now()
+      const stopping = h.service.stop()
+      // Every loop is unscheduled synchronously, before any tick is awaited.
+      await Promise.resolve()
+      expect(h.timers.size).toBe(0)
+      await stopping
+      expect(Date.now() - started).toBeLessThan(1000)
+      expect(h.logs.lines.join('\n')).toContain(
+        'controller shutdown deadline exceeded'
+      )
+
+      // The held tick resumes after SQLite is closed; its late writes are
+      // harmless and must not surface as a loop failure.
+      agents['host-a']!.infoHold = null
+      release()
+      await heartbeat
+      expect(h.logs.lines.join('\n')).not.toContain(
+        'controller loop tick failed'
+      )
+    } finally {
+      // stopped above
+    }
+  })
+
   for (const offset of [5000, -5000]) {
     test(`translates deadlines by a ${offset}ms clock offset in both directions`, async () => {
       const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
@@ -897,11 +1041,12 @@ describe('controller service', () => {
         expect(row.status).toBe('running')
         const id = [...agents['host-a']!.instances.keys()][0]!
         const deadline = rowExpiry(h.path, 'team-1')!
+        // +1ms is the conservative RTT/2 slack of the deterministic 1ms sample.
         expect(agents['host-a']!.createCalls[0]!.expiresAtMs).toBe(
-          deadline + offset
+          deadline + offset + 1
         )
         expect(agents['host-a']!.instances.get(id)!.expiresAtMs).toBe(
-          deadline + offset
+          deadline + offset + 1
         )
 
         h.clock.t += 1000
@@ -913,7 +1058,7 @@ describe('controller service', () => {
         const extended = rowExpiry(h.path, 'team-1')!
         expect(extended).toBe(h.clock.t + 20_000)
         expect(agents['host-a']!.instances.get(id)!.expiresAtMs).toBe(
-          extended + offset
+          extended + offset + 1
         )
       } finally {
         await h.service.stop()
@@ -934,6 +1079,210 @@ describe('controller service', () => {
       expect(errorCode(error)).toBe('no_capacity')
       expect((error as ProtocolError).message).toContain('clock skew')
       expect(agents['host-a']!.createCount()).toBe(0)
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('an initial /info failure refuses placement until a probe succeeds', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    agents['host-a']!.infoMode = 'unreachable'
+    const h = harness({ agents })
+    await h.start()
+    try {
+      expect((await h.service.listHosts())[0]!.health).toBe('healthy')
+      const error = await h.service
+        .create(makeCreateRequest('team-1'))
+        .catch(error => error)
+      expect(errorCode(error)).toBe('no_capacity')
+      expect((error as ProtocolError).message).toContain('clock sample')
+      expect(agents['host-a']!.createCount()).toBe(0)
+      expect(hostClock(h.path, 'host-a').state).toBe('unknown')
+
+      agents['host-a']!.infoMode = 'ok'
+      await h.timers.trigger(0)
+      expect(hostClock(h.path, 'host-a').state).toBe('valid')
+      expect((await h.service.create(makeCreateRequest('team-1'))).status).toBe(
+        'running'
+      )
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('fails over to a host that has a usable clock sample', async () => {
+    const agents = {
+      'host-a': new FakeAgent('host-a', HOST_CAPACITY),
+      'host-b': new FakeAgent('host-b', HOST_CAPACITY),
+    }
+    agents['host-a']!.infoMode = 'unreachable'
+    const h = harness({ agents })
+    await h.start()
+    try {
+      const details = await h.service.create(makeCreateRequest('team-1'))
+      expect(details.status).toBe('running')
+      expect(agents['host-a']!.createCount()).toBe(0)
+      expect(agents['host-b']!.createCount()).toBe(1)
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('rejects an asymmetric slow clock sample instead of trusting a bogus skew', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    agents['host-a']!.latencyMs = 40
+    const h = harness({
+      agents,
+      config: { clockMaxRttSeconds: 0.01 },
+      rttNow: () => performance.now(),
+    })
+    await h.start()
+    try {
+      // Synchronized clocks, but the response spent 40ms on the wire: the
+      // measured skew must not be (or ever be used as) -20ms.
+      const clock = hostClock(h.path, 'host-a')
+      expect(clock.state).not.toBe('valid')
+      const error = await h.service
+        .create(makeCreateRequest('team-1'))
+        .catch(error => error)
+      expect(errorCode(error)).toBe('no_capacity')
+      expect((error as ProtocolError).message).toContain('clock sample')
+      expect(agents['host-a']!.createCount()).toBe(0)
+
+      agents['host-a']!.latencyMs = 0
+      await h.timers.trigger(0)
+      expect(hostClock(h.path, 'host-a').state).toBe('valid')
+      expect(hostClock(h.path, 'host-a').skew).toBe(0)
+      expect((await h.service.create(makeCreateRequest('team-1'))).status).toBe(
+        'running'
+      )
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('a controller clock step rejects the sample and keeps the old estimate', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    agents['host-a']!.clockOffsetMs = 5000
+    const h = harness({ agents })
+    await h.start()
+    try {
+      expect(hostClock(h.path, 'host-a')).toMatchObject({
+        state: 'valid',
+        skew: 5000,
+      })
+      await h.service.create(makeCreateRequest('team-1'))
+
+      // The controller wall clock jumps backwards while the probe runs.
+      agents['host-a']!.infoHook = () => {
+        h.clock.t -= 1000
+      }
+      await h.timers.trigger(0)
+      expect(hostClock(h.path, 'host-a')).toMatchObject({
+        state: 'stale',
+        skew: 5000,
+      })
+      // No NEW placements while the sample is not trustworthy...
+      const error = await h.service
+        .create(makeCreateRequest('team-2'))
+        .catch(error => error)
+      expect(errorCode(error)).toBe('no_capacity')
+      // ...but existing instances keep working.
+      expect(
+        (
+          await h.service.extend({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+            timeoutMilliseconds: 10_000,
+          })
+        ).status
+      ).toBe('running')
+
+      agents['host-a']!.infoHook = null
+      await h.timers.trigger(0)
+      expect(hostClock(h.path, 'host-a').state).toBe('valid')
+      expect((await h.service.create(makeCreateRequest('team-2'))).status).toBe(
+        'running'
+      )
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('an RTT above clockMaxRttSeconds is rejected and keeps the previous estimate', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    agents['host-a']!.clockOffsetMs = 5000
+    const rtt = {
+      value: 0,
+      step: 1,
+      now(): number {
+        const value = this.value
+        this.value += this.step
+        return value
+      },
+    }
+    const h = harness({
+      agents,
+      config: { clockMaxRttSeconds: 2 },
+      rttNow: () => rtt.now(),
+    })
+    await h.start()
+    try {
+      expect(hostClock(h.path, 'host-a')).toMatchObject({
+        state: 'valid',
+        skew: 5000,
+        rtt: 1,
+      })
+      await h.service.create(makeCreateRequest('team-1'))
+
+      rtt.step = 9000
+      await h.timers.trigger(0)
+      // The bad sample is discarded; the last good one is kept but stale.
+      expect(hostClock(h.path, 'host-a')).toMatchObject({
+        state: 'stale',
+        skew: 5000,
+        rtt: 1,
+      })
+      expect(
+        errorCode(
+          await h.service
+            .create(makeCreateRequest('team-2'))
+            .catch(error => error)
+        )
+      ).toBe('no_capacity')
+
+      rtt.step = 1
+      await h.timers.trigger(0)
+      expect(hostClock(h.path, 'host-a').state).toBe('valid')
+      expect((await h.service.create(makeCreateRequest('team-2'))).status).toBe(
+        'running'
+      )
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('a stale clock sample blocks new placements but keeps existing instances', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents, config: { clockSampleMaxAgeSeconds: 0.005 } })
+    await h.start()
+    try {
+      await h.service.create(makeCreateRequest('team-1'))
+      h.clock.t += 10
+      const error = await h.service
+        .create(makeCreateRequest('team-2'))
+        .catch(error => error)
+      expect(errorCode(error)).toBe('no_capacity')
+      expect((error as ProtocolError).message).toContain('clock sample')
+      expect(
+        (
+          await h.service.extend({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+            timeoutMilliseconds: 10_000,
+          })
+        ).status
+      ).toBe('running')
     } finally {
       await h.service.stop()
     }

@@ -14,6 +14,10 @@
  * - Other calls map 4xx `agentError` bodies to `AgentRejectedError` and 5xx or
  *   unrecognised failures to `AgentUnreachableError` (a failed GET must never
  *   make the controller delete a row).
+ * - `delete` confirms ownership release ONLY for HTTP 2xx or 404, which is the
+ *   only outcome that guarantees the agent wrote its durable tombstone. Every
+ *   other response (410/`expired`, another 4xx, 5xx, timeout, malformed body)
+ *   throws, so the caller keeps the row fenced and retries.
  *
  * Request bodies can contain flags: they are never logged here.
  */
@@ -77,11 +81,6 @@ export const isDefinitiveCreateRejection = (
   (status === 503 && code === 'draining') ||
   (status === 400 && code === 'invalid_request') ||
   (status === 401 && code === 'unauthorized')
-
-/** Errors that confirm an id is gone (DELETE/GET 404 or an expired row). */
-export const isConfirmedGone = (error: unknown): boolean =>
-  error instanceof AgentRejectedError &&
-  (error.code === 'not_found' || error.code === 'expired')
 
 export class HttpAgentClient implements AgentClient {
   readonly hostId: string
@@ -343,14 +342,25 @@ export class HttpAgentClient implements AgentClient {
     )
     if (result.kind === 'notFound') return
     if (result.kind === 'error') this.rejectNonCreate(result)
-    // Teardown is confirmed by the status. Older/newer agents may return an
-    // empty body or the instance record; an unparseable body must not undo a
-    // successful teardown.
+    // Only HTTP 2xx/404 confirm a teardown (the agent wrote its tombstone).
+    // Older/newer agents may return an empty body or the instance record; a
+    // malformed body is NOT confirmation, so the caller keeps the row fenced
+    // and retries the DELETE.
     if (result.text.trim() === '') return
+    let json: unknown
     try {
-      agentInstanceSchema.safeParse(JSON.parse(result.text))
+      json = JSON.parse(result.text)
     } catch {
-      // ignore: DELETE succeeded, the body is informational only
+      throw new AgentUnreachableError(
+        this.hostId,
+        'agent returned malformed JSON for DELETE'
+      )
+    }
+    if (!agentInstanceSchema.safeParse(json).success) {
+      throw new AgentUnreachableError(
+        this.hostId,
+        'agent returned an invalid DELETE response'
+      )
     }
   }
 }

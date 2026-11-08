@@ -84,6 +84,12 @@ export interface InstanceRecord {
   expiresAtMs: number
   createdAtMs: number
   updatedAtMs: number
+  /**
+   * Monotonically incremented on every mutation of this row. Snapshots/CAS
+   * compare this instead of `updatedAtMs`, so two writes in the same
+   * millisecond (or with a coarse/fixed clock) cannot clobber each other.
+   */
+  revision: number
   message: string | null
   /** false => the agent's copy of the deadline is behind and must be re-pushed. */
   agentExpirySynced: boolean
@@ -94,6 +100,21 @@ export interface InstanceRecord {
 }
 
 export type HostHealth = 'healthy' | 'unhealthy'
+
+/**
+ * `unknown`: never sampled successfully.
+ * `valid`: the stored estimate came from a recent accepted sample.
+ * `stale`: a previous estimate exists, but the last sample was rejected or the
+ * controller restarted; the host takes no new placements until a probe works.
+ */
+export type HostClockState = 'unknown' | 'valid' | 'stale'
+
+/** One accepted clock measurement: (agent - controller) offset in ms. */
+export interface ClockSample {
+  skewMs: number
+  rttMs: number
+  sampledAtMs: number
+}
 
 export interface HostRecord {
   id: string
@@ -108,6 +129,11 @@ export interface HostRecord {
   reportedCapacity: Capacity | null
   /** Estimated (agent - controller) clock offset in ms, RTT compensated. */
   clockSkewMs: number
+  /** Round-trip time of the sample that produced `clockSkewMs`. */
+  clockRttMs: number | null
+  /** Controller-clock time when the estimate was measured. */
+  clockSampledAtMs: number | null
+  clockState: HostClockState
 }
 
 export interface InstanceKeyRow {
@@ -129,6 +155,7 @@ interface InstanceDbRow {
   expires_at_ms: number
   created_at_ms: number
   updated_at_ms: number
+  revision: number
   message: string | null
   agent_expiry_synced: number
   expose_json: string
@@ -148,6 +175,9 @@ interface HostDbRow {
   reported_disk_mib: number | null
   reported_max_instances: number | null
   clock_skew_ms: number
+  clock_rtt_ms: number | null
+  clock_sampled_at_ms: number | null
+  clock_state: string
 }
 
 interface Migration {
@@ -219,12 +249,25 @@ const MIGRATIONS: readonly Migration[] = [
         ON instances(team_id, challenge_integration_id, state);
     `,
   },
+  {
+    version: 3,
+    sql: `
+      -- CAS revision: every row mutation increments it, so snapshot updates
+      -- never rely on millisecond timestamps.
+      ALTER TABLE instances ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+
+      -- Clock samples: an estimate is usable only when recent and accepted.
+      ALTER TABLE hosts ADD COLUMN clock_rtt_ms REAL;
+      ALTER TABLE hosts ADD COLUMN clock_sampled_at_ms INTEGER;
+      ALTER TABLE hosts ADD COLUMN clock_state TEXT NOT NULL DEFAULT 'unknown';
+    `,
+  },
 ]
 
 const INSTANCE_COLUMNS = `
   id, team_id, challenge_integration_id, team_key, host_id, state, image,
   vcpus, mem_mib, disk_mib, expires_at_ms, created_at_ms, updated_at_ms,
-  message, agent_expiry_synced, expose_json, endpoints_json
+  revision, message, agent_expiry_synced, expose_json, endpoints_json
 `
 
 const parseJson = <T>(value: string | null): T | null => {
@@ -250,6 +293,7 @@ const rowToInstance = (row: InstanceDbRow): InstanceRecord => ({
   expiresAtMs: row.expires_at_ms,
   createdAtMs: row.created_at_ms,
   updatedAtMs: row.updated_at_ms,
+  revision: row.revision,
   message: row.message,
   agentExpirySynced: row.agent_expiry_synced === 1,
   expose: parseJson<StoredExpose[]>(row.expose_json) ?? [],
@@ -277,6 +321,12 @@ const rowToHost = (row: HostDbRow): HostRecord => ({
           maxInstances: row.reported_max_instances,
         },
   clockSkewMs: row.clock_skew_ms ?? 0,
+  clockRttMs: row.clock_rtt_ms ?? null,
+  clockSampledAtMs: row.clock_sampled_at_ms ?? null,
+  clockState:
+    row.clock_state === 'valid' || row.clock_state === 'stale'
+      ? row.clock_state
+      : 'unknown',
 })
 
 const placeholders = (count: number): string =>
@@ -309,6 +359,14 @@ export interface StatePatch {
   agentExpirySynced?: boolean
 }
 
+/** Thrown by every store operation after `close()` (controller shutdown). */
+export class StoreClosedError extends Error {
+  constructor() {
+    super('controller store is closed')
+    this.name = 'StoreClosedError'
+  }
+}
+
 export class Store {
   readonly db: Database
   private closed = false
@@ -326,6 +384,27 @@ export class Store {
     this.db.exec('PRAGMA busy_timeout = 5000;')
     this.db.exec('PRAGMA synchronous = NORMAL;')
     this.migrate()
+    // Opening the database IS a controller (re)start: a persisted estimate was
+    // measured by a previous process and must not be trusted until this process
+    // completes its own probe. Keep the value, but mark it stale.
+    this.markClockSamplesStale()
+  }
+
+  /** Any operation after `close()` throws so late loop ticks are harmless. */
+  private assertOpen(): void {
+    if (this.closed) throw new StoreClosedError()
+  }
+
+  private markClockSamplesStale(): void {
+    this.db
+      .prepare(
+        `UPDATE hosts
+         SET clock_state = CASE
+           WHEN clock_sampled_at_ms IS NULL THEN 'unknown'
+           ELSE 'stale'
+         END`
+      )
+      .run()
   }
 
   private migrate(): void {
@@ -360,6 +439,7 @@ export class Store {
    * synchronous: reservations + placement happen in one atomic step.
    */
   transaction<T>(fn: () => T): T {
+    this.assertOpen()
     return this.db.transaction(fn).immediate()
   }
 
@@ -372,6 +452,7 @@ export class Store {
   // ---- hosts ------------------------------------------------------------
 
   ensureHost(id: string, url: string, now = this.now()): HostRecord {
+    this.assertOpen()
     this.db
       .prepare(
         `INSERT INTO hosts (id, url, created_at_ms)
@@ -383,6 +464,7 @@ export class Store {
   }
 
   getHost(id: string): HostRecord | null {
+    this.assertOpen()
     const row = this.db
       .prepare('SELECT * FROM hosts WHERE id = ?')
       .get(id) as HostDbRow | null
@@ -390,10 +472,17 @@ export class Store {
   }
 
   listHosts(): HostRecord[] {
+    this.assertOpen()
     const rows = this.db.prepare('SELECT * FROM hosts').all() as HostDbRow[]
     return rows.map(rowToHost)
   }
 
+  /**
+   * Record a successful heartbeat. `clock` is the accepted sample, or `null`
+   * when this probe's sample was rejected: the previous estimate (if any) is
+   * kept but marked stale, so the host takes no new placements until a later
+   * probe produces a trustworthy sample.
+   */
   recordHeartbeat(
     id: string,
     opts: {
@@ -401,17 +490,30 @@ export class Store {
       now: number
       accepting: boolean
       capacity: Capacity
-      /** Estimated (agent - controller) clock offset in ms. */
-      skewMs?: number
+      clock?: ClockSample | null
     }
   ): void {
+    this.assertOpen()
+    const existing = this.getHost(id)
+    const sample = opts.clock ?? null
+    const skewMs =
+      sample === null ? (existing?.clockSkewMs ?? 0) : sample.skewMs
+    const rttMs =
+      sample === null ? (existing?.clockRttMs ?? null) : sample.rttMs
+    const sampledAtMs =
+      sample === null
+        ? (existing?.clockSampledAtMs ?? null)
+        : sample.sampledAtMs
+    const clockState: HostClockState =
+      sample !== null ? 'valid' : sampledAtMs === null ? 'unknown' : 'stale'
     this.db
       .prepare(
         `INSERT INTO hosts (
            id, url, created_at_ms, health, accepting, last_seen_ms,
            reported_vcpus, reported_mem_mib, reported_disk_mib,
-           reported_max_instances, clock_skew_ms
-         ) VALUES (?, ?, ?, 'healthy', ?, ?, ?, ?, ?, ?, ?)
+           reported_max_instances, clock_skew_ms, clock_rtt_ms,
+           clock_sampled_at_ms, clock_state
+         ) VALUES (?, ?, ?, 'healthy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            health = 'healthy',
            accepting = excluded.accepting,
@@ -420,7 +522,10 @@ export class Store {
            reported_mem_mib = excluded.reported_mem_mib,
            reported_disk_mib = excluded.reported_disk_mib,
            reported_max_instances = excluded.reported_max_instances,
-           clock_skew_ms = excluded.clock_skew_ms`
+           clock_skew_ms = excluded.clock_skew_ms,
+           clock_rtt_ms = excluded.clock_rtt_ms,
+           clock_sampled_at_ms = excluded.clock_sampled_at_ms,
+           clock_state = excluded.clock_state`
       )
       .run(
         id,
@@ -432,15 +537,20 @@ export class Store {
         opts.capacity.memMiB,
         opts.capacity.diskMiB,
         opts.capacity.maxInstances,
-        Math.round(opts.skewMs ?? 0)
+        Math.round(skewMs),
+        rttMs,
+        sampledAtMs,
+        clockState
       )
   }
 
   markHostHealth(id: string, health: HostHealth): void {
+    this.assertOpen()
     this.db.prepare('UPDATE hosts SET health = ? WHERE id = ?').run(health, id)
   }
 
   setDraining(id: string, draining: boolean): void {
+    this.assertOpen()
     this.db
       .prepare('UPDATE hosts SET draining = ? WHERE id = ?')
       .run(draining ? 1 : 0, id)
@@ -463,10 +573,11 @@ export class Store {
   // ---- instances --------------------------------------------------------
 
   insertInstance(record: InstanceRecord): void {
+    this.assertOpen()
     this.db
       .prepare(
         `INSERT INTO instances (${INSTANCE_COLUMNS})
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.id,
@@ -482,6 +593,7 @@ export class Store {
         record.expiresAtMs,
         record.createdAtMs,
         record.updatedAtMs,
+        record.revision,
         record.message,
         record.agentExpirySynced ? 1 : 0,
         JSON.stringify(record.expose),
@@ -490,6 +602,7 @@ export class Store {
   }
 
   getInstance(id: string): InstanceRecord | null {
+    this.assertOpen()
     const row = this.db
       .prepare(`SELECT ${INSTANCE_COLUMNS} FROM instances WHERE id = ?`)
       .get(id) as InstanceDbRow | null
@@ -497,6 +610,7 @@ export class Store {
   }
 
   getLiveInstance(key: InstanceKeyRow): InstanceRecord | null {
+    this.assertOpen()
     const row = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
@@ -514,6 +628,7 @@ export class Store {
 
   /** Preferred row for `get`: a live row if any, else the newest terminal row. */
   getInstanceForKey(key: InstanceKeyRow): InstanceRecord | null {
+    this.assertOpen()
     const row = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
@@ -532,6 +647,7 @@ export class Store {
   }
 
   listInstancesForHost(hostId: string): InstanceRecord[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances WHERE host_id = ?
@@ -542,6 +658,7 @@ export class Store {
   }
 
   listInstances(): InstanceRecord[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(`SELECT ${INSTANCE_COLUMNS} FROM instances`)
       .all() as InstanceDbRow[]
@@ -549,6 +666,7 @@ export class Store {
   }
 
   listInstancesInStates(states: readonly InstanceState[]): InstanceRecord[] {
+    this.assertOpen()
     if (states.length === 0) return []
     const rows = this.db
       .prepare(
@@ -561,6 +679,7 @@ export class Store {
 
   /** Terminal `errored` rows for one key; GC'd before a fresh create. */
   listErroredForKey(key: InstanceKeyRow): InstanceRecord[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
@@ -577,6 +696,7 @@ export class Store {
    * tombstone forever.
    */
   listSupersededErrored(): InstanceRecord[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances e
@@ -594,6 +714,7 @@ export class Store {
   }
 
   listExpiredRunning(now: number): InstanceRecord[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
@@ -604,12 +725,14 @@ export class Store {
   }
 
   deleteInstance(id: string): boolean {
+    this.assertOpen()
     return (
       this.db.prepare('DELETE FROM instances WHERE id = ?').run(id).changes > 0
     )
   }
 
   deleteInstanceIfState(id: string, state: InstanceState): boolean {
+    this.assertOpen()
     return (
       this.db
         .prepare('DELETE FROM instances WHERE id = ? AND state = ?')
@@ -625,6 +748,7 @@ export class Store {
     now: number,
     patch: StatePatch = {}
   ): boolean {
+    this.assertOpen()
     if (from.length === 0) return false
     return this.applyStateUpdate(
       `id = ? AND state IN (${placeholders(from.length)})`,
@@ -636,10 +760,11 @@ export class Store {
   }
 
   /**
-   * CAS against a row snapshot read earlier (`state` + `updated_at_ms`).
+   * CAS against a row snapshot read earlier (`state` + `revision`).
    * Used whenever a decision was made from data fetched before a network
    * round-trip: if anything changed the row in the meantime, the update is a
-   * no-op instead of clobbering newer ownership.
+   * no-op instead of clobbering newer ownership. `revision` increments on
+   * every mutation, so it also separates writes made in the same millisecond.
    */
   casStateSnapshot(
     snapshot: InstanceRecord,
@@ -647,9 +772,10 @@ export class Store {
     now: number,
     patch: StatePatch = {}
   ): boolean {
+    this.assertOpen()
     return this.applyStateUpdate(
-      'id = ? AND state = ? AND updated_at_ms = ?',
-      [snapshot.id, snapshot.state, snapshot.updatedAtMs],
+      'id = ? AND state = ? AND revision = ?',
+      [snapshot.id, snapshot.state, snapshot.revision],
       to,
       now,
       patch
@@ -663,7 +789,7 @@ export class Store {
     now: number,
     patch: StatePatch
   ): boolean {
-    const sets = ['state = ?', 'updated_at_ms = ?']
+    const sets = ['state = ?', 'updated_at_ms = ?', 'revision = revision + 1']
     const params: (string | number | null)[] = [to, now]
     if (patch.message !== undefined) {
       sets.push('message = ?')
@@ -697,12 +823,13 @@ export class Store {
     expiresAtMs: number,
     now: number
   ): boolean {
+    this.assertOpen()
     if (from.length === 0) return false
     const result = this.db
       .prepare(
         `UPDATE instances
          SET expires_at_ms = MAX(expires_at_ms, ?), updated_at_ms = ?,
-             agent_expiry_synced = 0
+             agent_expiry_synced = 0, revision = revision + 1
          WHERE id = ? AND state IN (${placeholders(from.length)})
            AND expires_at_ms > ?`
       )
@@ -716,10 +843,11 @@ export class Store {
     expiresAtMs: number,
     synced: boolean
   ): boolean {
+    this.assertOpen()
     return (
       this.db
         .prepare(
-          `UPDATE instances SET agent_expiry_synced = ?
+          `UPDATE instances SET agent_expiry_synced = ?, revision = revision + 1
            WHERE id = ? AND expires_at_ms = ?`
         )
         .run(synced ? 1 : 0, id, expiresAtMs).changes > 0
@@ -728,10 +856,12 @@ export class Store {
 
   /** Claim an expired running row for deletion; returns false if it was extended first. */
   claimExpiredRunning(id: string, now: number): boolean {
+    this.assertOpen()
     return (
       this.db
         .prepare(
-          `UPDATE instances SET state = 'deleting', updated_at_ms = ?
+          `UPDATE instances
+           SET state = 'deleting', updated_at_ms = ?, revision = revision + 1
            WHERE id = ? AND state = 'running' AND expires_at_ms <= ?`
         )
         .run(now, id, now).changes > 0
@@ -741,6 +871,7 @@ export class Store {
   // ---- reservations -----------------------------------------------------
 
   reservedByHost(): Map<string, Reserved> {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT host_id,
@@ -772,6 +903,7 @@ export class Store {
   }
 
   reservedForHost(hostId: string): Reserved {
+    this.assertOpen()
     return this.reservedByHost().get(hostId) ?? EMPTY_RESERVED
   }
 
@@ -783,10 +915,12 @@ export class Store {
    * as tombstones so the reconciler can delete the agent side when it returns.
    */
   writeOffHost(hostId: string, now: number): string[] {
+    this.assertOpen()
     return this.transaction(() => this.writeOffHostUnsafe(hostId, now))
   }
 
   private writeOffHostUnsafe(hostId: string, now: number): string[] {
+    this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
@@ -798,7 +932,7 @@ export class Store {
       const result = this.db
         .prepare(
           `UPDATE instances
-           SET state = 'lost', updated_at_ms = ?,
+           SET state = 'lost', updated_at_ms = ?, revision = revision + 1,
                message = 'host lost'
            WHERE id = ? AND state = ?`
         )

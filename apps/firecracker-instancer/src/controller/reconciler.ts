@@ -25,12 +25,12 @@
  */
 import type { AgentInstance } from '@rctf/firecracker-protocol'
 import {
+  AgentRejectedError,
   AgentUnreachableError,
   type AgentClient,
   type Clock,
 } from '../interfaces'
 import type { Logger } from '../log'
-import { isConfirmedGone } from './agent-client'
 import type { ControllerConfig } from './config'
 import { controllerEndpoints, Store, type InstanceRecord } from './store'
 
@@ -45,6 +45,22 @@ export interface ReconcilerDeps {
 }
 
 const LOST_MESSAGE = 'instance lost on host'
+
+interface ClockEstimate {
+  skewMs: number
+  /** Sample uncertainty (RTT/2) added conservatively to translated deadlines. */
+  slackMs: number
+}
+
+/**
+ * PATCH-only interpretation: `not_found`/`expired` from an extend means the
+ * instance is gone. This is deliberately NOT used to confirm a DELETE: only a
+ * resolving `AgentClient.delete` (HTTP 2xx/404) proves the agent wrote its
+ * tombstone.
+ */
+const isMissingOnExtend = (error: unknown): boolean =>
+  error instanceof AgentRejectedError &&
+  (error.code === 'not_found' || error.code === 'expired')
 
 export class Reconciler {
   private ticking = false
@@ -74,13 +90,10 @@ export class Reconciler {
         // on this snapshot and re-confirmed per id.
         const rows = store.listInstancesForHost(host.id)
         const agentInstances = await client.list()
-        await this.reconcileHost(
-          host.id,
-          client,
-          rows,
-          agentInstances,
-          record.clockSkewMs
-        )
+        await this.reconcileHost(host.id, client, rows, agentInstances, {
+          skewMs: record.clockSkewMs,
+          slackMs: Math.ceil((record.clockRttMs ?? 0) / 2),
+        })
       } catch (error) {
         if (error instanceof AgentUnreachableError) {
           this.deps.logger.warn(
@@ -107,7 +120,7 @@ export class Reconciler {
     client: AgentClient,
     rows: readonly InstanceRecord[],
     agentInstances: readonly AgentInstance[],
-    skewMs: number
+    clock: ClockEstimate
   ): Promise<void> {
     const { store, now, logger } = this.deps
     const agentById = new Map(
@@ -121,16 +134,11 @@ export class Reconciler {
             row,
             agentById.get(row.id),
             client,
-            skewMs
+            clock
           )
           break
         case 'running':
-          await this.reconcileRunning(
-            row,
-            agentById.get(row.id),
-            client,
-            skewMs
-          )
+          await this.reconcileRunning(row, agentById.get(row.id), client, clock)
           break
         case 'deleting':
           await this.confirmDelete(row, client)
@@ -157,7 +165,7 @@ export class Reconciler {
         // as an orphan.
         continue
       }
-      if (at - (agent.createdAtMs - skewMs) < graceMs) continue
+      if (at - (agent.createdAtMs - clock.skewMs) < graceMs) continue
       try {
         await client.delete(agent.id)
         logger.warn(
@@ -181,7 +189,7 @@ export class Reconciler {
     row: InstanceRecord,
     listed: AgentInstance | undefined,
     client: AgentClient,
-    skewMs: number
+    clock: ClockEstimate
   ): Promise<void> {
     const { store, now, logger } = this.deps
     if (this.deps.isCreateInFlight(row.id)) return
@@ -192,7 +200,7 @@ export class Reconciler {
         : await this.freshGet(row, client)
     if (fresh.kind === 'unknown') return
     if (fresh.kind === 'present') {
-      await this.applyCreatingObservation(row, fresh.agent, client, skewMs)
+      await this.applyCreatingObservation(row, fresh.agent, client, clock)
       return
     }
 
@@ -219,7 +227,7 @@ export class Reconciler {
     row: InstanceRecord,
     agent: AgentInstance,
     client: AgentClient,
-    skewMs: number
+    clock: ClockEstimate
   ): Promise<void> {
     const { store, now } = this.deps
     const endpoints = controllerEndpoints(row.expose, agent.endpoints)
@@ -228,7 +236,7 @@ export class Reconciler {
         store.casStateSnapshot(row, 'running', now(), {
           endpoints,
           message: null,
-          agentExpirySynced: this.agentDeadlineSynced(row, agent, skewMs),
+          agentExpirySynced: this.agentDeadlineSynced(row, agent, clock),
         })
         break
       case 'errored':
@@ -254,9 +262,9 @@ export class Reconciler {
       current !== null &&
       (current.state === 'creating' || current.state === 'running') &&
       (current.agentExpirySynced === false ||
-        this.agentDeadlineSynced(current, agent, skewMs) === false)
+        this.agentDeadlineSynced(current, agent, clock) === false)
     ) {
-      await this.syncExpiry(current, client, skewMs)
+      await this.syncExpiry(current, client, clock)
     }
   }
 
@@ -264,7 +272,7 @@ export class Reconciler {
     row: InstanceRecord,
     listed: AgentInstance | undefined,
     client: AgentClient,
-    skewMs: number
+    clock: ClockEstimate
   ): Promise<void> {
     const { store, now } = this.deps
     const fresh =
@@ -307,7 +315,7 @@ export class Reconciler {
 
     store.casStateSnapshot(row, 'running', now(), {
       endpoints,
-      agentExpirySynced: this.agentDeadlineSynced(row, agent, skewMs),
+      agentExpirySynced: this.agentDeadlineSynced(row, agent, clock),
     })
 
     const current = store.getInstance(row.id)
@@ -315,9 +323,9 @@ export class Reconciler {
       current !== null &&
       current.state === 'running' &&
       (current.agentExpirySynced === false ||
-        this.agentDeadlineSynced(current, agent, skewMs) === false)
+        this.agentDeadlineSynced(current, agent, clock) === false)
     ) {
-      await this.syncExpiry(current, client, skewMs)
+      await this.syncExpiry(current, client, clock)
     }
   }
 
@@ -352,18 +360,18 @@ export class Reconciler {
   private agentDeadlineSynced(
     row: InstanceRecord,
     agent: AgentInstance,
-    skewMs: number
+    clock: ClockEstimate
   ): boolean {
-    return agent.expiresAtMs - skewMs >= row.expiresAtMs
+    return agent.expiresAtMs - clock.skewMs - clock.slackMs >= row.expiresAtMs
   }
 
   private async syncExpiry(
     row: InstanceRecord,
     client: AgentClient,
-    skewMs: number
+    clock: ClockEstimate
   ): Promise<void> {
     const { store, logger } = this.deps
-    const target = row.expiresAtMs + skewMs
+    const target = row.expiresAtMs + clock.skewMs + clock.slackMs
     try {
       const confirmed = await client.extend(row.id, target)
       // Only trust a confirmation that covers the row's translated deadline.
@@ -381,7 +389,7 @@ export class Reconciler {
         )
       }
     } catch (error) {
-      if (isConfirmedGone(error)) {
+      if (isMissingOnExtend(error)) {
         if (row.state === 'running') {
           store.casStateSnapshot(row, 'errored', this.deps.now(), {
             message: LOST_MESSAGE,
@@ -407,12 +415,10 @@ export class Reconciler {
   ): Promise<void> {
     const { store } = this.deps
     try {
+      // Only a resolving delete proves the agent wrote its tombstone.
       await client.delete(row.id)
       store.deleteInstanceIfState(row.id, 'deleting')
-    } catch (error) {
-      if (isConfirmedGone(error)) {
-        store.deleteInstanceIfState(row.id, 'deleting')
-      }
+    } catch {
       // Otherwise keep the row `deleting`; the next tick retries.
     }
   }
@@ -425,10 +431,8 @@ export class Reconciler {
     try {
       await client.delete(row.id)
       store.deleteInstanceIfState(row.id, 'lost')
-    } catch (error) {
-      if (isConfirmedGone(error)) {
-        store.deleteInstanceIfState(row.id, 'lost')
-      }
+    } catch {
+      // Keep the tombstone; the next tick retries.
     }
   }
 
@@ -449,11 +453,8 @@ export class Reconciler {
           { instanceId: row.id, hostId: row.hostId },
           'reconciler: garbage-collected superseded errored instance'
         )
-      } catch (error) {
-        if (isConfirmedGone(error)) {
-          store.deleteInstanceIfState(row.id, 'errored')
-        }
-        // Unreachable: keep the tombstone for the next sweep.
+      } catch {
+        // Unconfirmed: keep the tombstone for the next sweep.
       }
     }
   }

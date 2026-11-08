@@ -24,6 +24,10 @@ export interface PlacementCandidate {
   reserved: Reserved
   /** Max |clock skew| in ms allowed for placement (default: unlimited). */
   maxClockSkewMs?: number
+  /** Controller time used to judge clock-sample age (default: no age limit). */
+  nowMs?: number
+  /** Max age of an accepted clock sample in ms (default: no age limit). */
+  clockSampleMaxAgeMs?: number
 }
 
 export const effectiveCapacity = (
@@ -43,10 +47,30 @@ const withinClockSkew = (candidate: PlacementCandidate): boolean =>
   candidate.maxClockSkewMs === undefined ||
   Math.abs(candidate.host.clockSkewMs) <= candidate.maxClockSkewMs
 
+/**
+ * A placement needs a successful, accepted clock sample. Without one the
+ * controller cannot translate the deadline safely, so the host takes no new
+ * instances (existing ones keep running on the stored estimate).
+ */
+const hasUsableClockSample = (candidate: PlacementCandidate): boolean => {
+  if (candidate.host.clockState !== 'valid') return false
+  if (candidate.host.clockSampledAtMs === null) return false
+  if (
+    candidate.nowMs === undefined ||
+    candidate.clockSampleMaxAgeMs === undefined
+  )
+    return true
+  return (
+    candidate.nowMs - candidate.host.clockSampledAtMs <=
+    candidate.clockSampleMaxAgeMs
+  )
+}
+
 export const isPlaceable = (candidate: PlacementCandidate): boolean =>
   candidate.host.health === 'healthy' &&
   !candidate.host.draining &&
   candidate.host.accepting &&
+  hasUsableClockSample(candidate) &&
   withinClockSkew(candidate)
 
 export interface FitResult {
@@ -170,6 +194,24 @@ export const describeNoCapacity = (
         ).length
     ) {
       return 'no capacity: all hosts exceed the maximum clock skew'
+    }
+    const clockUnusable = candidates.filter(
+      candidate =>
+        candidate.host.health === 'healthy' &&
+        !candidate.host.draining &&
+        candidate.host.accepting &&
+        withinClockSkew(candidate) &&
+        !hasUsableClockSample(candidate)
+    )
+    if (
+      clockUnusable.length > 0 &&
+      clockUnusable.length ===
+        candidates.filter(
+          candidate =>
+            candidate.host.health === 'healthy' && !candidate.host.draining
+        ).length
+    ) {
+      return 'no capacity: no host has a fresh clock sample'
     }
     return 'no capacity: no host is accepting instances'
   }

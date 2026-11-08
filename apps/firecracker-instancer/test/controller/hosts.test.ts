@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import type { ControllerConfig } from '../../src/controller/config'
 import { HostMonitor, PeriodicLoop } from '../../src/controller/hosts'
-import { Store } from '../../src/controller/store'
+import { Store, StoreClosedError } from '../../src/controller/store'
 import {
   cleanupDir,
   databasePath,
@@ -29,11 +29,14 @@ const monitorSetup = (
   const store = new Store(databasePath(dir), () => Date.now())
   const logs = new MemoryLogs()
   const config = makeConfig(dir, hosts, overrides)
+  let monotonic = 0
   const monitor = new HostMonitor({
     config,
     store,
     clients: agents,
     now: () => Date.now(),
+    // Deterministic 1ms RTT per probe (the fixed wall clock never advances).
+    rttNow: () => ++monotonic,
     logger: logs.asLogger(),
   })
   return { store, monitor, logs, dir }
@@ -172,5 +175,65 @@ describe('PeriodicLoop', () => {
     await loop.stop()
     expect(finished).toBe(true)
     await running
+  })
+
+  test('stop is bounded by the deadline even with a held tick', async () => {
+    const timers = new FakeTimers()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const loop = new PeriodicLoop(
+      'held',
+      1000,
+      async () => {
+        await gate
+      },
+      timers,
+      logs.asLogger()
+    )
+    loop.start()
+    const running = loop.run()
+    await Promise.resolve()
+    const started = Date.now()
+    await loop.stop(50)
+    expect(Date.now() - started).toBeLessThan(1000)
+    // Scheduling stopped immediately, even though the tick is still held.
+    expect(timers.size).toBe(0)
+    release()
+    await running
+  })
+
+  test('a late tick against a closed store is swallowed quietly', async () => {
+    const dir = testDir()
+    dirs.push(dir)
+    const store = new Store(databasePath(dir), () => Date.now())
+    const timers = new FakeTimers()
+    const localLogs = new MemoryLogs()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const loop = new PeriodicLoop(
+      'late',
+      1000,
+      async () => {
+        await gate
+        // The controller closed SQLite while this tick was in flight.
+        store.getHost('host-a')
+      },
+      timers,
+      localLogs.asLogger()
+    )
+    loop.start()
+    const running = loop.run()
+    await Promise.resolve()
+    store.close()
+    release()
+    await running
+    expect(localLogs.lines.join('\n')).not.toContain(
+      'controller loop tick failed'
+    )
+    expect(() => store.getHost('host-a')).toThrow(StoreClosedError)
   })
 })

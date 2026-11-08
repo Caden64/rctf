@@ -36,7 +36,7 @@ import {
   type ControllerService,
 } from '../interfaces'
 import { createLogger, type Logger } from '../log'
-import { HttpAgentClient, isConfirmedGone } from './agent-client'
+import { HttpAgentClient } from './agent-client'
 import type { ControllerConfig, HostConfig } from './config'
 import {
   defaultTimers,
@@ -73,6 +73,8 @@ export interface ControllerServiceDeps {
   newId?: () => string
   /** Injectable interval timers (tests). */
   timers?: ControllerTimers
+  /** Monotonic RTT source for clock samples (tests); defaults to performance.now. */
+  rttNow?: () => number
 }
 
 type ExtendOutcome =
@@ -179,6 +181,7 @@ class ControllerServiceImpl implements ControllerService {
       store: this.store,
       clients: this.clients,
       now: this.now,
+      ...(deps.rttNow === undefined ? {} : { rttNow: deps.rttNow }),
       logger: this.logger,
     })
     this.reconciler = new Reconciler({
@@ -416,6 +419,8 @@ class ControllerServiceImpl implements ControllerService {
       const at = this.now()
       const reserved = this.store.reservedByHost()
       const maxClockSkewMs = (this.config.maxClockSkewSeconds ?? 10) * 1000
+      const clockSampleMaxAgeMs =
+        (this.config.clockSampleMaxAgeSeconds ?? 60) * 1000
       const candidates = this.config.hosts
         .filter(host => !attempted.has(host.id))
         .map(host => {
@@ -425,6 +430,8 @@ class ControllerServiceImpl implements ControllerService {
             host: record,
             reserved: reserved.get(host.id) ?? EMPTY_RESERVED,
             maxClockSkewMs,
+            nowMs: at,
+            clockSampleMaxAgeMs,
           }
         })
 
@@ -465,6 +472,7 @@ class ControllerServiceImpl implements ControllerService {
         expiresAtMs,
         createdAtMs: at,
         updatedAtMs: at,
+        revision: 0,
         message: null,
         agentExpirySynced: true,
         expose,
@@ -475,8 +483,37 @@ class ControllerServiceImpl implements ControllerService {
     })
   }
 
-  private skewFor(hostId: string): number {
-    return this.store.getHost(hostId)?.clockSkewMs ?? 0
+  /**
+   * Clock estimate used to translate a controller deadline onto the agent
+   * clock. `slackMs` is the sample's uncertainty (RTT/2): adding it means the
+   * translated deadline is never earlier than the controller deadline by more
+   * than measurement noise, even if the skew estimate is off by that much.
+   */
+  private clockEstimate(hostId: string): { skewMs: number; slackMs: number } {
+    const host = this.store.getHost(hostId)
+    if (host === null) return { skewMs: 0, slackMs: 0 }
+    return {
+      skewMs: host.clockSkewMs,
+      slackMs: Math.ceil((host.clockRttMs ?? 0) / 2),
+    }
+  }
+
+  private toAgentDeadline(
+    hostId: string,
+    controllerDeadlineMs: number
+  ): number {
+    const { skewMs, slackMs } = this.clockEstimate(hostId)
+    return controllerDeadlineMs + skewMs + slackMs
+  }
+
+  /** Conservative check that an agent deadline covers the controller one. */
+  private agentCoversDeadline(
+    hostId: string,
+    agentDeadlineMs: number,
+    controllerDeadlineMs: number
+  ): boolean {
+    const { skewMs, slackMs } = this.clockEstimate(hostId)
+    return agentDeadlineMs - skewMs - slackMs >= controllerDeadlineMs
   }
 
   private buildSpec(
@@ -517,7 +554,7 @@ class ControllerServiceImpl implements ControllerService {
             }
       ),
       // Deadlines are on the AGENT clock.
-      expiresAtMs: row.expiresAtMs + this.skewFor(row.hostId),
+      expiresAtMs: this.toAgentDeadline(row.hostId, row.expiresAtMs),
       flags: req.flags,
     }
   }
@@ -541,8 +578,11 @@ class ControllerServiceImpl implements ControllerService {
     return this.store.casState(row.id, ['creating'], target, at, {
       endpoints,
       message: agent.message ?? null,
-      agentExpirySynced:
-        agent.expiresAtMs - this.skewFor(row.hostId) >= row.expiresAtMs,
+      agentExpirySynced: this.agentCoversDeadline(
+        row.hostId,
+        agent.expiresAtMs,
+        row.expiresAtMs
+      ),
     })
   }
 
@@ -704,18 +744,22 @@ class ControllerServiceImpl implements ControllerService {
         }
       }
 
-      let expiresAtMs = at + req.timeoutMilliseconds
+      let requestedDeadline = at + req.timeoutMilliseconds
       if (this.config.maxLifetimeSeconds !== undefined) {
-        expiresAtMs = Math.min(
-          expiresAtMs,
+        requestedDeadline = Math.min(
+          requestedDeadline,
           row.createdAtMs + this.config.maxLifetimeSeconds * 1000
         )
-        if (expiresAtMs <= at) {
-          return {
-            kind: 'error',
-            code: 'expired',
-            message: 'instance has reached its maximum lifetime',
-          }
+      }
+      // GRANDFATHERED: a cap lowered across a restart never shortens an
+      // existing instance. Keep the current deadline when it is already later
+      // than what the new cap would allow (the row simply stops extending).
+      const expiresAtMs = Math.max(row.expiresAtMs, requestedDeadline)
+      if (expiresAtMs <= at) {
+        return {
+          kind: 'error',
+          code: 'expired',
+          message: 'instance has reached its maximum lifetime',
         }
       }
 
@@ -753,10 +797,16 @@ class ControllerServiceImpl implements ControllerService {
     const row = outcome.row
     const client = this.clients[row.hostId]
     if (client !== undefined) {
-      const skewMs = this.skewFor(row.hostId)
+      const target = this.toAgentDeadline(row.hostId, row.expiresAtMs)
       try {
-        const confirmed = await client.extend(row.id, row.expiresAtMs + skewMs)
-        if (confirmed.expiresAtMs - skewMs >= row.expiresAtMs) {
+        const confirmed = await client.extend(row.id, target)
+        if (
+          this.agentCoversDeadline(
+            row.hostId,
+            confirmed.expiresAtMs,
+            row.expiresAtMs
+          )
+        ) {
           this.store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
         }
       } catch (error) {
@@ -787,11 +837,10 @@ class ControllerServiceImpl implements ControllerService {
         try {
           await client.delete(row.id)
           this.store.deleteInstanceIfState(row.id, 'lost')
-        } catch (error) {
-          if (isConfirmedGone(error)) {
-            this.store.deleteInstanceIfState(row.id, 'lost')
-          }
-          // Unreachable: keep the tombstone; the host's return cleans it up.
+        } catch {
+          // Unconfirmed: keep the tombstone; the host's return cleans it up.
+          // Only a resolving `AgentClient.delete` (HTTP 2xx/404) proves the
+          // agent wrote its fence.
         }
       }
       return stoppedDetails()
@@ -817,10 +866,6 @@ class ControllerServiceImpl implements ControllerService {
         this.store.deleteInstanceIfState(row.id, 'deleting')
         return stoppedDetails()
       } catch (error) {
-        if (isConfirmedGone(error)) {
-          this.store.deleteInstanceIfState(row.id, 'deleting')
-          return stoppedDetails()
-        }
         this.logger.warn(
           {
             instanceId: row.id,
@@ -847,10 +892,8 @@ class ControllerServiceImpl implements ControllerService {
       try {
         await client.delete(row.id)
         this.store.deleteInstanceIfState(row.id, 'errored')
-      } catch (error) {
-        if (isConfirmedGone(error)) {
-          this.store.deleteInstanceIfState(row.id, 'errored')
-        }
+      } catch {
+        // Not confirmed; the reconciler sweep retries.
       }
     }
   }
@@ -981,10 +1024,44 @@ class ControllerServiceImpl implements ControllerService {
   }
 
   async stop(): Promise<void> {
-    // Stop scheduling and await any in-flight tick before closing SQLite.
-    for (const loop of this.loops) await loop.stop()
+    const loops = this.loops
     this.loops = []
     this.started = false
+
+    // First, synchronously stop scheduling in EVERY loop. Awaiting one held
+    // tick must never leave the remaining loops armed.
+    for (const loop of loops) loop.halt()
+
+    if (loops.length > 0) {
+      const timeoutMs = Math.max(
+        0,
+        (this.config.shutdownTimeoutSeconds ?? 10) * 1000
+      )
+      let handle: ReturnType<typeof setTimeout> | undefined
+      let timedOut = false
+      const deadline = new Promise<void>(resolve => {
+        handle = setTimeout(() => {
+          timedOut = true
+          resolve()
+        }, timeoutMs)
+      })
+      try {
+        // One shared deadline for all loops, awaited concurrently.
+        await Promise.race([
+          Promise.all(loops.map(loop => loop.settle())),
+          deadline,
+        ])
+      } finally {
+        if (handle !== undefined) clearTimeout(handle)
+      }
+      if (timedOut) {
+        this.logger.warn(
+          { timeoutMs, loops: loops.length },
+          'controller shutdown deadline exceeded; closing SQLite with ticks still in flight'
+        )
+      }
+    }
+    // Late ticks now fail with StoreClosedError, which PeriodicLoop swallows.
     this.store.close()
   }
 }

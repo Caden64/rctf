@@ -14,7 +14,7 @@ import {
 } from '../interfaces'
 import type { Logger } from '../log'
 import type { ControllerConfig, HostConfig } from './config'
-import { Store } from './store'
+import { Store, StoreClosedError } from './store'
 
 export interface ControllerTimers {
   setInterval(handler: () => unknown, ms: number): unknown
@@ -60,6 +60,9 @@ export class PeriodicLoop {
       try {
         await this.fn()
       } catch (error) {
+        // A late tick racing controller shutdown is expected: the store is
+        // closed and its typed error is not a loop failure.
+        if (error instanceof StoreClosedError) return
         this.logger.warn(
           {
             loop: this.name,
@@ -75,8 +78,12 @@ export class PeriodicLoop {
     return this.active
   }
 
-  /** Stop scheduling and wait for the in-flight tick (if any) to finish. */
-  async stop(): Promise<void> {
+  /**
+   * Synchronously stop scheduling further ticks. Called for every loop before
+   * any is awaited, so a held tick in one loop never leaves the others
+   * scheduled.
+   */
+  halt(): void {
     this.stopping = true
     if (this.started) {
       this.started = false
@@ -85,8 +92,49 @@ export class PeriodicLoop {
         this.handle = undefined
       }
     }
+  }
+
+  /** Resolve when the in-flight tick (if any) settles; never rejects. */
+  settle(): Promise<void> {
     const active = this.active
-    if (active !== null) await active.catch(() => undefined)
+    return active === null ? Promise.resolve() : active.catch(() => undefined)
+  }
+
+  /**
+   * Stop scheduling and wait for the in-flight tick (if any) to finish.
+   * With `timeoutMs`, the wait is bounded (used by the controller-wide
+   * shutdown deadline); a late tick is made harmless by the store close.
+   */
+  async stop(timeoutMs?: number): Promise<void> {
+    this.halt()
+    if (this.active === null) return
+    const settled = this.settle()
+    if (timeoutMs === undefined) {
+      await settled
+      return
+    }
+    let handle: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+    const deadline = new Promise<void>(resolve => {
+      handle = setTimeout(
+        () => {
+          timedOut = true
+          resolve()
+        },
+        Math.max(0, timeoutMs)
+      )
+    })
+    try {
+      await Promise.race([settled, deadline])
+    } finally {
+      if (handle !== undefined) clearTimeout(handle)
+    }
+    if (timedOut) {
+      this.logger.warn(
+        { loop: this.name, timeoutMs },
+        'controller loop did not finish before the shutdown deadline'
+      )
+    }
   }
 }
 
@@ -95,6 +143,12 @@ export interface HostMonitorDeps {
   store: Store
   clients: Record<string, AgentClient>
   now: Clock
+  /**
+   * Monotonic elapsed-time source used for RTT. Defaults to
+   * `performance.now`, which (unlike the injectable wall clock) advances even
+   * when tests use a fixed `now`.
+   */
+  rttNow?: () => number
   logger: Logger
 }
 
@@ -120,6 +174,7 @@ export class HostMonitor {
 
   async tick(): Promise<HostMonitorTickResult> {
     const { store, clients, config, now } = this.deps
+    const rttNow = this.deps.rttNow ?? (() => performance.now())
     this.seed()
 
     // Probe every host concurrently and record each success at its own
@@ -129,6 +184,7 @@ export class HostMonitor {
       1,
       (config.hostProbeTimeoutSeconds ?? 10) * 1000
     )
+    const maxRttMs = Math.max(0, (config.clockMaxRttSeconds ?? 2) * 1000)
     const timeoutMs = (config.hostTimeoutSeconds ?? 20) * 1000
     const lostMs = (config.hostLostSeconds ?? 300) * 1000
     const unhealthy: string[] = []
@@ -175,6 +231,7 @@ export class HostMonitor {
           return
         }
         const startedAt = now()
+        const startedMono = rttNow()
         try {
           const info = await probeWithDeadline(
             client.info(),
@@ -183,6 +240,42 @@ export class HostMonitor {
             host.id
           )
           const finishedAt = now()
+          const finishedMono = rttNow()
+          const rttMs = finishedMono - startedMono
+          // Wall-clock elapsed also catches a forward clock step that the
+          // monotonic RTT source cannot see. A zero wall RTT is expected with
+          // an injected fixed test clock; the monotonic RTT is authoritative.
+          const wallRttMs = finishedAt - startedAt
+          const rejectReason =
+            wallRttMs < 0
+              ? 'controller clock stepped backwards'
+              : wallRttMs > maxRttMs
+                ? 'wall-clock round trip too long'
+                : rttMs <= 0
+                  ? 'non-positive round trip'
+                  : rttMs > maxRttMs
+                    ? 'round trip too long'
+                    : null
+          if (rejectReason !== null) {
+            this.deps.logger.warn(
+              {
+                hostId: host.id,
+                reason: rejectReason,
+                rttMs,
+                wallRttMs,
+                maxRttMs,
+              },
+              'host clock sample rejected; keeping the previous estimate'
+            )
+            store.recordHeartbeat(host.id, {
+              url: host.url,
+              now: finishedAt,
+              accepting: info.accepting,
+              capacity: info.capacity,
+              clock: null,
+            })
+            return
+          }
           // RTT-compensated estimate of (agent clock - controller clock).
           const midpoint = (startedAt + finishedAt) / 2
           store.recordHeartbeat(host.id, {
@@ -190,9 +283,16 @@ export class HostMonitor {
             now: finishedAt,
             accepting: info.accepting,
             capacity: info.capacity,
-            skewMs: info.timeMs - midpoint,
+            clock: {
+              skewMs: info.timeMs - midpoint,
+              rttMs,
+              sampledAtMs: finishedAt,
+            },
           })
         } catch (error) {
+          // A tick racing controller shutdown must fail quietly, not be
+          // reported as a heartbeat failure.
+          if (error instanceof StoreClosedError) throw error
           if (!(error instanceof AgentUnreachableError)) {
             this.deps.logger.warn(
               {

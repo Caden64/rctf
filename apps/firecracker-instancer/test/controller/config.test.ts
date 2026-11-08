@@ -71,6 +71,9 @@ describe('loadControllerConfig', () => {
     expect(config.createFenceSeconds).toBe(45)
     expect(config.maxClockSkewSeconds).toBe(10)
     expect(config.hostProbeTimeoutSeconds).toBe(10)
+    expect(config.clockMaxRttSeconds).toBe(2)
+    expect(config.clockSampleMaxAgeSeconds).toBe(60)
+    expect(config.shutdownTimeoutSeconds).toBe(10)
   })
 
   test('applies create fence and clock skew environment overrides', () => {

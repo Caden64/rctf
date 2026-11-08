@@ -103,18 +103,21 @@ describe('reconciler', () => {
     const { service, agent, clock, timers, path } = setup({
       createFenceSeconds: 5,
     })
-    agent.createMode = 'create-then-unreachable'
-    await service.create(makeCreateRequest('team-1'))
-    agent.createMode = 'unreachable'
-    await service.create(makeCreateRequest('team-2'))
-    expect(instanceRow(path, 'team-1')?.state).toBe('creating')
-    expect(instanceRow(path, 'team-2')?.state).toBe('creating')
-
-    agent.createMode = 'ok'
-    // Inside the fence: the ambiguous row is left alone.
-    clock.t += 1000
+    // Sampling the host clock requires the first heartbeat; start the loops
+    // (they are only driven manually through FakeTimers).
     await service.start()
     try {
+      agent.createMode = 'create-then-unreachable'
+      await service.create(makeCreateRequest('team-1'))
+      agent.createMode = 'unreachable'
+      await service.create(makeCreateRequest('team-2'))
+      expect(instanceRow(path, 'team-1')?.state).toBe('creating')
+      expect(instanceRow(path, 'team-2')?.state).toBe('creating')
+
+      agent.createMode = 'ok'
+      // Inside the fence: the ambiguous row is left alone.
+      clock.t += 1000
+      await timers.trigger(2)
       expect(instanceRow(path, 'team-1')?.state).toBe('running')
       expect(instanceRow(path, 'team-2')?.state).toBe('creating')
 
@@ -159,6 +162,52 @@ describe('reconciler', () => {
       expect(agent.instances.size).toBe(0)
 
       // A same-key retry gets a fresh id and never produces a second VM.
+      const retried = await service.create(makeCreateRequest('team-1'))
+      expect(retried.status).toBe('running')
+      expect(agent.instances.size).toBe(1)
+      expect(agent.instances.has(spec.id)).toBe(false)
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('a DELETE answering expired does not free the fence; no delayed PUT survives a retry', async () => {
+    const { service, agent, clock, timers, path } = setup({
+      createFenceSeconds: 5,
+    })
+    await service.start()
+    try {
+      const gate = agent.deferNextCreate()
+      await service.create(makeCreateRequest('team-1'))
+      const spec = await gate.captured
+      expect(instanceRow(path, 'team-1')?.state).toBe('creating')
+
+      // The agent knows the id only after this DELETE: it writes the tombstone
+      // but answers 410/expired, which is NOT teardown confirmation.
+      agent.deleteMissingMode = 'expired'
+      clock.t += 6000
+      await timers.trigger(2)
+      expect(instanceRow(path, 'team-1')?.state).toBe('deleting')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(1)
+      expect(agent.isTombstoned(spec.id)).toBe(true)
+
+      // Ownership is still held: a same-key create cannot start a second VM.
+      const whileFenced = await service.create(makeCreateRequest('team-1'))
+      expect(whileFenced.status).toBe('stopping')
+      expect(agent.createCount()).toBe(1)
+
+      // The delayed PUT is rejected by the tombstone even while the row is
+      // still fenced, so it can never coexist with a retry.
+      const late = await gate.execute().catch(error => error)
+      expect(late).toBeInstanceOf(AgentRejectedError)
+      expect((late as AgentRejectedError).code).toBe('conflict')
+      expect(agent.instances.size).toBe(0)
+
+      // Confirmation finally releases the row, and a same-key retry gets a
+      // fresh id with exactly one VM.
+      agent.deleteMissingMode = 'ok'
+      await timers.trigger(2)
+      expect(instanceRow(path, 'team-1')).toBe(null)
       const retried = await service.create(makeCreateRequest('team-1'))
       expect(retried.status).toBe('running')
       expect(agent.instances.size).toBe(1)
@@ -353,6 +402,31 @@ describe('reconciler', () => {
       expect(rowCount(path, 'team-1')).toBe(2)
 
       agent.deleteUnreachable = false
+      await timers.trigger(2)
+      expect(rowCount(path, 'team-1')).toBe(1)
+      expect(agent.instances.has(oldId)).toBe(false)
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('errored-row GC keeps the row when DELETE answers expired', async () => {
+    const { service, agent, timers, path } = setup()
+    await service.start()
+    try {
+      agent.createState = 'errored'
+      await service.create(makeCreateRequest('team-1'))
+      const oldId = [...agent.instances.keys()][0]!
+      expect(instanceRow(path, 'team-1')?.state).toBe('errored')
+
+      agent.createState = 'running'
+      agent.deleteErrorMode = 'expired'
+      await service.create(makeCreateRequest('team-1'))
+      // The unconfirmed GC did not remove the old tombstone row.
+      expect(rowCount(path, 'team-1')).toBe(2)
+      expect(agent.instances.has(oldId)).toBe(true)
+
+      agent.deleteErrorMode = 'none'
       await timers.trigger(2)
       expect(rowCount(path, 'team-1')).toBe(1)
       expect(agent.instances.has(oldId)).toBe(false)

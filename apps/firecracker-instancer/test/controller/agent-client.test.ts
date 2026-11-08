@@ -85,6 +85,76 @@ describe('HttpAgentClient', () => {
     await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
   })
 
+  test('DELETE only confirms on 2xx or 404', async () => {
+    // 2xx (empty or record body) confirms.
+    for (const body of ['', JSON.stringify(agentInstance)]) {
+      const { client } = startServer(() => new Response(body, { status: 200 }))
+      await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
+    }
+
+    // 404 (plain or agent not_found body) confirms.
+    for (const body of [
+      'not found',
+      JSON.stringify({ kind: 'agentError', code: 'not_found', message: 'x' }),
+    ]) {
+      const { client } = startServer(() => new Response(body, { status: 404 }))
+      await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
+    }
+
+    // Everything else must throw: the caller keeps the row fenced.
+    const failures: Array<{
+      body: string
+      status: number
+      kind: 'rejected' | 'unreachable'
+    }> = [
+      {
+        body: JSON.stringify({
+          kind: 'agentError',
+          code: 'expired',
+          message: 'gone',
+        }),
+        status: 410,
+        kind: 'rejected',
+      },
+      {
+        body: JSON.stringify({
+          kind: 'agentError',
+          code: 'internal',
+          message: 'boom',
+        }),
+        status: 409,
+        kind: 'rejected',
+      },
+      { body: 'upstream down', status: 502, kind: 'unreachable' },
+      { body: 'not json', status: 200, kind: 'unreachable' },
+      { body: '{}', status: 200, kind: 'unreachable' },
+    ]
+    for (const failure of failures) {
+      const { client } = startServer(
+        () => new Response(failure.body, { status: failure.status })
+      )
+      const error = await client()
+        .delete('a'.repeat(24))
+        .then(() => 'resolved')
+        .catch(error => error)
+      expect(error).toBeInstanceOf(
+        failure.kind === 'rejected' ? AgentRejectedError : AgentUnreachableError
+      )
+    }
+  })
+
+  test('a timed-out DELETE does not confirm teardown', async () => {
+    const { client } = startServer(async () => {
+      await Bun.sleep(100)
+      return new Response('', { status: 200 })
+    })
+    const error = await client({ timeoutMs: 10 })
+      .delete('a'.repeat(24))
+      .then(() => 'resolved')
+      .catch(error => error)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
+
   test('a well-formed 507 becomes AgentRejectedError(no_capacity)', async () => {
     const { client } = startServer(() =>
       json({ kind: 'agentError', code: 'no_capacity', message: 'full' }, 507)
