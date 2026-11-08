@@ -25,6 +25,12 @@ export const agentConfigSchema = z.object({
   }),
   /** How long past expiresAtMs the agent waits for the controller before self-destructing the VM. */
   expiryGraceSeconds: z.optional(z.prefault(z.int(), 120)),
+  /** Local drain flag: stop accepting new instances (existing ones keep running). */
+  draining: z.optional(z.prefault(z.boolean(), false)),
+  /** Keep an errored tombstone for this long, then forget it. */
+  erroredTtlSeconds: z.optional(z.prefault(z.int(), 600)),
+  /** Fence deleted ids for this long so delayed duplicate PUTs cannot resurrect them. */
+  tombstoneTtlSeconds: z.optional(z.prefault(z.int(), 86400)),
   vm: z.optional(z.prefault(vmConfigSchema, {})),
   network: networkConfigSchema,
 })
