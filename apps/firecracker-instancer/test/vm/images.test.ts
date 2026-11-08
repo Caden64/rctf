@@ -11,6 +11,7 @@ import {
 import os from 'node:os'
 import path from 'node:path'
 import { listImageNames, resolveImage } from '../../src/agent/vm/images'
+import { checkImagesTrusted } from '../../src/agent/vm/images'
 import type { VmConfig } from '../../src/agent/vm/config'
 import { makeDirs, makeImage, makeVmConfig } from './helpers'
 
@@ -137,6 +138,43 @@ describe('image resolution', () => {
     })
     await chmod(path.join(config.imagesDir, 'web-demo', 'vmlinux'), 0o664)
     await expect(resolveImage(relaxed, 'web-demo', 64)).resolves.toBeDefined()
+  })
+
+  test('rejects a kernel symlink into a group/world-writable intermediate directory', async () => {
+    // Resolved-target containment is not enough: the symlink stays below
+    // imagesDir but an intermediate directory could be swapped by another user.
+    const imageDir = await makeImage(config.imagesDir, 'web-demo')
+    const nested = path.join(imageDir, 'nested')
+    await mkdir(nested, { recursive: true, mode: 0o777 })
+    await chmod(nested, 0o777)
+    await writeFile(path.join(nested, 'kernel'), 'kernel')
+    await rm(path.join(imageDir, 'vmlinux'))
+    await symlink(path.join('nested', 'kernel'), path.join(imageDir, 'vmlinux'))
+
+    expect(await checkImagesTrusted(config)).toBe(false)
+    await expect(resolveImage(config, 'web-demo', 64)).rejects.toThrow(
+      /not trusted|group\/world-writable/
+    )
+
+    await chmod(nested, 0o700)
+    expect(await checkImagesTrusted(config)).toBe(true)
+    await expect(resolveImage(config, 'web-demo', 64)).resolves.toBeDefined()
+  })
+
+  test('applies the same trust checks to initrd in preflight and at launch', async () => {
+    const imageDir = await makeImage(config.imagesDir, 'with-initrd', {
+      initrd: true,
+    })
+    const initrd = path.join(imageDir, 'initrd')
+    await chmod(initrd, 0o666)
+    expect(await checkImagesTrusted(config)).toBe(false)
+    await expect(resolveImage(config, 'with-initrd', 64)).rejects.toThrow(
+      /not trusted|group\/other-writable/
+    )
+
+    await chmod(initrd, 0o600)
+    expect(await checkImagesTrusted(config)).toBe(true)
+    await expect(resolveImage(config, 'with-initrd', 64)).resolves.toBeDefined()
   })
 
   test('lists only well-formed images with both files', async () => {
