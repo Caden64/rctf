@@ -15,7 +15,7 @@ const base = (
       httpDomain: 'fc1.example.com',
       ...overrides.network,
     },
-    vm: { mode: 'jailer', ...((overrides.vm as object | undefined) ?? {}) },
+    vm: { mode: 'jailer', ...overrides.vm },
   })
 
 describe('tap owner vs jailer identity', () => {
