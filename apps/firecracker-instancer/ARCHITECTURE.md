@@ -53,15 +53,25 @@ and `lost` are terminal-until-delete. Agent states: `creating, starting, running
    `errored`, release everything, keep a tombstone record until the controller deletes/forgets it.
 3. `extend`: authoritative at the controller. CAS in SQLite:
    `UPDATE … SET expires_at=now+timeout WHERE state IN (creating,running) AND expires_at>now` (never extends past
-   `maxLifetime` if configured). Then push `expiresAtMs` to the agent (monotonic max). If the push fails it is
-   retried by the reconciler. Expired ⇒ `expired` error.
-4. Expiry: the controller reaper claims `state=running AND expires_at<=now` via CAS to `deleting`, then tells the agent to delete.
-   Extend and expiry race on the same row, so exactly one wins. The **agent also has a dead-man deadline**:
-   at `expiresAtMs + expiryGraceSeconds` it destroys the VM on its own (controller loss ≠ leaked VMs forever).
-5. `delete`: CAS to `deleting` (idempotent), agent `DELETE` (idempotent; unknown = done), then row removed and the
-   reservation released _only after the agent confirmed_. If the host is unreachable the row stays `deleting`
-   (player sees `stopping`) and is retried; after `hostLostSeconds` it is written off: the unique key is freed,
-   the row is tombstoned, the host's orphan cleanup finishes the job when it returns.
+   `maxLifetime` if configured; `MAX(old,new)` keeps deadlines monotonic). Then push `expiresAtMs` to the agent
+   (monotonic max) and require a confirmation covering the requested deadline. The committed row is never rolled
+   back: a failed/ambiguous push, a missing client, or a short-deadline acknowledgement leaves the later deadline
+   in SQLite with `agent_expiry_synced=0` for the reconciler to retry, and returns `host_unavailable` to the
+   caller instead of a false success. Concurrent extends only mark the still-current deadline synced (conditional
+   CAS), and a concurrent delete wins the final read, so the player sees `stopping`/`stopped`, not a stale
+   `running` snapshot. Expired ⇒ `expired` error.
+4. Expiry: the controller reaper claims **expired live rows** (`state IN (creating,running) AND expires_at<=now`)
+   via CAS to `deleting`, then tells the agent to delete. Including `creating` fences a create that outlived its
+   deadline: the DELETE writes the tombstone, so a late completion can never leak a VM. Extend and expiry race on
+   the same row, so exactly one wins. The reservation is kept until teardown is confirmed. The **agent also has a
+   dead-man deadline**: at `expiresAtMs + expiryGraceSeconds` it destroys the VM on its own (controller loss ≠
+   leaked VMs forever).
+5. `delete`: CAS to `deleting` (idempotent), agent `DELETE` (idempotent; a **verified instance absence** = done),
+   then row removed and the reservation released _only after the agent confirmed_. A plain/route-level/proxy 404
+   is ambiguous (see "Error classification and absence fencing"), so the row stays fenced. If the host is
+   unreachable the row stays `deleting` (player sees `stopping`) and is retried; after `hostLostSeconds` it is
+   written off: the unique key is freed, the row is tombstoned, the host's orphan cleanup finishes the job when it
+   returns.
 
 ### Ambiguous creates and fencing (normative)
 
@@ -70,9 +80,35 @@ pre-create rejection_: `no_capacity`, `draining`, `invalid_request`, `unauthoriz
 host, holding the key and reservation. The reconciler resolves it: `get(id)` finds the VM ⇒ adopt; still absent after
 `createFenceSeconds` (default 45) ⇒ row becomes `deleting` and the controller sends `DELETE` — which makes the agent write a
 **tombstone** so a delayed original `PUT` can never create the VM (see agent protocol, FENCING) — and only when the agent
-confirms (200/404) is the row removed and the key freed. Absence is never inferred from a single listing: a listing can be
-stale relative to concurrent creates, so every "missing on agent" conclusion is re-confirmed with a fresh per-id `get` and applied
-with a version CAS on the row snapshot taken **before** the listing.
+confirms (2xx or a verified instance absence) is the row removed and the key freed. Absence is never inferred from a single
+listing: a listing can be stale relative to concurrent creates, so every "missing on agent" conclusion is re-confirmed with a
+fresh per-id `get` and applied with a version CAS on the row snapshot taken **before** the listing.
+
+### Error classification and absence fencing (normative)
+
+Only an **instance-scoped absence response** may drive a terminal decision. An agent that advertises
+`AGENT_CAPABILITY_INSTANCE_ABSENCE` in `GET /v1/info` stamps the validated path id on every `not_found`/`expired` emitted by
+`/v1/instances/:id` (`agentError.instanceId`). The controller trusts a GET/PATCH/DELETE 404 only when the body is a
+well-formed `not_found` carrying the requested id; that DELETE response also proves the durable tombstone was written first.
+Everything else 404-shaped — plain text, an unmatched route (`route not found`), a mismatched id, a proxy/mid-deploy error —
+is **ambiguous**: `AgentUnreachableError`, never an absence. A failed GET leaves the row unchanged (the player sees `errored`
+for that read but no terminal transition), a failed PATCH leaves it live, and a failed DELETE keeps it `deleting` with its
+reservation. Genuine missing-instance convergence is preserved because the agent's real unknown-id GET/PATCH/DELETE bodies
+carry the discriminator.
+
+**Legacy fallback.** Agents that predate capability negotiation omit `capabilities`; they keep the old 404-means-absent
+semantics so deleting rows are not stranded forever. Before accepting a marker-less 404 the controller probes `/v1/info`
+(cached from heartbeats when available); if the probe fails the 404 is ambiguous. Once an agent advertises the capability, a
+marker-less 404 is always ambiguous. This keeps new agents on the strict path while remaining compatible with old ones.
+
+### Extend semantics (normative)
+
+The controller commits the desired deadline first and treats that row as authoritative. The agent push is a confirmation
+step, not a transaction participant: there is no rollback of an ambiguous PATCH (it may have been applied). Success requires
+the agent's reported deadline to cover the requested one (after skew/slack translation); a transport failure, timeout,
+missing client, malformed reply or short deadline returns `host_unavailable` and leaves `agent_expiry_synced=0` for the
+reconciler. The sync marker is conditional on the deadline still being current, so an out-of-order extend cannot mark a
+newer deadline synced. The result is re-read after the push, so a concurrent delete is reported as `stopping`/`stopped`.
 
 ### Agent crash safety (normative)
 
