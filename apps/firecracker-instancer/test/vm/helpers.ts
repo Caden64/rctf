@@ -189,7 +189,7 @@ export const makeLease = (instanceId: string): NetLease => ({
   guestIp: '10.200.0.2',
   prefixLength: 30,
   guestMac: '02:00:00:00:00:01',
-  guestPorts: {},
+  expose: [],
   publicPorts: {},
   publicHostnames: {},
   egress: false,

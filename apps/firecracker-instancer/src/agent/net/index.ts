@@ -355,9 +355,7 @@ class NetworkManagerImpl implements NetworkManager {
           guestIp,
           prefixLength: 30,
           guestMac: this.freshMac(),
-          guestPorts: Object.fromEntries(
-            expose.map((entry, position) => [position, entry.port])
-          ),
+          expose: expose.map(entry => ({ ...entry })),
           publicPorts,
           publicHostnames,
           egress: req.egress,
