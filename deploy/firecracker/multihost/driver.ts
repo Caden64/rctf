@@ -14,14 +14,17 @@
  *                                                         agent host-b under systemd, JAILER mode
  *                                                         real Firecracker guests
  *
- * host-a and host-b share a private L2 (QEMU socket/multicast) 10.77.0.0/24;
- * the controller and agents speak real HTTP with real per-host bearer tokens.
+ * host-a and host-b share a point-to-point Ethernet link (QEMU -netdev dgram
+ * over two AF_UNIX sockets under the run directory) 10.77.0.0/24; the link has
+ * no multicast group, no UDP/TCP socket and no host interface, so its traffic
+ * cannot leave this machine. The controller and agents speak real HTTP with
+ * real per-host bearer tokens.
  *
  * Every assertion here is a real invariant, not a log mirror: instances are
  * observed directly on each agent, guest flags are fetched from the guests,
  * and the controller SQLite is read for ownership/pinning.
  */
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import FirecrackerInstancerProvider from '../../../apps/api/src/providers/instancer/firecracker-instancer'
 import type { CreateInstanceOptions } from '../../../apps/api/src/providers/instancer/base'
@@ -53,6 +56,11 @@ const A_IP = must(process.env.HOST_A_IP, 'HOST_A_IP')
 const B_IP = must(process.env.HOST_B_IP, 'HOST_B_IP')
 const A_SSH = Number(must(process.env.HOST_A_SSH_PORT, 'HOST_A_SSH_PORT'))
 const B_SSH = Number(must(process.env.HOST_B_SSH_PORT, 'HOST_B_SSH_PORT'))
+const LINK_DIR = must(process.env.MH_LINK_DIR, 'MH_LINK_DIR')
+const LINK_A = must(process.env.MH_LINK_A, 'MH_LINK_A')
+const LINK_B = must(process.env.MH_LINK_B, 'MH_LINK_B')
+const A_MAC_PRIV = '52:54:00:77:0a:01'
+const B_MAC_PRIV = '52:54:00:77:0b:01'
 
 const VMCTL = path.join(REPO, 'deploy/firecracker/multihost/vm.sh')
 const LOGS = path.join(RUN, 'logs')
@@ -132,6 +140,25 @@ const remoteOut = (
   }
   return result.stdout.trim()
 }
+
+const remoteSoft = (host: string, command: string): string => {
+  const result = remote(host, command)
+  return result.code === 0 ? result.stdout.trim() : ''
+}
+
+const qemuCmdline = (host: string): string =>
+  readFileSync(path.join(RUN, 'vms', host, 'qemu.cmdline'), 'utf8')
+
+/** Every argument that follows a `-netdev` in a recorded QEMU command line. */
+const netdevArgs = (cmdline: string): string[] => {
+  const lines = cmdline.split('\n')
+  return lines.flatMap((line, index) =>
+    line === '-netdev' ? [lines[index + 1] ?? ''] : []
+  )
+}
+
+const privateIfaceCommand = (ip: string): string =>
+  `ip -4 -o addr show | awk -v ip='${ip}/24' '$4 == ip { gsub(":", "", $2); print $2; exit }'`
 
 const controllerLogTail = (variant = 'normal', lines = 20): string => {
   try {
@@ -1203,6 +1230,109 @@ const scenarioHosts = async (): Promise<void> => {
           b: { kvm: infoB.checks?.kvm, jailer: infoB.checks?.jailerBin },
         })
       )
+
+      // --- private link confinement --------------------------------------
+      // Inspect the QEMU command lines recorded in the run directory: the
+      // private NIC must be one AF_UNIX datagram netdev pointing at the peer
+      // socket, with no multicast, UDP/TCP or host-network backend. Also check
+      // the socket objects themselves and that the developer machine has no
+      // interface or listener on the private addresses.
+      const cmdA = qemuCmdline(A)
+      const cmdB = qemuCmdline(B)
+      const ndA = netdevArgs(cmdA)
+      const ndB = netdevArgs(cmdB)
+      const specA = `dgram,id=n1,local.type=unix,local.path=${LINK_A},remote.type=unix,remote.path=${LINK_B}`
+      const specB = `dgram,id=n1,local.type=unix,local.path=${LINK_B},remote.type=unix,remote.path=${LINK_A}`
+      const linkDir = statSync(LINK_DIR)
+      const linkMode = linkDir.mode & 0o777
+      const linkOwner = linkDir.uid
+      const socketsAreUnix =
+        lstatSync(LINK_A).isSocket() && lstatSync(LINK_B).isSocket()
+      const hostAddrs = shell(['ip', '-4', '-o', 'addr', 'show']).stdout
+      const hostHasPrivate =
+        hostAddrs.includes(`inet ${A_IP}/`) ||
+        hostAddrs.includes(`inet ${B_IP}/`)
+      const userNetdev = (arg: string): boolean =>
+        arg.startsWith('user,id=n0,hostfwd=tcp:127.0.0.1:')
+      const confined =
+        !/mcast/i.test(cmdA + cmdB) &&
+        ndA.length === 2 &&
+        ndB.length === 2 &&
+        ndA.includes(specA) &&
+        ndB.includes(specB) &&
+        ndA.filter(userNetdev).length === 1 &&
+        ndB.filter(userNetdev).length === 1 &&
+        ![...ndA, ...ndB].some(arg =>
+          /^(socket|tap|bridge|hubport|vde|passt|l2tpv3),/.test(arg)
+        ) &&
+        ![...ndA, ...ndB].some(arg => arg.includes('local.type=inet')) &&
+        linkMode === 0o700 &&
+        linkOwner === process.getuid?.() &&
+        socketsAreUnix &&
+        !hostHasPrivate
+      report.check(
+        '1.8',
+        'the private link is a host-local unix-datagram point-to-point link, not multicast (recorded QEMU command lines + socket objects)',
+        confined,
+        `netdevs a=${short(ndA)} b=${short(ndB)} dirMode=${linkMode.toString(8)} owner=${linkOwner} unixSockets=${socketsAreUnix} hostAddr=${hostHasPrivate}`
+      )
+
+      // The agent must be bound to exactly its private-NIC address, and that
+      // address must be on the MAC-pinned second NIC (not the management NIC).
+      const ifaceA = remoteSoft(A, privateIfaceCommand(A_IP))
+      const ifaceB = remoteSoft(B, privateIfaceCommand(B_IP))
+      const ifaceLinkA =
+        ifaceA === '' ? '' : remoteSoft(A, `ip -o link show dev '${ifaceA}'`)
+      const ifaceLinkB =
+        ifaceB === '' ? '' : remoteSoft(B, `ip -o link show dev '${ifaceB}'`)
+      const listenersOf = (host: string): string[] =>
+        remoteSoft(host, "ss -ltn 2>/dev/null | awk 'NR > 1 { print $4 }'")
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line !== '')
+      const listensA = listenersOf(A)
+      const listensB = listenersOf(B)
+      const onlyPrivatePort = (lines: string[], ip: string): boolean =>
+        lines.includes(`${ip}:7001`) &&
+        lines.filter(line => line.endsWith(':7001')).length === 1
+      report.check(
+        '1.9',
+        "each agent's private-NIC address is MAC-pinned and is the only address it listens on",
+        ifaceA !== '' &&
+          ifaceB !== '' &&
+          ifaceLinkA.includes(`link/ether ${A_MAC_PRIV}`) &&
+          ifaceLinkB.includes(`link/ether ${B_MAC_PRIV}`) &&
+          onlyPrivatePort(listensA, A_IP) &&
+          onlyPrivatePort(listensB, B_IP),
+        `ifaceA=${ifaceA} macA=${ifaceLinkA.includes(A_MAC_PRIV)} ifaceB=${ifaceB} macB=${ifaceLinkB.includes(B_MAC_PRIV)} listenA=${short(listensA)} listenB=${short(listensB)}`
+      )
+
+      // Cross-link reachability: each VM's only route to the peer is its
+      // private NIC, the peer's hardware address resolves to the peer's
+      // private MAC, and the developer machine has neither address nor a
+      // listener on them.
+      // Refresh the neighbour entries over the link before reading them.
+      remoteSoft(A, `ping -c 1 -W 2 ${B_IP}`)
+      remoteSoft(B, `ping -c 1 -W 2 ${A_IP}`)
+      const routeA = remoteSoft(A, `ip route get ${B_IP}`)
+      const routeB = remoteSoft(B, `ip route get ${A_IP}`)
+      const neighA = remoteSoft(A, `ip neigh show ${B_IP}`)
+      const neighB = remoteSoft(B, `ip neigh show ${A_IP}`)
+      const hostListeners = shell(['ss', '-ltn']).stdout
+      const hostListensPrivate =
+        hostListeners.includes(`${A_IP}:`) || hostListeners.includes(`${B_IP}:`)
+      report.check(
+        '1.10',
+        'the agents private-link addresses are reachable only across that link (peer route + MAC, and absent from the developer machine)',
+        routeA.includes(`dev ${ifaceA}`) &&
+          routeA.includes(`src ${A_IP}`) &&
+          routeB.includes(`dev ${ifaceB}`) &&
+          routeB.includes(`src ${B_IP}`) &&
+          neighA.includes(`lladdr ${B_MAC_PRIV}`) &&
+          neighB.includes(`lladdr ${A_MAC_PRIV}`) &&
+          !hostListensPrivate,
+        `routeA=${short(routeA)} routeB=${short(routeB)} neighA=${short(neighA)} hostListener=${hostListensPrivate}`
+      )
     }
   )
 }
@@ -2233,12 +2363,14 @@ const scenarioHostLoss = async (): Promise<void> => {
           must(process.env.HOST_B_SEED_PORT, 'HOST_B_SEED_PORT'),
           '--priv-ip',
           B_IP,
-          '--mcast',
-          must(process.env.MH_MCAST, 'MH_MCAST'),
+          '--link-local',
+          LINK_B,
+          '--link-peer',
+          LINK_A,
           '--mac-mgmt',
           '52:54:00:77:0b:00',
           '--mac-priv',
-          '52:54:00:77:0b:01',
+          B_MAC_PRIV,
           'create',
         ],
         600_000
@@ -2408,15 +2540,36 @@ const scenarioClockSkew = async (): Promise<void> => {
         fixed !== undefined && Math.abs(fixed.clock_skew_ms) < 3_000,
         `skew=${fixed?.clock_skew_ms}`
       )
-      await adminRequest('POST', `/v1/hosts/${A}/undrain`)
+      // Keep host-a drained: otherwise host-a alone could satisfy this create
+      // and a permanently-excluded host-b would still look healthy. Only
+      // host-b can take it, and its guest must actually serve the flag.
       const ok = await create('skew-ok', CHAL)
+      const okAccepted = isDetails(ok)
+      const okRun = okAccepted ? await waitRunning('skew-ok', CHAL) : undefined
+      const okIdentity =
+        okRun !== undefined && okRun.row.host_id === B
+          ? requireIdentity(B, okRun.row.id)
+          : undefined
       report.check(
         '7.7',
-        'placement works again after the skew is fixed',
-        isDetails(ok),
-        short(ok)
+        'with host-a still drained, placement works again only on host-b after the skew is fixed',
+        okAccepted && okRun !== undefined && okRun.row.host_id === B,
+        `create=${short(ok)} host=${okRun?.row.host_id ?? 'none'}`
       )
-      await waitRunning('skew-ok', CHAL)
+      report.check(
+        '7.8',
+        'the post-correction instance is pinned to host-b and its guest serves the team flag',
+        okIdentity !== undefined &&
+          guestFlag(B, okIdentity.guestIp) === flagFor('skew-ok', CHAL),
+        `id=${okRun?.row.id ?? 'none'} host=${okRun?.row.host_id ?? 'none'}`
+      )
+      await adminRequest('POST', `/v1/hosts/${A}/undrain`)
+      report.check(
+        '7.9',
+        'host-a is undrained only after host-b proved it can take and serve a placement',
+        (await hostSummary(A))?.health === 'healthy',
+        (await hostSummary(A))?.health
+      )
       await deleteAndWait('skew-ok', CHAL)
       await waitControllerEmpty()
       await waitAgentsClean()
