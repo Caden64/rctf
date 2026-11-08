@@ -485,13 +485,70 @@ describe('FirecrackerInstancerProvider create', () => {
     }
   })
 
-  test('errors when create returns null endpoints', async () => {
+  test('errors when a running create returns null endpoints', async () => {
     const { server, fake } = startController()
     fake.handlers.create = async () => details(null)
     const provider = providerFor(server.url)
 
     const result = await provider.createInstance(createOptions())
     expect(result.kind).toBe('instancerError')
+  })
+
+  test('passes through a transitional (starting) create without endpoints', async () => {
+    const { server, fake } = startController()
+    fake.handlers.create = async () => ({
+      ...details(null),
+      status: 'starting',
+    })
+    const provider = providerFor(server.url)
+
+    const result = await provider.createInstance(createOptions())
+    expect(result.kind).toBe('instancerInstanceDetails')
+    if (result.kind === 'instancerInstanceDetails') {
+      expect(result.status).toBe('starting')
+    }
+  })
+
+  test('never follows a redirect with the flag-bearing body', async () => {
+    let leaked = false
+    const sink = Bun.serve({
+      port: 0,
+      fetch: async req => {
+        leaked = true
+        await req.text()
+        return Response.json(details([]))
+      },
+    })
+    const redirector = Bun.serve({
+      port: 0,
+      fetch: () =>
+        new Response(null, {
+          status: 307,
+          headers: { Location: `http://127.0.0.1:${sink.port}/v1/instances` },
+        }),
+    })
+    try {
+      const provider = providerFor(`http://127.0.0.1:${redirector.port}`)
+      const result = await provider.createInstance(createOptions())
+      expect(result.kind).toBe('instancerError')
+      expect(leaked).toBe(false)
+    } finally {
+      redirector.stop(true)
+      sink.stop(true)
+    }
+  })
+
+  test('rejects an apiUrl with credentials, query or a non-http scheme', () => {
+    for (const apiUrl of [
+      'ftp://controller.example.com',
+      'http://user:pw@controller.example.com',
+      'http://controller.example.com/?a=b',
+      'not a url',
+    ]) {
+      expect(
+        () => new FirecrackerInstancerProvider({ apiUrl, authToken: 't' })
+      ).toThrow()
+    }
   })
 })
 

@@ -24,11 +24,13 @@ import {
 interface FirecrackerInstancerProviderOptions {
   authToken?: string
   apiUrl?: string
-  /** Request timeout; overridable for tests. Defaults to 15 seconds. */
+  /** Request timeout; overridable for tests. Defaults to 45 seconds. */
   timeoutMilliseconds?: number
 }
 
-const DEFAULT_TIMEOUT_MILLISECONDS = 15_000
+// Must exceed the controller's agent create timeout (30s) so a slow-but-healthy
+// launch (e.g. rootfs copy without reflink) is not reported as a failure.
+const DEFAULT_TIMEOUT_MILLISECONDS = 45_000
 
 const REQUEST_FAILED_MESSAGE =
   'Something went wrong while talking to the Firecracker controller'
@@ -74,6 +76,24 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
       throw new Error(
         'Missing one of the authToken or apiUrl for the FirecrackerInstancerProvider. ' +
           'Set FIRECRACKER_INSTANCER_AUTH_TOKEN and FIRECRACKER_INSTANCER_API_URL (or the provider options).'
+      )
+    }
+
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(apiUrl)
+    } catch {
+      throw new Error('FirecrackerInstancerProvider: apiUrl is not a valid URL')
+    }
+    if (
+      (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') ||
+      parsedUrl.username !== '' ||
+      parsedUrl.password !== '' ||
+      parsedUrl.search !== '' ||
+      parsedUrl.hash !== ''
+    ) {
+      throw new Error(
+        'FirecrackerInstancerProvider: apiUrl must be an http(s) URL without credentials, query or fragment'
       )
     }
 
@@ -148,25 +168,22 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
 
   private assertEndpointCount(
     details: ControllerInstanceDetails,
-    expected: number | undefined,
-    strict: boolean
+    expected: number | undefined
   ): instanceDetailsOrError | undefined {
     if (expected === undefined) {
       return undefined
     }
 
-    const endpoints = details.endpoints
-    if (endpoints === null) {
-      return strict
-        ? this.error(
-            'The Firecracker controller returned no endpoints for the exposed ports'
-          )
-        : undefined
+    // Transitional states (starting/stopping/...) legitimately have no
+    // endpoints yet; only a running instance must be complete.
+    if (details.status !== 'running') {
+      return undefined
     }
 
-    if (endpoints.length !== expected) {
+    const endpoints = details.endpoints
+    if (endpoints === null || endpoints.length !== expected) {
       return this.error(
-        `The Firecracker controller returned ${endpoints.length} endpoint(s) for ${expected} exposed port(s)`
+        `The Firecracker controller returned ${endpoints?.length ?? 0} endpoint(s) for ${expected} exposed port(s)`
       )
     }
 
@@ -176,8 +193,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
   private async apiRequest(
     method: 'POST' | 'PUT' | 'DELETE' | 'PATCH',
     body: unknown,
-    expectedEndpointCount: number | undefined,
-    strictEndpointCount: boolean
+    expectedEndpointCount: number | undefined
   ): Promise<instanceDetailsOrError> {
     let response: Response
     try {
@@ -188,6 +204,8 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
           Authorization: `Bearer ${this.authToken}`,
         },
         body: JSON.stringify(body),
+        // A redirect would replay the flag-bearing body to another origin.
+        redirect: 'error',
         signal: AbortSignal.timeout(this.timeoutMilliseconds),
       })
     } catch (err) {
@@ -232,8 +250,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
 
     const mismatch = this.assertEndpointCount(
       parsed.data,
-      expectedEndpointCount,
-      strictEndpointCount
+      expectedEndpointCount
     )
     if (mismatch) {
       return mismatch
@@ -269,7 +286,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
       )
     }
 
-    return this.apiRequest('PUT', validated.data, expose.expose.length, true)
+    return this.apiRequest('PUT', validated.data, expose.expose.length)
   }
 
   getInstance = async (
@@ -286,8 +303,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
     return this.apiRequest(
       'POST',
       key.data,
-      this.expectedEndpointCount(options),
-      false
+      this.expectedEndpointCount(options)
     )
   }
 
@@ -302,7 +318,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
       return this.error('Invalid instance key')
     }
 
-    return this.apiRequest('DELETE', key.data, undefined, false)
+    return this.apiRequest('DELETE', key.data, undefined)
   }
 
   extendInstance = async (
@@ -320,8 +336,7 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
     return this.apiRequest(
       'PATCH',
       body.data,
-      this.expectedEndpointCount(options),
-      false
+      this.expectedEndpointCount(options)
     )
   }
 }

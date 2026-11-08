@@ -166,7 +166,7 @@ export const createControllerServer = (options: ControllerServerOptions) => {
     }
   }
 
-  const handler = async (req: Request): Promise<Response> => {
+  const handle = async (req: Request): Promise<Response> => {
     try {
       const url = new URL(req.url)
       const path = normalizePath(url.pathname)
@@ -318,7 +318,7 @@ export const createControllerServer = (options: ControllerServerOptions) => {
 
       return errorResponse(404, 'Not found', 'not_found')
     } catch (err) {
-      if (err instanceof ProtocolError) {
+      if (err instanceof ProtocolError && err.code !== 'internal') {
         return errorResponse(
           ERROR_HTTP_STATUS[err.code] ?? 500,
           err.message,
@@ -341,6 +341,28 @@ export const createControllerServer = (options: ControllerServerOptions) => {
     }
   }
 
+  const inflight = new Set<Promise<Response>>()
+  const handler = (req: Request): Promise<Response> => {
+    const pending = handle(req)
+    inflight.add(pending)
+    const done = () => inflight.delete(pending)
+    pending.then(done, done)
+    return pending
+  }
+
+  /** Resolve once active requests finish, or after `timeoutMs`. */
+  const drain = async (timeoutMs: number): Promise<void> => {
+    if (inflight.size === 0) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      Promise.allSettled([...inflight]),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, timeoutMs)
+      }),
+    ])
+    clearTimeout(timer)
+  }
+
   const serve = (listen: ControllerListenOptions) =>
     Bun.serve({
       hostname: listen.host,
@@ -353,5 +375,5 @@ export const createControllerServer = (options: ControllerServerOptions) => {
       fetch: handler,
     })
 
-  return { handler, fetch: handler, serve }
+  return { handler, fetch: handler, serve, drain }
 }

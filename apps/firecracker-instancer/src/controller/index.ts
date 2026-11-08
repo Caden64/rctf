@@ -43,6 +43,10 @@ const main = async (): Promise<void> => {
     logger.info({ signal }, 'shutting down the firecracker controller')
 
     try {
+      // Stop accepting, let in-flight create/delete bookkeeping finish, then
+      // force-close whatever is left.
+      await http.stop()
+      await server.drain(30_000)
       await http.stop(true)
     } catch (err) {
       logger.error({ err }, 'failed to stop the HTTP server')

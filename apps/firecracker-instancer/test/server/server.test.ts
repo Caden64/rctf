@@ -544,7 +544,15 @@ describe('controller server: errors', () => {
         token: AUTH_TOKEN,
       })
       await expectError(response, ERROR_HTTP_STATUS[code], code)
-      expect(await response.text()).toContain(`business outcome: ${code}`)
+      const text = await response.text()
+      if (code === 'internal') {
+        // Internal messages can embed infrastructure detail (or worse); they
+        // are masked for the player and only the code is passed on.
+        expect(text).not.toContain(`business outcome: ${code}`)
+        expect(text).toContain('Internal server error')
+      } else {
+        expect(text).toContain(`business outcome: ${code}`)
+      }
     }
   })
 
@@ -583,5 +591,47 @@ describe('controller server: errors', () => {
     expect(bad.status).toBe(400)
 
     expect(JSON.stringify(logEntries)).not.toContain(flag)
+  })
+})
+
+describe('controller server: shutdown drain', () => {
+  test('drain waits for an in-flight request and gives up at the deadline', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const { server, fake } = makeServer()
+    const originalCreate = fake.service.create
+    fake.service.create = async req => {
+      await gate
+      return originalCreate(req)
+    }
+
+    const pending = call(server.handler, 'PUT', '/v1/instances', {
+      body: validCreateBody(),
+      token: AUTH_TOKEN,
+    })
+
+    let drained = false
+    const drain = server.drain(5_000).then(() => {
+      drained = true
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(drained).toBe(false)
+
+    release()
+    await pending
+    await drain
+    expect(drained).toBe(true)
+
+    // A stuck request must not block shutdown beyond the deadline.
+    fake.service.create = () => new Promise(() => {})
+    void call(server.handler, 'PUT', '/v1/instances', {
+      body: validCreateBody(),
+      token: AUTH_TOKEN,
+    })
+    const started = Date.now()
+    await server.drain(50)
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })
