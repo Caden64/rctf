@@ -909,7 +909,11 @@ class NetworkManagerImpl implements NetworkManager {
       const result = await this.runner.run(['ip', '-V'], { timeoutMs: 5_000 })
       return result.code === 0
     })
-    await check('conntrackBin', () => conntrackAvailable(this.runner))
+    await check(
+      'conntrackBin',
+      async () =>
+        !this.config.requireConntrack || (await conntrackAvailable(this.runner))
+    )
     await check('ipForward', async () => {
       const text = await readFile('/proc/sys/net/ipv4/ip_forward', 'utf8')
       return text.trim() === '1'

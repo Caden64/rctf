@@ -212,7 +212,7 @@ describe('renderRuleset invariants', () => {
         `iifname "${lease.tapName}" arp saddr ether != "${lease.guestMac}" drop`
       )
       expect(text).toContain(
-        `iifname "${lease.tapName}" arp operation request arp taddr ip != ${lease.hostIp} drop`
+        `iifname "${lease.tapName}" arp operation request arp daddr ip != ${lease.hostIp} drop`
       )
     }
   })

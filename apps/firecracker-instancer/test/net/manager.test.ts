@@ -585,7 +585,13 @@ describe('publish / unpublish / release', () => {
       expose: [],
     })
     expect(lease.guestIp).toBe('10.200.0.2')
-    expect((await relaxed.manager.preflight()).conntrackBin).toBe(false)
+    // With requireConntrack=false a missing binary must not fail preflight
+    // (a failing check takes the whole host out of rotation).
+    expect((await relaxed.manager.preflight()).conntrackBin).toBe(true)
+
+    const required = await setup()
+    required.host.conntrackOk = false
+    expect((await required.manager.preflight()).conntrackBin).toBe(false)
   })
 
   test('egress leases get masquerade, others do not', async () => {

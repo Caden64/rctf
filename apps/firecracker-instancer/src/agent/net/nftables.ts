@@ -330,7 +330,7 @@ export const renderRuleset = (
       `    iifname "${lease.tapName}" arp saddr ether != "${lease.guestMac}" drop`
     )
     lines.push(
-      `    iifname "${lease.tapName}" arp operation request arp taddr ip != ${lease.hostIp} drop`
+      `    iifname "${lease.tapName}" arp operation request arp daddr ip != ${lease.hostIp} drop`
     )
   }
   lines.push('  }', '}', '')

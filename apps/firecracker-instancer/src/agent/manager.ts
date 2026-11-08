@@ -126,6 +126,9 @@ const leaseWithExpose = (
 }
 
 /** Fixed, secret-free persisted failure messages. Never driver text. */
+/** Preflight checks that are reported but never block placement. */
+const INFORMATIONAL_CHECKS: ReadonlySet<string> = new Set(['reflink'])
+
 const FAILURE_MESSAGES = {
   allocate: 'network allocation failed',
   launch: 'launch failed',
@@ -1175,11 +1178,15 @@ export const createInstanceManager = (deps: {
       logOperationError('*', 'net.preflight', err)
       checks.net_preflight = false
     }
+    // Informational checks (e.g. reflink support only affects boot speed) must
+    // never take a host out of rotation.
     const accepting =
       !config.draining &&
       !shuttingDown &&
       recovered &&
-      Object.values(checks).every(Boolean)
+      Object.entries(checks).every(
+        ([name, ok]) => ok || INFORMATIONAL_CHECKS.has(name)
+      )
     return {
       version,
       hostId: config.hostId,
