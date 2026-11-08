@@ -9,6 +9,18 @@ SPEC=/tmp/vmtest-spec-$ID.json
 
 section "c) jailer-mode create via the agent HTTP API"
 net_setup
+
+# This whole check must run under the SHIPPED unit, not a test-only drop-in.
+UNIT_SRC=$REPO/deploy/firecracker/host/rctf-firecracker-agent.service
+UNIT_DST=/etc/systemd/system/rctf-firecracker-agent.service
+expect_eq "$(sha256sum "$UNIT_DST" | cut -d' ' -f1)" \
+  "$(sha256sum "$UNIT_SRC" | cut -d' ' -f1)" \
+  "installed unit is byte-identical to the repository unit"
+if [ -d "$UNIT_DST.d" ] && [ -n "$(ls -A "$UNIT_DST.d" 2>/dev/null)" ]; then
+  bad "a systemd drop-in is installed ($(ls "$UNIT_DST.d"))"
+else
+  ok "no systemd drop-in installed (shipped unit alone)"
+fi
 expect_eq "$(ip -br addr show "$OUT_IF" | awk '{print $3}')" "$OUT_HOST_IP/24" \
   "outside test peer network is up on $OUT_IF"
 outside_http_start || bad "outside HTTP service did not start"
@@ -25,7 +37,10 @@ if [ "$CODE" = 200 ] || [ "$CODE" = 201 ]; then ok "create accepted in jailer mo
   exit 1
 fi
 
-if wait_state "$ID" running 180; then ok "instance reaches state running under the jailer"; else
+if wait_state "$ID" running 180; then
+  ok "instance reaches state running under the jailer"
+  ok "jailer launched Firecracker under the shipped unit (no drop-in)"
+else
   bad "instance did not reach running: $(api "$API/v1/instances/$ID" | head -c 500)"
   journalctl -u rctf-firecracker-agent --no-pager -n 80 | tail -40 >&2
 fi

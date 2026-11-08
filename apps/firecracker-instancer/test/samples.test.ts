@@ -68,4 +68,46 @@ describe('shipped example configs', () => {
     // VMs must outlive an agent restart: the default mixed kill mode would SIGKILL them.
     expect(unit).toMatch(/^KillMode=process$/m)
   })
+
+  test('the agent systemd unit keeps the capabilities the jailer needs', () => {
+    const unit = readFileSync(
+      new URL('host/rctf-firecracker-agent.service', root),
+      'utf8'
+    )
+    const directive = (name: string) =>
+      unit
+        .split('\n')
+        .find(line => line.startsWith(`${name}=`))
+        ?.slice(name.length + 1)
+        .trim()
+        .split(/\s+/) ?? []
+
+    // The jailer chroots, mounts, writes cgroups and setuid/setgid()s to the
+    // per-VM uid, so all of these must survive the bounding set.
+    const bounding = directive('CapabilityBoundingSet')
+    for (const cap of [
+      'CAP_NET_ADMIN',
+      'CAP_NET_RAW',
+      'CAP_SYS_ADMIN',
+      'CAP_SYS_CHROOT',
+      'CAP_SYS_PTRACE',
+      'CAP_SETUID',
+      'CAP_SETGID',
+      'CAP_CHOWN',
+      'CAP_MKNOD',
+    ]) {
+      expect(bounding).toContain(cap)
+    }
+    // systemd 255 (Ubuntu 24.04) launches a root unit one bit short of
+    // CapBnd (CAP_SETUID) when NoNewPrivileges=yes is combined with a seccomp
+    // filter. AmbientCapabilities restores exactly the jailer's bits; removing
+    // either directive would silently reintroduce the launch failure.
+    expect(unit).toMatch(/^NoNewPrivileges=yes$/m)
+    expect(directive('RestrictAddressFamilies')).toEqual(
+      expect.arrayContaining(['AF_UNIX', 'AF_INET', 'AF_INET6', 'AF_NETLINK'])
+    )
+    const ambient = directive('AmbientCapabilities')
+    expect(ambient).toContain('CAP_SETUID')
+    expect(ambient).toContain('CAP_SETGID')
+  })
 })

@@ -192,6 +192,16 @@ If you change `vm.chrootBase` or `vm.runDir`, update the unit accordingly. The
 unit also keeps kernel tunables writable because the jailer creates cgroups
 under `/sys/fs/cgroup`.
 
+On systemd 255 (Ubuntu 24.04), `NoNewPrivileges=yes` combined with a seccomp
+filter (`RestrictAddressFamilies=` installs one) makes systemd start a root
+service with `CAP_SETUID` still in `CapBnd` but missing from
+`CapPrm`/`CapEff`; the jailer's `setuid(10000)` then fails with
+`Failed to exec into Firecracker: Operation not permitted (os error 1)`.
+The unit therefore also sets `AmbientCapabilities=CAP_SETUID CAP_SETGID`,
+which restores exactly the two bits the jailer needs (and keeps the socket
+filter). Verified on systemd `255.4-1ubuntu8.18` (Ubuntu 24.04, kernel 6.8)
+with Firecracker/jailer v1.17.0 on 2026-11-08; see `../vmtest/`.
+
 ## Install
 
 ```sh
@@ -210,6 +220,12 @@ verifies the Firecracker and jailer binaries and versions (default minimum
 /etc/traefik/dynamic/rctf-firecracker 0755  Traefik file provider
 /etc/rctf-firecracker                 0755  agent config
 ```
+
+Version parsing reads only the first line of `--version` and the first
+`x.y.z` token, so Firecracker/jailer ≥ 1.17 (which log an extra
+`exit_code=0` line on stdout) and pre-release suffixes work. For an
+unprivileged check of the same parser, `./host-setup.sh --check-version-only`
+prints the two parsed versions and exits without touching the host.
 
 It does **not** start/stop services, flush firewalls or delete anything.
 
@@ -323,14 +339,24 @@ user+network namespace, two real Firecracker v1.17.0 microVMs, direct mode):
   and removing the rules makes the same probe succeed (so the result is not a false negative);
 - the guest reaches `169.254.169.254` (MMDS) through the documented `ip=` cmdline and route.
 
-**Not verified (needs a real root KVM host):**
+**Verified as root inside a throwaway Ubuntu 24.04 QEMU VM** (`../vmtest/`, 2026-11-08; systemd
+255.4-1ubuntu8.18, kernel 6.8, Firecracker/jailer v1.17.0, nested KVM; the host ran only
+unprivileged QEMU):
 
-- jailer mode (the smoke test uses `mode: direct`), including `ip tuntap` with `user`/`group` under the jailer uid;
-- `egress: true` masquerade, public DNAT from outside the host, and conntrack flushing/reuse safety (the smoke
-  test runs with `requireConntrack: false`);
+- `host-setup.sh` on a fresh distro, including parsing Firecracker 1.17's `--version` and an
+  idempotent rerun;
+- jailer mode: create/delete over the real agent API, uid/gid 10000, chroot, per-VM cgroup, real
+  tap with the durable alias, MMDS flag delivery, no flag on host disk;
+- the **shipped** systemd unit (byte-identical, no drop-in) actually launching the jailer
+  (`CAP_SETUID`/`CAP_SETGID` via `AmbientCapabilities=`, see above), `KillMode=process` across
+  `systemctl restart` and `kill -9`, and agent re-adoption;
+- `egress: true` masquerade, `egress: false` denial, public DNAT from an outside network
+  namespace, conntrack flushing on release, and reuse quarantine;
+- team isolation measured from inside the guests, with a rules-removed positive control.
+
+**Not verified:**
+
 - Traefik actually loading the generated dynamic files and proxying, and TLS;
-- the systemd unit under a real systemd, in particular that `KillMode=process` really leaves VMs running across
-  `systemctl restart` (VMs live in the unit's cgroup unless `vm.cgroupLimits` gives each its own), and the
-  hardening options against your specific Firecracker/jailer version (capability and namespace requirements can
-  change between releases);
+- your specific distro/systemd/kernel/Firecracker combination (capability and namespace
+  requirements can change between releases) — the vmtest results are for the versions above;
 - more than one host.
