@@ -46,7 +46,15 @@ Everything needed on a KVM host for the rCTF Firecracker instancer's
   - Egress is denied by default. With `egress: true` the guest is masqueraded
     out of `network.externalInterface`, and destinations in loopback, RFC1918,
     CGNAT, link-local, multicast, reserved space and the VM subnet pool are
-    still dropped.
+    still dropped. **The egress flag is immutable for the life of a lease**:
+    it is chosen at allocation, persisted in the lease, and restore never
+    flips it. If a restored lease's flag disagrees with the currently
+    installed rules (`restore` reads the `inet rctf_fc` table), the lease is
+    fenced and its conntrack entries are flushed before the new policy is
+    rendered, so established flows cannot survive an egress change.
+  - Unknown `fctap*` interfaces (up but without a lease) get no per-lease
+    rules; the ARP table ends with an explicit drop for every `fctap*` that is
+    not in the leased tap set (with zero leases it drops all `fctap*` ARP).
   - DNAT only matches packets addressed to a **local** address
     (`fib daddr type local`) on `externalInterface`; transit traffic through the
     host is never rewritten.
@@ -76,32 +84,65 @@ Everything needed on a KVM host for the rCTF Firecracker instancer's
 Netfilter conntrack entries (including NAT mappings) outlive a lease. On
 `unpublish` and on release, the agent deletes every entry for the lease's guest
 IP in all four directions (`--orig-src`, `--orig-dst`, `--reply-src`,
-`--reply-dst`) plus every public DNAT port (`--orig-port-dst <port> -p tcp`).
-"0 flow entries have been deleted" is treated as success; any other failure
-aborts the release so the lease stays reserved and the release can be retried.
+`--reply-dst`). It deliberately does **not** delete by destination port alone:
+`--orig-port-dst <port>` has no address component and would also remove other
+tenants' egress or host connections to that port. Published DNAT flows always
+have `reply-src == guestIp`, so the address selectors cover them. "0 flow
+entries have been deleted" is treated as success; any other failure aborts the
+release so the lease stays reserved and the release can be retried.
+
+Release is ordered so no pass-through window exists:
+
+1. install a **fenced** ruleset (only blocking rules for the retiring lease:
+   no DNAT, no forward/input accepts, explicit unconditional drops for its tap
+   and guest address in both directions, including established/related);
+2. remove its Traefik routes;
+3. delete its tap (stops guest packets);
+4. flush conntrack in all four directions;
+5. only after all of the above succeed, free the /30, ports and hostnames into
+   the quarantine below. `unpublish` uses the same fence step before removing
+   routes and flushing, then re-renders the live tap's security rules.
+
+Any failure keeps the lease reserved and fenced, and `release`/`unpublish` are
+retryable/idempotent; a restore that finds a half-released lease keeps it
+fenced and never re-creates its tap or public routes.
 
 Freed /30 indexes and public ports are additionally **quarantined** for
 `network.reuseQuarantineSeconds` (default 120) before they can be handed out
 again; allocation prefers never-used entries and then the oldest release.
 Restore-time stray resources (a removed abandoned tap) start their quarantine
-at restore time.
+at restore time. Deadlines are persisted in `network.quarantineFile` (default
+`/var/lib/rctf-firecracker/net-quarantine.json`), an atomic (tmp + fsync +
+rename, mode 0600) JSON file containing only resource ids and expiry epoch ms —
+no addresses, hostnames, flags or other secrets. It is written on release and
+orphan cleanup and loaded at startup, so a restart (including `restore([])`)
+cannot make a just-released /30 or port immediately reusable. A corrupt or
+unreadable file fails closed: every unowned index/port stays quarantined for
+one full period and an error is logged. If the file cannot be written on a
+development host, release proceeds with the in-memory quarantine and logs an
+error (durability across restarts is lost).
 
 Allocation refuses to proceed when `conntrack` is unavailable, unless
 `network.requireConntrack` is explicitly set to `false` (dev only).
 
-### Tap ownership
+### Tap ownership (durable alias)
 
-An allocation never deletes an interface it did not create. If the chosen
-`fctapN` already exists (`File exists` from `ip tuntap add`), that index is
-skipped/quarantined and the allocation fails with a clear error if no index is
-left; the existing interface is left untouched. A failed `ip link del` is
-reported (not swallowed) so release stays retryable.
+Every tap the agent creates is marked immediately after creation with an
+interface alias: `ip link set dev fctapN alias rctf-fc:<network.ownerMarker>`
+(default marker `rctf-fc`, so `rctf-fc:rctf-fc`). An interface is considered
+ours only when **both** hold:
 
-Restore only removes stray `fctap*` interfaces when the ownership evidence
-matches: it is down **and** unaddressed (interrupted create), or every IPv4
-address on it is exactly the host side of the /30 belonging to its own index in
-`subnetPool`. A foreign interface named `fctap9` (e.g. with a LAN address) is
-left alone and reported.
+- `ip -d -o link show dev fctapN` reports `tun type tap`, and
+- its alias equals this host's `rctf-fc:<ownerMarker>`.
+
+Restore, `ensure`, release and allocation rollback never adopt, modify or
+delete an interface that does not have both. A foreign interface named
+`fctapN` (for example an operator's dummy `fctap9`) is reported and left
+untouched, and its index is skipped just like the existing name-conflict path.
+A restored live lease whose interface exists without the marker is reported
+and fails that lease loudly (it is not silently adopted or modified). Keep
+`ownerMarker` stable across restarts: changing it makes previously created
+taps look foreign.
 
 ### DNS and certificates
 
@@ -193,6 +234,10 @@ Then:
        "subnetPool": "10.200.0.0/16",
        "externalInterface": "eth0",
        "traefikDynamicDir": "/etc/traefik/dynamic/rctf-firecracker",
+   ```
+
+-      "ownerMarker": "rctf-fc",
+-      "quarantineFile": "/var/lib/rctf-firecracker/net-quarantine.json",
        "reuseQuarantineSeconds": 120,
        "requireConntrack": true,
        "httpEntrypoint": "web",
@@ -200,23 +245,24 @@ Then:
        "tcpSslEntrypoint": "websecure",
        "tapUser": "10000",
        "tapGroup": "10000"
-     }
-   }
-   ```
+  }
+  }
+  ```
 
-   - `subnetPool` must be an aligned CIDR between /8 and /30, and must not
-     overlap the host's own networks or the public internet ranges it routes
-     to. Sizing: one /30 per instance, so a /16 holds 16384 instances
-     (pool-wide), and the tap suffix is the pool index (`fctap0` … ).
-   - `tcpPortRange` needs one port per **tcp/raw expose entry** of every live
-     instance. It must be a valid, non-empty range and must not contain
-     `httpPort`, `httpsPort` or `tcpSslPort` (those belong to Traefik).
-   - With the jailer, `tapUser`/`tapGroup` must be the uid/gid Firecracker runs
-     as, otherwise it cannot open the tap. The VM driver defaults are
-     `jailUid`/`jailGid` **10000**; keep these values in sync (the example above
-     uses `10000`).
-   - `reuseQuarantineSeconds` and `requireConntrack` are described above. Only
-     disable the conntrack requirement on an isolated development host.
+  - `subnetPool` must be an aligned CIDR between /8 and /30, and must not
+    overlap the host's own networks or the public internet ranges it routes
+    to. Sizing: one /30 per instance, so a /16 holds 16384 instances
+    (pool-wide), and the tap suffix is the pool index (`fctap0` … ).
+  - `tcpPortRange` needs one port per **tcp/raw expose entry** of every live
+    instance. It must be a valid, non-empty range and must not contain
+    `httpPort`, `httpsPort` or `tcpSslPort` (those belong to Traefik).
+  - With the jailer, `tapUser`/`tapGroup` must be the uid/gid Firecracker runs
+    as, otherwise it cannot open the tap. The VM driver defaults are
+    `jailUid`/`jailGid` **10000**; keep these values in sync (the example above
+    uses `10000`).
+  - `reuseQuarantineSeconds` and `requireConntrack` are described above. Only
+    disable the conntrack requirement on an isolated development host.
+  ```
 
 ## Real-host tests (not run in CI)
 
@@ -253,7 +299,15 @@ real temp directories):
   detection, atomic 0644 writes, orphan removal;
 - restore rebuilds every route from the lease (including repaired Traefik
   files), skips and reports incomplete leases, and orphan cleanup with tap
-  ownership evidence.
+  ownership evidence;
+- release fences traffic before route/tap/conntrack teardown, is retryable at
+  every step (including a half-released restore), and conntrack deletion is
+  scoped to the lease's guest address (never port-only);
+- taps carry the durable `rctf-fc:<ownerMarker>` alias and link type, foreign
+  `fctapN` devices (including a dummy that spoofs the alias) survive restore;
+- reuse quarantine survives restart (and `restore([])`), with a fail-closed
+  corrupt-file path; the rendered `inet` + `arp` tables, including the unleased
+  `fctap*` ARP drop, pass real `nft -c -f -` inside `unshare -Urn`.
 
 **Verified against the real thing** (unprivileged, `../smoke/`: real nftables + real tap devices in a
 user+network namespace, two real Firecracker v1.17.0 microVMs, direct mode):
