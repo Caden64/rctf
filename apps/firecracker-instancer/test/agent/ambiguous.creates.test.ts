@@ -3,11 +3,7 @@ import { readTree } from './fakes'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { ProtocolError } from '@rctf/firecracker-protocol'
-import {
-  buildStoredInstance,
-  leaseToJson,
-  StateStore,
-} from '../../src/agent/state'
+import { buildStoredInstance, StateStore } from '../../src/agent/state'
 import type { VmHandle } from '../../src/interfaces'
 import { createLogger } from '../../src/log'
 import { createHarness, type Harness } from './harness'
@@ -15,10 +11,8 @@ import {
   FakeNetworkManager,
   FakeVmDriver,
   makeGate,
-  makeLease,
   makeSpec,
   waitFor,
-  toExpose,
   type Gate,
 } from './fakes'
 
@@ -162,7 +156,6 @@ describe('restart with may-hold ownership but no handle', () => {
   it('releases network and destroys the VM by id during recovery', async () => {
     const harness = await setup({ sweepIntervalMs: 1_000_000 })
     const spec = makeSpec()
-    const lease = leaseToJson(makeLease(spec.id, toExpose(spec.expose)))
     const handle = makeHandle(spec.id)
     await harness.mgr.stop()
 
@@ -177,8 +170,6 @@ describe('restart with may-hold ownership but no handle', () => {
     vm2.handles.set(spec.id, handle)
     vm2.alive.add(spec.id)
     const net2 = new FakeNetworkManager()
-    net2.leases.set(spec.id, lease)
-    net2.published.add(spec.id)
 
     const mgr = harness.spawn({ vm: vm2, net: net2 })
     await mgr.start()

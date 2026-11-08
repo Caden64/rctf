@@ -1,7 +1,7 @@
 import { createInstanceManager } from '../../src/agent/manager'
 import type { AgentConfig } from '../../src/agent/config'
 import { StateStore, TombstoneStore } from '../../src/agent/state'
-import type { InstanceManager } from '../../src/interfaces'
+import type { InstanceManager, NetworkManager } from '../../src/interfaces'
 import type { Logger } from '../../src/log'
 import {
   FakeNetworkManager,
@@ -15,7 +15,7 @@ import {
 
 interface SpawnOptions {
   vm?: FakeVmDriver
-  net?: FakeNetworkManager
+  net?: NetworkManager
   sweepIntervalMs?: number
   erroredTtlMs?: number
   tombstoneTtlMs?: number

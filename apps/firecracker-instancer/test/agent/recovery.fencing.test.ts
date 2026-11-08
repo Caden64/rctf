@@ -6,6 +6,7 @@ import {
   StateStore,
   TombstoneStore,
   buildStoredInstance,
+  type StoreFaults,
 } from '../../src/agent/state'
 import { createLogger } from '../../src/log'
 import type { VmHandle } from '../../src/interfaces'
@@ -244,6 +245,108 @@ describe('malformed files are quarantined and conservatively fenced', () => {
 
     expect(await rejectionCode(mgr.create(makeSpec({ id })))).toBe('conflict')
     expect(await mgr.get(other)).toBeUndefined()
+  })
+})
+
+describe('a malformed file is only quarantined after its fence is durable', () => {
+  it('keeps a malformed tombstone in place and recovery closed when the replacement fence cannot be written', async () => {
+    const harness = await setup({ sweepIntervalMs: 1_000_000 })
+    const id = nextId()
+    expect(await rejectionCode(harness.mgr.delete(id))).toBe('not_found')
+    await harness.mgr.stop()
+    await writeFile(
+      path.join(harness.dir, 'tombstones', `${id}.json`),
+      '{not json',
+      'utf8'
+    )
+
+    const faults: StoreFaults = {
+      writeFile: (fileName, dir) =>
+        fileName === `${id}.json` && dir.endsWith('tombstones')
+          ? ioError('fence write failed')
+          : undefined,
+    }
+    const tombstones = new TombstoneStore(
+      harness.dir,
+      logger(),
+      faults,
+      harness.clock.now
+    )
+    const mgr = harness.spawn({ tombstones, sweepIntervalMs: 1_000_000 })
+    await mgr.start()
+
+    const info = await mgr.info()
+    expect(info.checks.recovered).toBe(false)
+    expect(info.accepting).toBe(false)
+    // The original file is the only fence evidence: it must stay in place and
+    // must not have been renamed to `.corrupt`.
+    let names = await readdir(path.join(harness.dir, 'tombstones'))
+    expect(names).toContain(`${id}.json`)
+    expect(names.some(name => name.endsWith('.corrupt'))).toBe(false)
+    expect(await rejectionCode(mgr.create(makeSpec({ id })))).toBe(
+      'host_unavailable'
+    )
+    expect(harness.vm.launchCalls).toBe(0)
+
+    // Once writes work again the next load fences durably, then quarantines.
+    faults.writeFile = undefined
+    await mgr.stop()
+    const healthy = harness.spawn({ sweepIntervalMs: 1_000_000 })
+    await healthy.start()
+    expect((await healthy.info()).accepting).toBe(true)
+    expect(await rejectionCode(healthy.create(makeSpec({ id })))).toBe(
+      'conflict'
+    )
+    names = await readdir(path.join(harness.dir, 'tombstones'))
+    expect(names).toContain(`${id}.json`)
+    expect(names.some(name => name.endsWith('.corrupt'))).toBe(true)
+  })
+
+  it('keeps a malformed state record until its conservative tombstone is durable', async () => {
+    const harness = await setup({ sweepIntervalMs: 1_000_000 })
+    const id = nextId()
+    await harness.mgr.stop()
+    await writeFile(path.join(harness.dir, `${id}.json`), '{not json', 'utf8')
+
+    const faults: StoreFaults = {
+      writeFile: (fileName, dir) =>
+        fileName === `${id}.json` && dir.endsWith('tombstones')
+          ? ioError('tombstone write failed')
+          : undefined,
+    }
+    const mgr = harness.spawn({
+      tombstones: new TombstoneStore(
+        harness.dir,
+        logger(),
+        faults,
+        harness.clock.now
+      ),
+      sweepIntervalMs: 1_000_000,
+    })
+    await mgr.start()
+
+    expect((await mgr.info()).checks.recovered).toBe(false)
+    expect((await mgr.info()).accepting).toBe(false)
+    let names = await readdir(harness.dir)
+    expect(names).toContain(`${id}.json`)
+    expect(names.some(name => name.endsWith('.corrupt'))).toBe(false)
+    // The in-process pending fence still rejects the id even though it is not
+    // durable yet (and recovery is not accepting new instances).
+    expect(['conflict', 'host_unavailable']).toContain(
+      await rejectionCode(mgr.create(makeSpec({ id })))
+    )
+
+    faults.writeFile = undefined
+    await mgr.stop()
+    const healthy = harness.spawn({ sweepIntervalMs: 1_000_000 })
+    await healthy.start()
+    expect((await healthy.info()).accepting).toBe(true)
+    names = await readdir(harness.dir)
+    expect(names).not.toContain(`${id}.json`)
+    expect(names.some(name => name.endsWith('.corrupt'))).toBe(true)
+    expect(await rejectionCode(healthy.create(makeSpec({ id })))).toBe(
+      'conflict'
+    )
   })
 })
 

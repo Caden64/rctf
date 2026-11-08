@@ -88,6 +88,23 @@ interface BootTask {
   promise: Promise<void>
 }
 
+/**
+ * One resource-acquiring call (allocate/launch/publish) whose outcome is not
+ * known yet because it outlived the operation deadline. `settled` is created
+ * exactly once so repeated retries never attach another reaction to the
+ * still-pending operation (that leaked memory with never-settling calls).
+ */
+interface PendingOperation {
+  /** The underlying driver/network call (possibly a thenable in tests). */
+  promise: PromiseLike<unknown>
+  /** Resolves when `promise` settles, successfully or not. */
+  settled: Promise<void>
+  settledFlag: boolean
+  startedAtMs: number
+  label: string
+  abandonLogged: boolean
+}
+
 interface Entry {
   id: string
   mutex: Mutex
@@ -100,7 +117,9 @@ interface Entry {
    * release anything until these settle: a late call could create a lease/VM
    * after the release and leave an unowned guest behind.
    */
-  pendingOps: Set<Promise<unknown>>
+  pendingOps: Set<PendingOperation>
+  /** Shared settlement promise for the current pending set (never re-wrapped). */
+  settlement?: Promise<void>
 }
 
 const TERMINAL_STATES: ReadonlySet<AgentInstanceState> = new Set([
@@ -222,10 +241,20 @@ export const createInstanceManager = (deps: {
   const shutdownTimeoutMs = (config.shutdownTimeoutSeconds ?? 15) * 1000
   const version = deps.version ?? '0.0.0'
   /**
-   * Teardown waits at most this long for an unsettled provisioning call to
-   * settle before keeping the record `stopping` and retrying on the sweep.
+   * Teardown (DELETE) waits at most this long for an unsettled provisioning
+   * call to settle before keeping the record `stopping` and retrying on the
+   * sweep. Sweeps never wait at all: they skip the entry for this pass.
    */
   const pendingOperationGraceMs = Math.max(operationTimeoutMs * 4, 1)
+  /**
+   * After this long an unsettled operation is reported loudly and takes the
+   * host out of rotation. It is NEVER forgotten: the late call may still create
+   * a lease/VM, so ownership and capacity stay accounted until it settles.
+   */
+  const pendingOperationAbandonMs = Math.max(
+    (config.pendingOperationAbandonSeconds ?? 900) * 1000,
+    1
+  )
 
   const entries = new Map<string, Entry>()
   const entriesLock = new Mutex()
@@ -302,18 +331,62 @@ export const createInstanceManager = (deps: {
    */
   const trackProvisioning = <T>(
     entry: Entry,
+    label: string,
     fn: () => Promise<T>
   ): Promise<T> => {
-    const operation = (async () => fn())()
-    entry.pendingOps.add(operation)
-    const settle = (): void => {
-      entry.pendingOps.delete(operation)
+    // Keep the caller's promise itself (never re-wrap it), so the settlement
+    // notification below is the only reaction ever attached to it.
+    const operation = fn()
+    const pending: PendingOperation = {
+      promise: operation,
+      settled: Promise.resolve(),
+      settledFlag: false,
+      startedAtMs: now(),
+      label,
+      abandonLogged: false,
     }
-    void operation.then(settle, settle)
+    pending.settled = Promise.resolve(operation).then(
+      () => {
+        pending.settledFlag = true
+      },
+      () => {
+        pending.settledFlag = true
+      }
+    )
+    entry.pendingOps.add(pending)
+    void pending.settled.then(() => {
+      entry.pendingOps.delete(pending)
+      if (entry.pendingOps.size === 0) entry.settlement = undefined
+    })
     return operation
   }
 
-  /** Wait (bounded) until every tracked provisioning call has settled. */
+  /**
+   * The single shared promise that resolves when every currently tracked
+   * operation has settled. Created once per pending set; retries await it
+   * instead of building another `Promise.allSettled` over the same promises.
+   */
+  const pendingSettlement = (entry: Entry): Promise<void> => {
+    if (entry.settlement !== undefined) return entry.settlement
+    const current = (async () => {
+      while (entry.pendingOps.size > 0) {
+        await Promise.all([...entry.pendingOps].map(pending => pending.settled))
+      }
+    })()
+    entry.settlement = current
+    void current.finally(() => {
+      if (entry.settlement === current && entry.pendingOps.size === 0) {
+        entry.settlement = undefined
+      }
+    })
+    return current
+  }
+
+  /**
+   * DELETE waits (bounded) for every tracked provisioning call to settle.
+   * NEVER call this from the sweep: a worker slot must not block on an
+   * operation that may never settle (see `hasPendingOperations`).
+   */
   const waitForPendingOperations = async (entry: Entry): Promise<boolean> => {
     if (entry.pendingOps.size === 0) return true
     let handle: ReturnType<typeof setTimeout> | undefined
@@ -326,11 +399,46 @@ export const createInstanceManager = (deps: {
     })
     try {
       return await Promise.race([
-        Promise.allSettled(entry.pendingOps).then(() => true),
+        pendingSettlement(entry).then(() => true),
         timedOut,
       ])
     } finally {
       if (handle) clearTimeout(handle)
+    }
+  }
+
+  const hasPendingOperations = (entry: Entry): boolean =>
+    entry.pendingOps.size > 0
+
+  /** True while any operation is older than the configured abandon window. */
+  const hasStalledOperations = (): boolean => {
+    const threshold = now() - pendingOperationAbandonMs
+    for (const entry of entries.values()) {
+      for (const pending of entry.pendingOps) {
+        if (pending.startedAtMs <= threshold) return true
+      }
+    }
+    return false
+  }
+
+  /** Loud, once-per-operation report; ownership is deliberately retained. */
+  const reportStalledOperations = (): void => {
+    const threshold = now() - pendingOperationAbandonMs
+    for (const entry of entries.values()) {
+      for (const pending of entry.pendingOps) {
+        if (pending.abandonLogged || pending.startedAtMs > threshold) continue
+        pending.abandonLogged = true
+        logger.error(
+          {
+            instanceId: entry.id,
+            operation: pending.label,
+            pendingMs: now() - pending.startedAtMs,
+            pendingOperationAbandonSeconds:
+              config.pendingOperationAbandonSeconds ?? 900,
+          },
+          'provisioning operation has not settled; keeping its ownership and capacity and refusing new placements until it settles or the agent restarts'
+        )
+      }
     }
   }
 
@@ -426,17 +534,27 @@ export const createInstanceManager = (deps: {
    * settle within the grace cap nothing is released and the caller keeps the
    * record so the sweep retries.
    */
-  const releaseResources = async (entry: Entry): Promise<boolean> => {
+  const releaseResources = async (
+    entry: Entry,
+    opts: { waitForPending?: boolean } = {}
+  ): Promise<boolean> => {
     const record = entry.record
     if (!record) return true
 
-    if (!(await waitForPendingOperations(entry))) {
-      logOperationError(
-        record.id,
-        'provisioning settle',
-        new OperationTimeoutError('provisioning')
-      )
-      return false
+    if (hasPendingOperations(entry)) {
+      // The sweep must never block a worker slot on a call that may never
+      // settle: skip this entry for this pass (it is retried next sweep) so
+      // unrelated instances' expiry/liveness checks keep running. DELETE (the
+      // only caller that waits) reports `in_progress` instead.
+      if (!opts.waitForPending) return false
+      if (!(await waitForPendingOperations(entry))) {
+        logOperationError(
+          record.id,
+          'provisioning settle',
+          new OperationTimeoutError('provisioning')
+        )
+        return false
+      }
     }
 
     const current = entry.record ?? record
@@ -528,7 +646,10 @@ export const createInstanceManager = (deps: {
    * failed and `fence_failed` when the tombstone could not be persisted; both
    * leave a stopping record so the next DELETE/sweep retries.
    */
-  const teardownLocked = async (entry: Entry): Promise<TeardownOutcome> => {
+  const teardownLocked = async (
+    entry: Entry,
+    opts: { waitForPending?: boolean } = {}
+  ): Promise<TeardownOutcome> => {
     const record = entry.record
     if (!record) return 'done'
     entry.boot?.controller.abort()
@@ -546,7 +667,7 @@ export const createInstanceManager = (deps: {
       return 'incomplete'
     }
 
-    const ok = await releaseResources(entry)
+    const ok = await releaseResources(entry, opts)
     const current = entry.record ?? stopping
     entry.record = { ...current, state: 'stopping', updatedAtMs: now() }
     if (!ok) {
@@ -758,7 +879,7 @@ export const createInstanceManager = (deps: {
         updatedAtMs: now(),
       })
       const lease = await runOperation(spec.id, 'net.allocate', () =>
-        trackProvisioning(entry, () =>
+        trackProvisioning(entry, 'net.allocate', () =>
           net.allocate({
             instanceId: spec.id,
             egress: spec.egress,
@@ -785,7 +906,7 @@ export const createInstanceManager = (deps: {
         updatedAtMs: now(),
       })
       const handle = await runOperation(spec.id, 'vm.launch', () =>
-        trackProvisioning(entry, () =>
+        trackProvisioning(entry, 'vm.launch', () =>
           vm.launch({
             instanceId: spec.id,
             image: spec.image,
@@ -815,7 +936,7 @@ export const createInstanceManager = (deps: {
       // A timed-out publish can still install routes after teardown released
       // the lease; track it so release happens only once it settled.
       await runOperation(spec.id, 'net.publish', () =>
-        trackProvisioning(entry, () =>
+        trackProvisioning(entry, 'net.publish', () =>
           net.publish(lease, exposeRequests(record.spec))
         )
       )
@@ -964,7 +1085,9 @@ export const createInstanceManager = (deps: {
             await fenceTombstone(id)
             throw new ProtocolError('not_found', 'instance not found')
           }
-          const outcome = await teardownLocked(entry)
+          // DELETE is user/controller-driven: wait (bounded) for an unsettled
+          // provisioning call, then answer `in_progress` if it is still open.
+          const outcome = await teardownLocked(entry, { waitForPending: true })
           if (outcome === 'fence_failed') {
             throw new ProtocolError('internal', 'failed to persist tombstone')
           }
@@ -997,6 +1120,29 @@ export const createInstanceManager = (deps: {
       const record = entry.record
       if (!record?.lease || !record.vm) continue
       if (record.state !== 'starting' && record.state !== 'running') continue
+      leases.push(leaseWithExpose(record.lease, record.spec))
+    }
+    return leases
+  }
+
+  /**
+   * Leases whose teardown was interrupted (or that were never adopted) but
+   * whose persisted record still owns host resources: `stopping`, errored
+   * records that still hold a lease, and abandoned `creating` records. They
+   * must be handed to `net.restore` as retiring BEFORE their records are
+   * processed, otherwise a fresh (empty) network manager would treat a later
+   * `release(id)` as an unknown-id no-op and the agent would drop ownership
+   * without ever flushing conntrack or persisting the reuse quarantine.
+   */
+  const retiringLeases = (): NetLease[] => {
+    const leases: NetLease[] = []
+    for (const entry of entries.values()) {
+      const record = entry.record
+      if (!record?.lease) continue
+      const live =
+        record.vm !== undefined &&
+        (record.state === 'starting' || record.state === 'running')
+      if (live) continue
       leases.push(leaseWithExpose(record.lease, record.spec))
     }
     return leases
@@ -1095,7 +1241,12 @@ export const createInstanceManager = (deps: {
     )
   }
 
-  /** Persist conservative fences for ids whose record file was malformed. */
+  /**
+   * Persist conservative fences for ids whose record file was malformed. The
+   * fence is made durable BEFORE the malformed file is renamed to `.corrupt`;
+   * if the fence write fails the original stays in place so the next load
+   * re-detects it and recovery stays closed.
+   */
   const persistConservativeFences = async (ids: string[]): Promise<boolean> => {
     for (const id of ids) {
       try {
@@ -1108,14 +1259,21 @@ export const createInstanceManager = (deps: {
         logOperationError(id, 'tombstone.persist', err)
         return false
       }
+      // Only after the durable fence: quarantine the unreadable original.
+      await store.quarantineCorrupt(id)
     }
     return true
   }
 
   /**
    * Load state from disk. A per-file READ failure fails recovery closed and is
-   * retried by the sweep; a MALFORMED file is quarantined and its id
-   * conservatively fenced so it can never be silently reused.
+   * retried by the sweep; a MALFORMED file is conservatively fenced (durably,
+   * before it is quarantined) so it can never be silently reused.
+   *
+   * The network is restored HERE, before any record is processed: every lease
+   * the agent still owns - live ones AND those whose teardown was interrupted -
+   * becomes known to a fresh network manager, so a following `release(id)` runs
+   * the real flush/quarantine sequence instead of a no-op on an unknown id.
    */
   const loadState = async (): Promise<boolean> => {
     try {
@@ -1162,6 +1320,24 @@ export const createInstanceManager = (deps: {
         record,
         pendingOps: new Set(),
       })
+    }
+
+    // Learn every lease (live + retiring) before touching any record. If this
+    // fails, recovery stays closed and the sweep retries it; a create cannot
+    // slip in and be undone by a later restore.
+    try {
+      const restored = await runOperation('*', 'net.restore', () =>
+        net.restore(liveLeases(), { retiring: retiringLeases() })
+      )
+      if (restored.removedOrphans.length > 0) {
+        logger.info(
+          { orphans: restored.removedOrphans },
+          'removed orphaned network artifacts'
+        )
+      }
+    } catch (err) {
+      logOperationError('*', 'net.restore', err)
+      return false
     }
 
     // Serialise recovery mutations per id before any request can arrive.
@@ -1237,32 +1413,17 @@ export const createInstanceManager = (deps: {
   }
 
   /**
-   * Restore the network from stable ownership and remove orphan VMs. Until
-   * this succeeds the agent is not accepting and readiness tasks are deferred;
-   * the sweep retries it. Failed orphan destructions do not block recovery but
-   * keep `accepting` false until they are confirmed.
+   * Finish recovery (state + network + orphan VMs). Until this succeeds the
+   * agent is not accepting and readiness tasks are deferred; the sweep retries
+   * it. The network restore itself happens inside `loadState` BEFORE any record
+   * is processed. Failed orphan destructions do not block recovery but keep
+   * `accepting` false until they are confirmed.
    */
   const finishRecovery = (): Promise<void> => {
     if (recovered || shuttingDown) return Promise.resolve()
     if (recoveryInFlight) return recoveryInFlight
     recoveryInFlight = (async () => {
       if (!stateLoaded && !(await loadState())) return
-
-      const leases = liveLeases()
-      try {
-        const restored = await runOperation('*', 'net.restore', () =>
-          net.restore(leases)
-        )
-        if (restored.removedOrphans.length > 0) {
-          logger.info(
-            { orphans: restored.removedOrphans },
-            'removed orphaned network artifacts'
-          )
-        }
-      } catch (err) {
-        logOperationError('*', 'net.restore', err)
-        return
-      }
 
       if (orphanGraceMs > 0) await Bun.sleep(orphanGraceMs)
       if (!(await scanForOrphans())) return
@@ -1409,6 +1570,7 @@ export const createInstanceManager = (deps: {
 
   const sweep = async (): Promise<void> => {
     if (shuttingDown) return
+    reportStalledOperations()
     if (!recovered) {
       void finishRecovery().catch(err => logOperationError('*', 'recover', err))
     }
@@ -1439,9 +1601,13 @@ export const createInstanceManager = (deps: {
 
   const info = async (): Promise<AgentInfo> => {
     let images: string[] = []
+    reportStalledOperations()
     const checks: Record<string, boolean> = {
       recovered,
       orphanBacklog: orphanBacklog.size === 0,
+      // A never-settling provisioning call is a critical check: it takes the
+      // host out of rotation (ownership/capacity stay accounted).
+      stalledOperations: !hasStalledOperations(),
     }
     try {
       const preflight = await runOperation('*', 'vm.preflight', () =>

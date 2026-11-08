@@ -137,7 +137,6 @@ describe('agent restart recovery', () => {
     await stateStore(harness.dir).save(record)
 
     const net2 = new FakeNetworkManager()
-    net2.leases.set(spec.id, lease)
     const mgr2 = harness.spawn({ net: net2 })
     await mgr2.start()
 
@@ -165,7 +164,6 @@ describe('agent restart recovery', () => {
     const vm2 = new FakeVmDriver()
     vm2.handles.set(spec.id, handle)
     const net2 = new FakeNetworkManager()
-    net2.leases.set(spec.id, lease)
     const mgr2 = harness.spawn({ vm: vm2, net: net2 })
     await mgr2.start()
 

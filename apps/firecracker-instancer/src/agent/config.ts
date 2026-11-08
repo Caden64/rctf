@@ -25,6 +25,13 @@ export const agentConfigSchema = z.object({
   }),
   /** How long past expiresAtMs the agent waits for the controller before self-destructing the VM. */
   expiryGraceSeconds: z.optional(z.prefault(z.int(), 120)),
+  /**
+   * A resource-acquiring call (allocate/launch/publish) that has not settled
+   * for this long is never abandoned (that could orphan a guest) but is loudly
+   * reported and takes the host out of rotation (`checks.stalledOperations`)
+   * until it settles or the agent is restarted.
+   */
+  pendingOperationAbandonSeconds: z.optional(z.prefault(z.int(), 900)),
   /** Local drain flag: stop accepting new instances (existing ones keep running). */
   draining: z.optional(z.prefault(z.boolean(), false)),
   /** Keep an errored tombstone for this long, then forget it. */
