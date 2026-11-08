@@ -119,7 +119,10 @@ describe('host monitor', () => {
     const { store, monitor } = monitorSetup(hosts, agents)
     try {
       await monitor.tick()
-      expect(store.getHost('host-a')?.clockSkewMs).toBe(-7000)
+      // The fake agent and the monitor both read the real wall clock, so a
+      // millisecond can pass between the two reads; allow that jitter.
+      const skew = store.getHost('host-a')?.clockSkewMs ?? Number.NaN
+      expect(Math.abs(skew + 7000)).toBeLessThanOrEqual(5)
     } finally {
       store.close()
     }
