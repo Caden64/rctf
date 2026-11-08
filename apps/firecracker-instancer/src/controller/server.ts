@@ -345,6 +345,11 @@ export const createControllerServer = (options: ControllerServerOptions) => {
     Bun.serve({
       hostname: listen.host,
       port: listen.port,
+      // Enforced by Bun while streaming, so chunked bodies cannot be buffered
+      // past the cap before our own check runs.
+      maxRequestBodySize: maxBodyBytes,
+      // Create waits on the host agent (up to ~30s); Bun's default is 10s.
+      idleTimeout: 60,
       fetch: handler,
     })
 
