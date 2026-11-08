@@ -43,6 +43,8 @@ export interface NetLease {
   guestIp: string
   prefixLength: number
   guestMac: string
+  /** index into the expose array -> guest port, for EVERY expose entry (lets routes be rebuilt from the lease alone after a restart). */
+  guestPorts: Record<number, number>
   /** index into the expose array -> public host TCP port (only for tcp/raw kinds). */
   publicPorts: Record<number, number>
   /** index into the expose array -> public hostname (only for http/https/tcp-ssl). */
