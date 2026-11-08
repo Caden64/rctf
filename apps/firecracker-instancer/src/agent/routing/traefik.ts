@@ -1,4 +1,11 @@
-import { chmod, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { join } from 'node:path'
 import { stringify } from 'yaml'
 import {
@@ -7,6 +14,7 @@ import {
 } from '@rctf/firecracker-protocol'
 import type { Logger } from '../../log'
 import type { NetworkConfig } from '../net/config'
+import { MAX_HOST_PREFIX_LENGTH } from '../net/lease'
 import {
   assertHostname,
   assertInstanceId,
@@ -30,7 +38,16 @@ const TMP_REGEX = /^\.rctf-fc-([a-z0-9]{16,32})\.yml\.tmp$/
 export const traefikFileName = (instanceId: string): string =>
   `rctf-fc-${assertInstanceId(instanceId)}.yml`
 
-/** `<hostPrefix>-<first 10 chars of instanceId>.<httpDomain>`; every label validated. */
+/**
+ * `<hostPrefix>-<first 20 chars of instanceId>.<httpDomain>`.
+ *
+ * 20 chars of the instance id (instead of 10) keeps hostnames distinct for
+ * realistic ids; a hostPrefix is limited to 32 characters so the label stays
+ * within 63 bytes (32 + 1 + 20). Allocation additionally rejects a hostname
+ * that a different lease (or a stale Traefik file) already owns.
+ */
+export const HOSTNAME_ID_CHARS = 20
+
 export const publicHostname = (
   config: Pick<NetworkConfig, 'httpDomain'>,
   instanceId: string,
@@ -40,7 +57,12 @@ export const publicHostname = (
   if (!DNS_LABEL_REGEX.test(hostPrefix)) {
     throw new Error(`invalid hostPrefix: ${JSON.stringify(hostPrefix)}`)
   }
-  const hostname = `${hostPrefix}-${instanceId.slice(0, 10)}.${config.httpDomain}`
+  if (hostPrefix.length > MAX_HOST_PREFIX_LENGTH) {
+    throw new Error(
+      `hostPrefix is longer than ${MAX_HOST_PREFIX_LENGTH} characters: ${JSON.stringify(hostPrefix)}`
+    )
+  }
+  const hostname = `${hostPrefix}-${instanceId.slice(0, HOSTNAME_ID_CHARS)}.${config.httpDomain}`
   assertHostname(config.httpDomain)
   return assertHostname(hostname)
 }
@@ -183,6 +205,34 @@ export class TraefikFileManager {
     return entries
       .map(name => FILE_REGEX.exec(name)?.[1])
       .filter((id): id is string => id !== undefined)
+  }
+
+  /**
+   * True when another instance's Traefik file already routes `hostname`.
+   * Used by allocation to fail (and roll back) instead of silently creating
+   * two routers for the same Host/HostSNI rule.
+   */
+  async containsHostname(
+    hostname: string,
+    exceptInstanceId?: string
+  ): Promise<boolean> {
+    const needle = `\`${assertHostname(hostname)}\``
+    for (const id of await this.list()) {
+      if (id === exceptInstanceId) {
+        continue
+      }
+      try {
+        const text = await readFile(this.pathFor(id), 'utf8')
+        if (text.includes(needle)) {
+          return true
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error
+        }
+      }
+    }
+    return false
   }
 
   /** Remove files (and stale temp files) for ids that are not in `known`. */

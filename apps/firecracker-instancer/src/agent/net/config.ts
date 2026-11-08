@@ -61,11 +61,18 @@ export const networkConfigSchema = z.object({
     '/etc/traefik/dynamic/rctf-firecracker'
   ),
   /**
-   * Per-instance route sidecars (instanceId -> expose list). The frozen
-   * `NetLease` has no guest ports, so this is what lets `restore()` re-assert
-   * DNAT and Traefik files after an agent restart. No secrets.
+   * How long a released /30 index and public port stay out of circulation.
+   * Netfilter conntrack entries (incl. NAT mappings) outlive a lease, so
+   * immediate reuse would let the next tenant inherit flows of the previous
+   * one. Production default: 120 s. Only lower it for isolated dev hosts.
    */
-  routesDir: z.prefault(z.string(), '/var/lib/rctf-firecracker/net-routes'),
+  reuseQuarantineSeconds: z.prefault(z.int().check(z.gte(0)), 120),
+  /**
+   * Refuse allocation when conntrack-tools is missing. Required in production:
+   * without `conntrack -D` a released lease can leak conntrack state to the
+   * next tenant. `false` is a dev-only escape hatch.
+   */
+  requireConntrack: z.prefault(z.boolean(), true),
   /** NIC that faces the internet; used for DNAT and masquerade. */
   externalInterface: z
     .prefault(z.string(), 'eth0')

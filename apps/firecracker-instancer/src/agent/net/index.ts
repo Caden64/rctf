@@ -1,14 +1,12 @@
 import { constants as fsConstants } from 'node:fs'
 import { access, readFile, stat } from 'node:fs/promises'
 import {
-  DNS_LABEL_REGEX,
-  type ExposeKindValue,
-} from '@rctf/firecracker-protocol'
-import {
+  type Clock,
   type CommandRunner,
   type NetExposeRequest,
   type NetLease,
   type NetworkManager,
+  NetworkCapacityError,
   type PublicEndpoint,
 } from '../../interfaces'
 import type { Logger } from '../../log'
@@ -18,6 +16,7 @@ import {
   publicHostname,
   type TraefikRoute,
 } from '../routing/traefik'
+import { conntrackAvailable, flushConntrack } from './conntrack'
 import type { NetworkConfig } from './config'
 import {
   Ipv4Pool,
@@ -26,44 +25,40 @@ import {
   tapNameForIndex,
   type SubnetPool,
 } from './ipam'
-import { applyRuleset, renderRuleset, type GuestPorts } from './nftables'
-import { RouteStore } from './routes'
-import { TapController } from './tap'
 import {
-  ENTRYPOINT_REGEX,
+  assertLeaseShape,
+  cloneLease,
+  deriveLeaseRoutes,
+  isHostnameKind,
+  isTcpKind,
+  validateExpose,
+} from './lease'
+import { applyRuleset, renderRuleset } from './nftables'
+import {
+  TapController,
+  TapNameConflictError,
+  newTapOwnership,
+  type TapInspection,
+  type TapOwnership,
+} from './tap'
+import {
+  TAP_NAME_REGEX,
   USER_GROUP_REGEX,
   assertHostname,
   assertIfaceName,
   assertInstanceId,
-  assertIpv4,
   assertPort,
-  assertTapName,
+  ENTRYPOINT_REGEX,
   isValidDomain,
-  isValidMacAddress,
   isValidPort,
   randomGuestMac,
 } from './validate'
-
-const EXPOSE_KINDS: ReadonlySet<string> = new Set<ExposeKindValue>([
-  'tcp',
-  'tcp-ssl',
-  'http',
-  'https',
-  'raw',
-])
-
-const cloneLease = (lease: NetLease): NetLease => ({
-  ...lease,
-  publicPorts: { ...lease.publicPorts },
-  publicHostnames: { ...lease.publicHostnames },
-})
 
 interface LeaseState {
   lease: NetLease
   /** Index into the pool (also the tap suffix). */
   index: number
-  expose: NetExposeRequest[]
-  /** Whether this lease currently contributes rules/DNAT (false after unpublish). */
+  /** Whether this lease currently installs public ingress (DNAT/Traefik). */
   routed: boolean
 }
 
@@ -81,35 +76,6 @@ class Mutex {
   }
 }
 
-const validateExpose = (
-  input: readonly NetExposeRequest[]
-): NetExposeRequest[] => {
-  if (!Array.isArray(input)) {
-    throw new Error('expose must be an array')
-  }
-  return input.map((entry, index) => {
-    if (typeof entry !== 'object' || entry === null) {
-      throw new Error(`expose[${index}] is not an object`)
-    }
-    if (!EXPOSE_KINDS.has(entry.kind)) {
-      throw new Error(`expose[${index}] has an invalid kind: ${entry.kind}`)
-    }
-    if (!DNS_LABEL_REGEX.test(entry.hostPrefix)) {
-      throw new Error(
-        `expose[${index}] has an invalid hostPrefix: ${JSON.stringify(entry.hostPrefix)}`
-      )
-    }
-    assertPort(entry.port)
-    return { kind: entry.kind, hostPrefix: entry.hostPrefix, port: entry.port }
-  })
-}
-
-const isTcpKind = (kind: ExposeKindValue): boolean =>
-  kind === 'tcp' || kind === 'raw'
-
-const isHostnameKind = (kind: ExposeKindValue): boolean =>
-  kind === 'http' || kind === 'https' || kind === 'tcp-ssl'
-
 const isDirWritable = async (path: string): Promise<boolean> => {
   try {
     const info = await stat(path)
@@ -123,6 +89,27 @@ const isDirWritable = async (path: string): Promise<boolean> => {
   }
 }
 
+const tapIndexFromName = (tapName: string): number | undefined => {
+  if (!TAP_NAME_REGEX.test(tapName)) {
+    return undefined
+  }
+  const suffix = tapName.slice('fctap'.length)
+  const index = Number(suffix)
+  return Number.isSafeInteger(index) ? index : undefined
+}
+
+const sameExpose = (
+  left: readonly NetExposeRequest[],
+  right: readonly NetExposeRequest[]
+): boolean =>
+  left.length === right.length &&
+  left.every(
+    (entry, index) =>
+      entry.kind === right[index]?.kind &&
+      entry.hostPrefix === right[index]?.hostPrefix &&
+      entry.port === right[index]?.port
+  )
+
 class NetworkManagerImpl implements NetworkManager {
   private readonly pool: SubnetPool
   private ipam: Ipv4Pool
@@ -132,14 +119,21 @@ class NetworkManagerImpl implements NetworkManager {
   private readonly usedMacs = new Set<string>()
   private readonly mutex = new Mutex()
   private readonly taps: TapController
-  private readonly routeStore: RouteStore
   private readonly traefik: TraefikFileManager
+  private readonly quarantineMs: number
+  private readonly clock: Clock
+  /** Lease ids whose rules must already be gone (release in progress). */
+  private readonly releasing = new Set<string>()
+  private conntrackUsable = false
 
   constructor(
     private readonly config: NetworkConfig,
     private readonly runner: CommandRunner,
-    private readonly logger?: Logger
+    private readonly logger?: Logger,
+    clock?: Clock
   ) {
+    this.clock = clock ?? Date.now
+    this.quarantineMs = config.reuseQuarantineSeconds * 1_000
     this.pool = parseSubnetPool(config.subnetPool)
     assertIfaceName(config.externalInterface)
     if (!isValidDomain(config.httpDomain)) {
@@ -175,7 +169,8 @@ class NetworkManagerImpl implements NetworkManager {
     try {
       ports = new PortAllocator(
         config.tcpPortRange.from,
-        config.tcpPortRange.to
+        config.tcpPortRange.to,
+        this.allocatorOptions()
       )
     } catch {
       ports = undefined
@@ -192,66 +187,53 @@ class NetworkManagerImpl implements NetworkManager {
         port =>
           port >= config.tcpPortRange.from && port <= config.tcpPortRange.to
       )
-    this.ipam = new Ipv4Pool(this.pool)
+    this.ipam = new Ipv4Pool(this.pool, this.allocatorOptions())
     this.taps = new TapController(
       runner,
       { user: config.tapUser, group: config.tapGroup },
       logger
     )
-    this.routeStore = new RouteStore(config.routesDir, logger)
     this.traefik = new TraefikFileManager(config, logger)
+  }
+
+  private allocatorOptions(): { quarantineMs: number; now: Clock } {
+    return { quarantineMs: this.quarantineMs, now: this.clock }
   }
 
   // ---------------------------------------------------------------------
   // Ruleset plumbing
   // ---------------------------------------------------------------------
 
-  private guestPortsOf(state: LeaseState): Record<number, number> {
-    const result: Record<number, number> = {}
-    state.expose.forEach((entry, index) => {
-      if (
-        isTcpKind(entry.kind) &&
-        state.lease.publicPorts[index] !== undefined
-      ) {
-        result[index] = entry.port
-      }
-    })
-    return result
-  }
-
+  /**
+   * Re-render both nftables tables from EVERY live lease. Public ingress
+   * (DNAT + its forward accept) is gated on `routed`; isolation, anti-spoof,
+   * IPv6 drop, egress policy and ARP are rendered for every allocated lease so
+   * `unpublish` never weakens a live tap.
+   */
   private async renderAndApply(): Promise<void> {
-    const active = [...this.states.values()].filter(state => state.routed)
-    const guestPorts: Record<string, Record<number, number>> = {}
-    for (const state of active) {
-      guestPorts[state.lease.instanceId] = this.guestPortsOf(state)
-    }
+    const active = [...this.states.values()].filter(
+      state => !this.releasing.has(state.lease.instanceId)
+    )
+    const published = new Set(
+      active.filter(state => state.routed).map(state => state.lease.instanceId)
+    )
     const ruleset = renderRuleset(
       active.map(state => state.lease),
       this.config,
-      guestPorts as GuestPorts
+      { published }
     )
     await applyRuleset(this.runner, ruleset)
   }
 
   private traefikRoutes(state: LeaseState): TraefikRoute[] {
-    const routes: TraefikRoute[] = []
-    state.expose.forEach((entry, index) => {
-      if (!isHostnameKind(entry.kind)) {
-        return
-      }
-      const hostname =
-        state.lease.publicHostnames[index] ??
-        publicHostname(this.config, state.lease.instanceId, entry.hostPrefix)
-      assertHostname(hostname)
-      routes.push({
-        index,
-        kind: entry.kind,
-        hostname,
-        guestIp: state.lease.guestIp,
-        guestPort: entry.port,
-      })
-    })
-    return routes
+    const routes = deriveLeaseRoutes(state.lease)
+    return routes.hostnames.map(route => ({
+      index: route.index,
+      kind: route.kind,
+      hostname: route.hostname,
+      guestIp: state.lease.guestIp,
+      guestPort: route.guestPort,
+    }))
   }
 
   private freshMac(): string {
@@ -275,26 +257,86 @@ class NetworkManagerImpl implements NetworkManager {
     }
   }
 
-  private async cleanupAllocation(
-    state: LeaseState | undefined,
-    index: number,
-    ports: number[]
-  ): Promise<void> {
-    this.ports?.release(ports)
-    this.ipam.release(index)
-    if (state === undefined) {
+  /**
+   * conntrack-tools is required for safe reuse of guest IPs/public ports.
+   * Allocation refuses early with a clear error when it is missing (unless
+   * `network.requireConntrack: false`, a dev-only escape hatch).
+   */
+  private async ensureConntrack(): Promise<void> {
+    if (this.conntrackUsable) {
       return
     }
-    this.states.delete(state.lease.instanceId)
-    this.usedMacs.delete(state.lease.guestMac)
-    await this.safe('remove route sidecar', () =>
-      this.routeStore.remove(state.lease.instanceId)
+    const available = await conntrackAvailable(this.runner)
+    if (available) {
+      this.conntrackUsable = true
+      return
+    }
+    if (this.config.requireConntrack) {
+      throw new Error(
+        'conntrack-tools (`conntrack`) is required to isolate reused guest addresses/ports but is not available; install conntrack-tools or set network.requireConntrack=false (dev only)'
+      )
+    }
+    this.conntrackUsable = false
+  }
+
+  private async flushConntrackFor(
+    guestIp: string,
+    publicPorts: Iterable<number>
+  ): Promise<void> {
+    if (!this.config.requireConntrack) {
+      const available = await conntrackAvailable(this.runner)
+      if (!available) {
+        this.logger?.warn(
+          { guestIp },
+          'conntrack-tools missing; skipping conntrack flush (requireConntrack=false)'
+        )
+        return
+      }
+    }
+    await flushConntrack(this.runner, { guestIp, publicPorts })
+  }
+
+  private async flushLeaseConntrack(lease: NetLease): Promise<void> {
+    await this.flushConntrackFor(
+      lease.guestIp,
+      Object.values(lease.publicPorts)
     )
-    await this.safe('remove traefik file', () =>
-      this.traefik.remove(state.lease.instanceId)
-    )
-    await this.safe('re-render ruleset', () => this.renderAndApply())
-    await this.safe('delete tap', () => this.taps.remove(state.lease.tapName))
+  }
+
+  private async cleanupAllocation(args: {
+    state: LeaseState | undefined
+    owned: TapOwnership
+    index: number
+    ports: number[]
+    blockIndex: boolean
+  }): Promise<void> {
+    const { state, owned, index, ports, blockIndex } = args
+    if (state !== undefined) {
+      this.states.delete(state.lease.instanceId)
+      this.usedMacs.delete(state.lease.guestMac)
+      await this.safe('re-render ruleset', () => this.renderAndApply())
+    }
+    let tapRemovalFailed = false
+    if (owned.tapCreated) {
+      const tapName = state?.lease.tapName ?? tapNameForIndex(index)
+      try {
+        await this.taps.remove(tapName)
+      } catch (error) {
+        tapRemovalFailed = true
+        this.logger?.warn(
+          { err: error, tap: tapName },
+          'could not roll back tap; quarantining its /30 index'
+        )
+      }
+    }
+    // Ports/IPs of an allocation that never published cannot have conntrack
+    // state (the VM was never launched), so they are freed immediately.
+    this.ports?.discard(ports)
+    if (tapRemovalFailed || blockIndex) {
+      this.ipam.block(index)
+    } else {
+      this.ipam.discard(index)
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -321,57 +363,120 @@ class NetworkManagerImpl implements NetworkManager {
           `invalid tcpPortRange ${this.config.tcpPortRange.from}-${this.config.tcpPortRange.to} (must be a valid range that excludes httpPort/httpsPort/tcpSslPort)`
         )
       }
-      const index = this.ipam.reserve()
-      let ports: number[] = []
-      let state: LeaseState | undefined
-      try {
-        ports = this.ports.reserve(
-          expose.filter(entry => isTcpKind(entry.kind)).length
-        )
-        const { hostIp, guestIp } = this.ipam.addresses(index)
-        const publicPorts: Record<number, number> = {}
-        let cursor = 0
-        const publicHostnames: Record<number, string> = {}
-        expose.forEach((entry, position) => {
-          if (isTcpKind(entry.kind)) {
+      await this.ensureConntrack()
+
+      // Hostnames are a pure function of the instance id, so they can be
+      // computed before any resource is reserved and a collision can fail the
+      // allocation before anything needs rolling back.
+      const publicHostnames: Record<number, string> = {}
+      expose.forEach((entry, index) => {
+        if (isHostnameKind(entry.kind)) {
+          publicHostnames[index] = publicHostname(
+            this.config,
+            req.instanceId,
+            entry.hostPrefix
+          )
+        }
+      })
+      await this.assertHostnamesFree(req.instanceId, publicHostnames)
+
+      const tcpCount = expose.filter(entry => isTcpKind(entry.kind)).length
+      let lastConflict: TapNameConflictError | undefined
+      for (;;) {
+        let index: number
+        try {
+          index = this.ipam.reserve()
+        } catch (error) {
+          if (lastConflict !== undefined) {
+            throw new NetworkCapacityError(
+              `could not find a free /30 for ${req.instanceId}: ${lastConflict.message}`
+            )
+          }
+          throw error
+        }
+        let ports: number[] = []
+        let state: LeaseState | undefined
+        const owned = newTapOwnership()
+        try {
+          ports = this.ports.reserve(tcpCount)
+          const { hostIp, guestIp } = this.ipam.addresses(index)
+          const publicPorts: Record<number, number> = {}
+          let cursor = 0
+          expose.forEach((entry, position) => {
+            if (!isTcpKind(entry.kind)) {
+              return
+            }
             const port = ports[cursor]
             cursor += 1
             if (port === undefined) {
               throw new Error('internal port reservation mismatch')
             }
             publicPorts[position] = port
-          } else {
-            publicHostnames[position] = publicHostname(
-              this.config,
-              req.instanceId,
-              entry.hostPrefix
-            )
+          })
+          const lease: NetLease = {
+            instanceId: req.instanceId,
+            tapName: tapNameForIndex(index),
+            hostIp,
+            guestIp,
+            prefixLength: 30,
+            guestMac: this.freshMac(),
+            expose: expose.map(entry => ({ ...entry })),
+            publicPorts,
+            publicHostnames: { ...publicHostnames },
+            egress: req.egress,
           }
-        })
-        const lease: NetLease = {
-          instanceId: req.instanceId,
-          tapName: tapNameForIndex(index),
-          hostIp,
-          guestIp,
-          prefixLength: 30,
-          guestMac: this.freshMac(),
-          expose: expose.map(entry => ({ ...entry })),
-          publicPorts,
-          publicHostnames,
-          egress: req.egress,
+          await this.taps.create(lease, owned)
+          state = { lease, index, routed: false }
+          this.states.set(req.instanceId, state)
+          this.usedMacs.add(lease.guestMac)
+          await this.renderAndApply()
+          return cloneLease(lease)
+        } catch (error) {
+          await this.cleanupAllocation({
+            state,
+            owned,
+            index,
+            ports,
+            blockIndex: error instanceof TapNameConflictError,
+          })
+          if (error instanceof TapNameConflictError) {
+            // The name belongs to somebody else: never delete it, never
+            // hand out that index again in this process, and try the next one.
+            lastConflict = error
+            continue
+          }
+          throw error
         }
-        state = { lease, index, expose, routed: true }
-        await this.routeStore.write({ instanceId: req.instanceId, expose })
-        await this.taps.create(lease)
-        this.states.set(req.instanceId, state)
-        this.usedMacs.add(lease.guestMac)
-        await this.renderAndApply()
-        return cloneLease(lease)
-      } catch (error) {
-        await this.cleanupAllocation(state, index, ports)
-        throw error
       }
     })
+  }
+
+  /** Reject a hostname already owned by another live lease or Traefik file. */
+  private async assertHostnamesFree(
+    instanceId: string,
+    hostnames: Record<number, string>
+  ): Promise<void> {
+    const values = Object.values(hostnames)
+    for (const state of this.states.values()) {
+      if (state.lease.instanceId === instanceId) {
+        continue
+      }
+      const assigned = new Set(Object.values(state.lease.publicHostnames))
+      for (const hostname of values) {
+        if (assigned.has(hostname)) {
+          throw new Error(
+            `public hostname ${hostname} is already assigned to lease ${state.lease.instanceId}`
+          )
+        }
+      }
+    }
+    for (const hostname of values) {
+      if (await this.traefik.containsHostname(hostname, instanceId)) {
+        throw new Error(
+          `public hostname ${hostname} is already used by another Traefik route`
+        )
+      }
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -387,12 +492,12 @@ class NetworkManagerImpl implements NetworkManager {
       } else {
         this.assertSameLease(state.lease, lease)
       }
-      state.expose = exposeReq
+      if (!sameExpose(state.lease.expose, exposeReq)) {
+        throw new Error(
+          `publish for ${lease.instanceId} disagrees with the lease expose list`
+        )
+      }
       state.routed = true
-      await this.routeStore.write({
-        instanceId: state.lease.instanceId,
-        expose: exposeReq,
-      })
       await this.renderAndApply()
       await this.traefik.write(
         state.lease.instanceId,
@@ -405,17 +510,25 @@ class NetworkManagerImpl implements NetworkManager {
     return this.mutex.run(async () => {
       assertInstanceId(instanceId)
       const state = this.states.get(instanceId)
-      if (state !== undefined) {
-        const wasRouted = state.routed
-        state.routed = false
-        try {
-          await this.renderAndApply()
-        } catch (error) {
-          state.routed = wasRouted
-          throw error
-        }
+      if (state === undefined) {
+        // Idempotent: remove a possibly stale public route even when the
+        // in-memory lease is gone (nothing to flush without a guest IP).
+        await this.traefik.remove(instanceId)
+        return
+      }
+      const wasRouted = state.routed
+      state.routed = false
+      try {
+        await this.renderAndApply()
+      } catch (error) {
+        state.routed = wasRouted
+        throw error
       }
       await this.traefik.remove(instanceId)
+      // The live tap keeps every security rule; only public ingress is gone.
+      // Flush the published flows so a later publish/tenant cannot inherit
+      // them (guests with no egress cannot re-open flows meanwhile).
+      await this.flushLeaseConntrack(state.lease)
     })
   }
 
@@ -426,18 +539,27 @@ class NetworkManagerImpl implements NetworkManager {
       if (state === undefined) {
         return
       }
-      await this.traefik.remove(instanceId)
-      await this.routeStore.remove(instanceId)
-      await this.taps.remove(state.lease.tapName)
+      const lease = state.lease
+      this.releasing.add(instanceId)
       state.routed = false
-      // Only free the allocator entries after the last fallible host step, so a
-      // failed release can simply be retried (the individual steps are
-      // idempotent and tolerate already-missing artifacts).
-      await this.renderAndApply()
-      this.ipam.release(state.index)
-      this.ports?.release(Object.values(state.lease.publicPorts))
-      this.usedMacs.delete(state.lease.guestMac)
+      try {
+        // Flush first: a failure keeps the lease reserved and retryable.
+        await this.flushLeaseConntrack(lease)
+        await this.traefik.remove(instanceId)
+        // `remove` propagates real failures; only confirmed absence is
+        // tolerated, so a failed deletion keeps the lease reserved.
+        await this.taps.remove(lease.tapName)
+        await this.renderAndApply()
+      } catch (error) {
+        this.releasing.delete(instanceId)
+        throw error
+      }
+      this.releasing.delete(instanceId)
       this.states.delete(instanceId)
+      this.usedMacs.delete(lease.guestMac)
+      // Freed resources enter the reuse quarantine (conntrack just flushed).
+      this.ipam.release(state.index)
+      this.ports?.release(Object.values(lease.publicPorts))
     })
   }
 
@@ -446,19 +568,7 @@ class NetworkManagerImpl implements NetworkManager {
   // ---------------------------------------------------------------------
 
   private adoptLease(lease: NetLease): LeaseState {
-    assertInstanceId(lease.instanceId)
-    assertTapName(lease.tapName)
-    assertIpv4(lease.hostIp)
-    assertIpv4(lease.guestIp)
-    if (lease.prefixLength !== 30) {
-      throw new Error(`lease ${lease.instanceId} must use a /30`)
-    }
-    if (!isValidMacAddress(lease.guestMac)) {
-      throw new Error(`invalid guest MAC in lease ${lease.instanceId}`)
-    }
-    if (typeof lease.egress !== 'boolean') {
-      throw new Error(`invalid egress flag in lease ${lease.instanceId}`)
-    }
+    assertLeaseShape(lease)
     if (this.ports === undefined || !this.portRangeValid) {
       throw new Error('invalid tcpPortRange in network config')
     }
@@ -468,10 +578,17 @@ class NetworkManagerImpl implements NetworkManager {
         `lease ${lease.instanceId} tap ${lease.tapName} does not match its address index ${index}`
       )
     }
-    this.ipam.adopt(index)
+    // Validate every conflict BEFORE mutating the allocators.
+    if (this.ipam.isAllocated(index)) {
+      throw new Error(
+        `/30 index ${index} of lease ${lease.instanceId} is already allocated`
+      )
+    }
     for (const port of Object.values(lease.publicPorts)) {
       assertPort(port)
-      this.ports.adopt(port)
+      if (this.ports.isAllocated(port)) {
+        throw new Error(`public port ${port} is allocated twice`)
+      }
     }
     for (const hostname of Object.values(lease.publicHostnames)) {
       assertHostname(hostname)
@@ -479,11 +596,24 @@ class NetworkManagerImpl implements NetworkManager {
     if (this.usedMacs.has(lease.guestMac)) {
       throw new Error(`duplicate guest MAC in lease ${lease.instanceId}`)
     }
+    for (const other of this.states.values()) {
+      const assigned = new Set(Object.values(other.lease.publicHostnames))
+      for (const hostname of Object.values(lease.publicHostnames)) {
+        if (assigned.has(hostname)) {
+          throw new Error(
+            `public hostname ${hostname} is assigned to both ${other.lease.instanceId} and ${lease.instanceId}`
+          )
+        }
+      }
+    }
+    this.ipam.adopt(index)
+    for (const port of Object.values(lease.publicPorts)) {
+      this.ports.adopt(port)
+    }
     this.usedMacs.add(lease.guestMac)
     const state: LeaseState = {
       lease: cloneLease(lease),
       index,
-      expose: [],
       routed: false,
     }
     this.states.set(lease.instanceId, state)
@@ -506,29 +636,55 @@ class NetworkManagerImpl implements NetworkManager {
     }
   }
 
-  async restore(leases: NetLease[]): Promise<{ removedOrphans: string[] }> {
+  async restore(leases: NetLease[]): Promise<{
+    removedOrphans: string[]
+    keptOrphans: string[]
+    skippedLeases: string[]
+  }> {
     return this.mutex.run(async () => {
+      const skippedLeases: string[] = []
+      const keptOrphans: string[] = []
+      const errors: unknown[] = []
+      const range = this.config.tcpPortRange
+
+      // Phase 1: validate shapes and range constraints without mutating the
+      // allocators, so one bad lease cannot corrupt a restore.
+      const staged: { lease: NetLease; index: number }[] = []
+      for (const candidate of leases) {
+        try {
+          assertLeaseShape(candidate)
+          const index = this.poolIndexFor(candidate)
+          if (candidate.tapName !== tapNameForIndex(index)) {
+            throw new Error(
+              `lease ${candidate.instanceId} tap does not match its address index`
+            )
+          }
+          for (const port of Object.values(candidate.publicPorts)) {
+            if (!isValidPort(port) || port < range.from || port > range.to) {
+              throw new Error(
+                `lease ${candidate.instanceId} has public port ${port} outside tcpPortRange`
+              )
+            }
+          }
+          staged.push({ lease: cloneLease(candidate), index })
+        } catch (error) {
+          skippedLeases.push(candidate?.instanceId ?? 'unknown')
+          this.logger?.warn(
+            { err: error, instanceId: candidate?.instanceId },
+            'skipping invalid/incomplete lease on restore'
+          )
+        }
+      }
+
+      // Structural duplicates stay hard errors: they mean two live VMs claim
+      // the same host resources.
       const ids = new Set<string>()
       const taps = new Set<string>()
       const guests = new Set<string>()
-      const publicPorts = new Set<number>()
       const macs = new Set<string>()
-      const staged: { lease: NetLease; index: number }[] = []
-      const range = this.config.tcpPortRange
-      for (const lease of leases) {
-        assertInstanceId(lease.instanceId)
-        assertTapName(lease.tapName)
-        assertIpv4(lease.hostIp)
-        assertIpv4(lease.guestIp)
-        if (lease.prefixLength !== 30) {
-          throw new Error(`lease ${lease.instanceId} must use a /30`)
-        }
-        if (!isValidMacAddress(lease.guestMac)) {
-          throw new Error(`invalid guest MAC in lease ${lease.instanceId}`)
-        }
-        if (typeof lease.egress !== 'boolean') {
-          throw new Error(`invalid egress flag in lease ${lease.instanceId}`)
-        }
+      const ports = new Set<number>()
+      const hostnames = new Map<string, string>()
+      for (const { lease } of staged) {
         if (ids.has(lease.instanceId)) {
           throw new Error(`duplicate lease instanceId: ${lease.instanceId}`)
         }
@@ -545,36 +701,42 @@ class NetworkManagerImpl implements NetworkManager {
           throw new Error(`duplicate lease guest MAC: ${lease.guestMac}`)
         }
         macs.add(lease.guestMac)
-        const index = this.poolIndexFor(lease)
-        if (lease.tapName !== tapNameForIndex(index)) {
-          throw new Error(
-            `lease ${lease.instanceId} tap does not match its address index`
-          )
-        }
         for (const port of Object.values(lease.publicPorts)) {
-          if (!isValidPort(port) || port < range.from || port > range.to) {
-            throw new Error(
-              `lease ${lease.instanceId} has public port ${port} outside tcpPortRange`
-            )
-          }
-          if (publicPorts.has(port)) {
+          if (ports.has(port)) {
             throw new Error(`public port ${port} is allocated twice`)
           }
-          publicPorts.add(port)
+          ports.add(port)
         }
         for (const hostname of Object.values(lease.publicHostnames)) {
-          assertHostname(hostname)
+          const owner = hostnames.get(hostname)
+          if (owner !== undefined && owner !== lease.instanceId) {
+            throw new Error(
+              `public hostname ${hostname} is assigned to both ${owner} and ${lease.instanceId}`
+            )
+          }
+          hostnames.set(hostname, lease.instanceId)
         }
-        staged.push({ lease: cloneLease(lease), index })
+        for (const hostname of Object.values(lease.publicHostnames)) {
+          if (await this.traefik.containsHostname(hostname, lease.instanceId)) {
+            throw new Error(
+              `public hostname ${hostname} of ${lease.instanceId} is also used by another Traefik file`
+            )
+          }
+        }
       }
 
-      // Authoritative replacement: the caller owns the live set.
+      // Phase 2: authoritative replacement of the in-memory allocators.
       this.states.clear()
       this.usedMacs.clear()
-      this.ipam = new Ipv4Pool(this.pool)
+      this.releasing.clear()
+      this.ipam = new Ipv4Pool(this.pool, this.allocatorOptions())
       let nextPorts: PortAllocator | undefined
       try {
-        nextPorts = new PortAllocator(range.from, range.to)
+        nextPorts = new PortAllocator(
+          range.from,
+          range.to,
+          this.allocatorOptions()
+        )
       } catch {
         nextPorts = undefined
       }
@@ -587,24 +749,19 @@ class NetworkManagerImpl implements NetworkManager {
           `invalid tcpPortRange ${range.from}-${range.to} blocks restoring DNAT leases`
         )
       }
-      const records = new Map<string, Awaited<ReturnType<RouteStore['read']>>>()
       for (const { lease, index } of staged) {
         this.ipam.adopt(index)
         for (const port of Object.values(lease.publicPorts)) {
           this.ports?.adopt(port)
         }
         this.usedMacs.add(lease.guestMac)
-        const record = await this.routeStore.read(lease.instanceId)
-        records.set(lease.instanceId, record)
         this.states.set(lease.instanceId, {
           lease,
           index,
-          expose: record?.expose ?? [],
           routed: true,
         })
       }
 
-      const errors: unknown[] = []
       for (const state of this.states.values()) {
         try {
           await this.taps.ensure(state.lease)
@@ -619,13 +776,9 @@ class NetworkManagerImpl implements NetworkManager {
 
       await this.renderAndApply()
 
+      // Every route (kind, entrypoint, guest port) is rebuilt from the lease;
+      // existing Traefik files are always rewritten, never trusted blindly.
       for (const state of this.states.values()) {
-        const record = records.get(state.lease.instanceId)
-        if (record === undefined) {
-          // No guest-port sidecar (crash before it was written): leave the
-          // existing Traefik file alone rather than deleting a working route.
-          continue
-        }
         await this.traefik.write(
           state.lease.instanceId,
           this.traefikRoutes(state)
@@ -634,31 +787,100 @@ class NetworkManagerImpl implements NetworkManager {
 
       const removed: string[] = []
       removed.push(...(await this.traefik.removeOrphans(ids)))
-      removed.push(...(await this.routeStore.removeOrphans(ids)))
 
-      try {
-        const links = await this.taps.listAgentLinks()
-        const knownTaps = new Set(
-          [...this.states.values()].map(state => state.lease.tapName)
-        )
-        for (const link of links) {
-          if (!knownTaps.has(link)) {
-            await this.taps.remove(link)
-            removed.push(`tap:${link}`)
-          }
-        }
-      } catch (error) {
+      await this.removeStrayTaps({
+        removed,
+        keptOrphans,
+        errors,
+      })
+
+      if (skippedLeases.length > 0) {
         this.logger?.warn(
-          { err: error },
-          'could not list taps for orphan cleanup'
+          { skippedLeases },
+          'restored without invalid/incomplete leases'
         )
       }
-
       if (errors.length > 0) {
         throw errors[0]
       }
-      return { removedOrphans: removed.sort() }
+      return {
+        removedOrphans: removed.sort(),
+        keptOrphans,
+        skippedLeases: skippedLeases.sort(),
+      }
     })
+  }
+
+  /**
+   * Orphan tap cleanup with ownership evidence.
+   *
+   * A stray `fctapN` is only OURS when either
+   *   - it is down and has no IPv4 address (an interrupted create), or
+   *   - every IPv4 address on it is exactly the host side of the /30 that
+   *     belongs to its own index inside `subnetPool`.
+   * Anything else (a foreign address, or up without an address) is reported as
+   * kept and left untouched: the name prefix alone is not proof of ownership.
+   * (`ip -d link show` does not expose the tun owner uid reliably, so the
+   * address/state pair is the evidence used here.)
+   */
+  private async removeStrayTaps(result: {
+    removed: string[]
+    keptOrphans: string[]
+    errors: unknown[]
+  }): Promise<void> {
+    const links = await this.taps.listAgentLinks()
+    const knownTaps = new Set(
+      [...this.states.values()].map(state => state.lease.tapName)
+    )
+    for (const link of links) {
+      if (knownTaps.has(link)) {
+        continue
+      }
+      let info: TapInspection
+      try {
+        info = await this.taps.inspect(link)
+      } catch (error) {
+        result.errors.push(error)
+        result.keptOrphans.push(`tap:${link}`)
+        continue
+      }
+      if (!info.exists) {
+        continue
+      }
+      const index = tapIndexFromName(link)
+      if (index === undefined || !this.isOwnedStrayTap(index, info)) {
+        this.logger?.warn(
+          { tap: link, addresses: info.addresses, up: info.up },
+          'leaving a non-agent fctap interface alone (ownership evidence mismatch)'
+        )
+        result.keptOrphans.push(`tap:${link}`)
+        continue
+      }
+      try {
+        const { guestIp } = this.ipam.addresses(index)
+        await this.flushConntrackFor(guestIp, [])
+        await this.taps.remove(link)
+        result.removed.push(`tap:${link}`)
+        // An unknown-lease resource begins its reuse quarantine now.
+        this.ipam.quarantine(index)
+      } catch (error) {
+        result.errors.push(error)
+      }
+    }
+  }
+
+  private isOwnedStrayTap(index: number, info: TapInspection): boolean {
+    let expected: string
+    try {
+      const { hostIp } = this.ipam.addresses(index)
+      expected = `${hostIp}/30`
+    } catch {
+      return false
+    }
+    if (info.addresses.length === 0) {
+      return !info.up
+    }
+    return info.addresses.every(address => address === expected)
   }
 
   private poolIndexFor(lease: NetLease): number {
@@ -687,6 +909,7 @@ class NetworkManagerImpl implements NetworkManager {
       const result = await this.runner.run(['ip', '-V'], { timeoutMs: 5_000 })
       return result.code === 0
     })
+    await check('conntrackBin', () => conntrackAvailable(this.runner))
     await check('ipForward', async () => {
       const text = await readFile('/proc/sys/net/ipv4/ip_forward', 'utf8')
       return text.trim() === '1'
@@ -694,7 +917,6 @@ class NetworkManagerImpl implements NetworkManager {
     await check('traefikDirWritable', () =>
       isDirWritable(this.config.traefikDynamicDir)
     )
-    await check('routesDirWritable', () => isDirWritable(this.config.routesDir))
     checks.tcpPortRange = this.portRangeValid
     checks.subnetPool = this.pool.capacity > 0
     return checks
@@ -703,15 +925,21 @@ class NetworkManagerImpl implements NetworkManager {
   // Pure: no host commands, deterministic in `expose` order.
   endpoints(lease: NetLease, expose: NetExposeRequest[]): PublicEndpoint[] {
     const exposeReq = validateExpose(expose)
+    const derived = deriveLeaseRoutes(lease)
+    const tcp = new Map(derived.tcp.map(route => [route.index, route]))
     return exposeReq.map((entry, index) => {
+      const route = tcp.get(index)
       if (isTcpKind(entry.kind)) {
-        const port = lease.publicPorts[index]
-        if (port === undefined) {
+        if (route === undefined) {
           throw new Error(
             `lease ${lease.instanceId} has no public port for expose[${index}]`
           )
         }
-        return { kind: entry.kind, host: this.config.publicHost, port }
+        return {
+          kind: entry.kind,
+          host: this.config.publicHost,
+          port: route.publicPort,
+        }
       }
       const host = lease.publicHostnames[index]
       if (host === undefined) {
@@ -733,6 +961,11 @@ class NetworkManagerImpl implements NetworkManager {
 
 export const createNetworkManager = (
   config: NetworkConfig,
-  deps?: { runner?: CommandRunner; logger?: Logger }
+  deps?: { runner?: CommandRunner; logger?: Logger; clock?: Clock }
 ): NetworkManager =>
-  new NetworkManagerImpl(config, deps?.runner ?? bunCommandRunner, deps?.logger)
+  new NetworkManagerImpl(
+    config,
+    deps?.runner ?? bunCommandRunner,
+    deps?.logger,
+    deps?.clock
+  )

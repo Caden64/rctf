@@ -8,6 +8,7 @@ import {
   traefikFileName,
   type TraefikRoute,
 } from '../../src/agent/routing/traefik'
+import { MAX_HOST_PREFIX_LENGTH } from '../../src/agent/net/lease'
 import { instanceId, makeTempConfig } from './support'
 
 const config = await makeTempConfig({
@@ -46,8 +47,19 @@ const routes: TraefikRoute[] = [
 ]
 
 describe('publicHostname', () => {
-  test('is <hostPrefix>-<first 10 of instanceId>.<httpDomain>', () => {
-    expect(hostname).toBe(`baby-rev-${id.slice(0, 10)}.fc7.ctf.example.com`)
+  test('is <hostPrefix>-<first 20 of instanceId>.<httpDomain>', () => {
+    expect(hostname).toBe(`baby-rev-${id.slice(0, 20)}.fc7.ctf.example.com`)
+  })
+
+  test('two ids sharing only 10 characters get distinct hostnames', () => {
+    const a = `${'a'.repeat(10)}bbbbbb`
+    const b = `${'a'.repeat(10)}cccccc`
+    expect(publicHostname(config, a, 'web')).not.toBe(
+      publicHostname(config, b, 'web')
+    )
+    expect(publicHostname(config, a, 'web')).toBe(
+      `web-${'a'.repeat(10)}bbbbbb.fc7.ctf.example.com`
+    )
   })
 
   test('rejects every character that could break a Traefik rule', () => {
@@ -64,10 +76,23 @@ describe('publicHostname', () => {
     ]) {
       expect(() => publicHostname(config, id, prefix)).toThrow('invalid')
     }
+    expect(() =>
+      publicHostname(config, id, 'x'.repeat(MAX_HOST_PREFIX_LENGTH + 1))
+    ).toThrow('invalid')
     expect(() => publicHostname(config, 'not-an-id', 'ok')).toThrow()
     expect(() =>
       publicHostname({ httpDomain: 'evil`domain.example' }, id, 'ok')
     ).toThrow('invalid')
+  })
+
+  test('the longest accepted prefix stays inside a 63 byte DNS label', () => {
+    const hostname = publicHostname(
+      config,
+      'a'.repeat(32),
+      'x'.repeat(MAX_HOST_PREFIX_LENGTH)
+    )
+    const label = hostname.split('.')[0] as string
+    expect(label.length).toBeLessThanOrEqual(63)
   })
 })
 
@@ -204,5 +229,25 @@ describe('TraefikFileManager', () => {
     expect(entries.sort()).toEqual(
       [traefikFileName(known), 'unrelated.yml'].sort()
     )
+  })
+
+  test('detects a hostname already routed by another instance file', async () => {
+    const localConfig = await makeTempConfig()
+    const manager = new TraefikFileManager(localConfig)
+    const other = instanceId(9)
+    const claimed = publicHostname(localConfig, other, 'web')
+    await manager.write(other, [
+      {
+        index: 0,
+        kind: 'http',
+        hostname: claimed,
+        guestIp: '10.200.0.2',
+        guestPort: 80,
+      },
+    ])
+    expect(await manager.containsHostname(claimed)).toBe(true)
+    // The file's own instance does not conflict with itself.
+    expect(await manager.containsHostname(claimed, other)).toBe(false)
+    expect(await manager.containsHostname('free.example.com')).toBe(false)
   })
 })

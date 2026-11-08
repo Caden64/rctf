@@ -84,6 +84,70 @@ describe('subnet pool', () => {
   })
 })
 
+describe('reuse quarantine', () => {
+  const clock = (start = 1_000_000) => {
+    let now = start
+    return {
+      now: () => now,
+      advance: (ms: number) => {
+        now += ms
+      },
+    }
+  }
+
+  test('/30 indexes stay out of circulation until the quarantine elapses', () => {
+    const time = clock()
+    const pool = new Ipv4Pool(parseSubnetPool('10.200.0.0/16'), {
+      quarantineMs: 120_000,
+      now: time.now,
+    })
+    expect(pool.reserve()).toBe(0)
+    expect(pool.reserve()).toBe(1)
+    pool.release(0)
+    // never-used index preferred while the release is quarantined
+    expect(pool.reserve()).toBe(2)
+    time.advance(119_000)
+    // a never-used index still wins over a still-quarantined release
+    expect(pool.reserve()).toBe(3)
+    time.advance(2_000)
+    // the oldest release is reused once the quarantine elapsed
+    expect(pool.reserve()).toBe(0)
+  })
+
+  test('blocked indexes are skipped and never handed out', () => {
+    const pool = new Ipv4Pool(parseSubnetPool('10.200.0.0/16'))
+    pool.block(0)
+    expect(pool.reserve()).toBe(1)
+    pool.block(2)
+    expect(pool.reserve()).toBe(3)
+  })
+
+  test('quarantine() starts the clock for a stray restore-time resource', () => {
+    const time = clock()
+    const pool = new Ipv4Pool(parseSubnetPool('10.200.0.0/16'), {
+      quarantineMs: 120_000,
+      now: time.now,
+    })
+    pool.quarantine(0)
+    expect(pool.reserve()).toBe(1)
+    time.advance(121_000)
+    expect(pool.reserve()).toBe(0)
+  })
+
+  test('public ports stay out of circulation until the quarantine elapses', () => {
+    const time = clock()
+    const ports = new PortAllocator(20000, 20002, {
+      quarantineMs: 120_000,
+      now: time.now,
+    })
+    expect(ports.reserve(1)).toEqual([20000])
+    ports.release([20000])
+    expect(ports.reserve(1)).toEqual([20001])
+    time.advance(121_000)
+    expect(ports.reserve(1)).toEqual([20000])
+  })
+})
+
 describe('port allocator', () => {
   test('reserves lowest free ports and reuses released ones', () => {
     const ports = new PortAllocator(20000, 20002)
