@@ -43,6 +43,24 @@ run_phase() {
   [ $rc -eq 0 ] || phase_rc=1
 }
 
+# Mutation proofs for the hardened assertions: the same checks the phases use
+# are run against deliberately broken conditions and must FAIL. This is a
+# separate, short netns so it cannot disturb a phase.
+run_selftest() {
+  local out=$RUN/logs/selftest.log
+  say ""
+  say "=== selftest: mutation proofs for conntrack flush / probe / closed-port assertions ==="
+  timeout 120 unshare -n bash "$EDGE/selftest.sh" >"$out" 2>&1
+  local rc=$?
+  cat "$out" >>"$SUMMARY"
+  sed -n 's/^SELFTEST /  /p' "$out"
+  local p f
+  p=$(grep -c '^SELFTEST .* PASS' "$out" 2>/dev/null || true); p=${p:-0}
+  f=$(grep -c '^SELFTEST .* FAIL' "$out" 2>/dev/null || true); f=${f:-0}
+  say "--- selftest exit=$rc ($p pass, $f fail)"
+  [ $rc -eq 0 ] || phase_rc=1
+}
+
 # ---------------------------------------------------------------------------
 # Guest image: the smoke rootfs plus our own /app/start (identity HTTP server,
 # raw TCP hold listener, egress/peer probe loop). Artifacts stay read-only.
@@ -68,12 +86,18 @@ build_guest_image() {
 
 build_guest_image
 
+run_selftest
 run_phase agent     "$EDGE/lib/phase-agent.sh"     480
 run_phase veth      "$EDGE/lib/phase-veth.sh"      240
 run_phase lifecycle "$EDGE/lib/phase-lifecycle.sh" 240
 
 passes=$(grep -c '^CHECK .* PASS' "$SUMMARY" || true)
 failures=$(grep -c '^CHECK .* FAIL' "$SUMMARY" || true)
+st_passes=$(grep -c '^SELFTEST .* PASS' "$SUMMARY" || true)
+st_failures=$(grep -c '^SELFTEST .* FAIL' "$SUMMARY" || true)
+passes=${passes:-0}; failures=${failures:-0}
+st_passes=${st_passes:-0}; st_failures=${st_failures:-0}
 say ""
 say "RESULT: ${passes} passed, ${failures} failed"
-[ $failures -eq 0 ] && [ $phase_rc -eq 0 ]
+say "SELFTEST RESULT: ${st_passes} passed, ${st_failures} failed"
+[ "$failures" -eq 0 ] && [ "$st_failures" -eq 0 ] && [ "$phase_rc" -eq 0 ]

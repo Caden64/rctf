@@ -5,6 +5,7 @@
 # externalInterface. Covers checks 1-5 and 7.
 set -u
 : "${RUN:?}" "${EDGE:?}" "${REPO:?}" "${ARTIFACTS:?}" "${TRAEFIK:?}"
+. "$EDGE/lib/assert.sh"
 PIDS=()
 AGENT_PID=
 TRAEFIK_PID=
@@ -333,16 +334,48 @@ else
   fail 3.4 "DNAT mapping is not per-lease: $(echo "$DNAT_RULES" | tr '\n' ' ')"
 fi
 CLOSED=24099
-nsenter -t "$OUT_PID" -n nc -z -w 2 203.0.113.1 "$CLOSED" >/dev/null 2>&1 && CLOSED_RC=0 || CLOSED_RC=1
-if [ "$CLOSED_RC" = 1 ]; then
-  pass 3.5 "an unpublished port ($CLOSED) on the host is closed, not forwarded"
+# Positive control: the published port must connect from the SAME netns/tool
+# immediately before the unpublished port is asserted closed. A dead nc (or a
+# wrong netns) would otherwise make any port look "closed".
+PORT_CTL=$(nsenter -t "$OUT_PID" -n bash -c \
+  '. "$1/lib/assert.sh"; if assert_port_closed "$2" "$3" "$4"; then echo ok; else echo fail; fi' \
+  _ "$EDGE" 203.0.113.1 "$A_PUB" "$CLOSED")
+if [ "$PORT_CTL" = ok ]; then
+  pass 3.5 "unpublished port ($CLOSED) is closed while the published port ($A_PUB) connects from the same netns"
 else
-  fail 3.5 "unpublished port $CLOSED accepted a connection"
+  fail 3.5 "port probe invalid: published $A_PUB did not connect or unpublished $CLOSED did (positive control required)"
 fi
-if nsenter -t "$OUT_PID" -n curl -sS -m 3 "http://$A_GUEST:8080/id.txt" >/dev/null 2>&1; then
-  fail 3.6 "outside client reached the guest address $A_GUEST directly, bypassing DNAT"
+
+note "-- 3.6/3.7 direct guest reachability and its positive control"
+direct_guest() {
+  nsenter -t "$OUT_PID" -n curl -sS -m 3 "http://$A_GUEST:8080/id.txt" 2>/dev/null || true
+}
+DIRECT=$(direct_guest)
+if [ -n "$DIRECT" ]; then
+  fail 3.6 "outside client reached the guest address $A_GUEST directly, bypassing DNAT (body '$DIRECT')"
 else
   pass 3.6 "outside client cannot reach guest address $A_GUEST directly (no bypass)"
+fi
+# Positive control: prepend accepts for both directions of the direct flow, so
+# the identical probe succeeds only because it was allowed; remove them again
+# and assert the absence returns. (This proves the probe is sensitive instead
+# of a dead curl.)
+nft insert rule inet rctf_fc forward ip saddr "$A_GUEST" tcp sport 8080 accept
+nft insert rule inet rctf_fc forward ip daddr "$A_GUEST" tcp dport 8080 accept
+DIRECT_CTL=$(direct_guest)
+del_forward_rule() {
+  local spec=$1 h
+  h=$(nft -a list chain inet rctf_fc forward | grep -F "$spec" |
+    sed -n 's/.*# handle \([0-9]*\).*/\1/p' | tail -1)
+  [ -n "$h" ] && nft delete rule inet rctf_fc forward handle "$h"
+}
+del_forward_rule "ip saddr $A_GUEST tcp sport 8080 accept"
+del_forward_rule "ip daddr $A_GUEST tcp dport 8080 accept"
+DIRECT_AFTER=$(direct_guest)
+if [ "$DIRECT_CTL" = team-a ] && [ -z "$DIRECT_AFTER" ]; then
+  pass 3.7 "control: the same direct probe reaches the guest when temporarily allowed, and is blocked again after removing the rules"
+else
+  fail 3.7 "direct-probe positive control failed (allowed='$DIRECT_CTL' after-removal='$DIRECT_AFTER')"
 fi
 
 # ===========================================================================
@@ -357,32 +390,102 @@ PB=
 for i in $(seq 1 40); do
   PA=$(probe "$A_HOSTNAME")
   PB=$(probe "$B_HOSTNAME")
-  case "$PA" in *peer=blocked*host=blocked*) a_ready=1;; *) a_ready=0;; esac
-  case "$PB" in *peer=REACHED*host=blocked*) b_ready=1;; *) b_ready=0;; esac
-  [ "$a_ready" = 1 ] && [ "$b_ready" = 1 ] && break
+  if probe_peer_is "$PA" blocked && probe_host_is "$PA" blocked &&
+     probe_peer_is "$PB" REACHED && probe_host_is "$PB" blocked; then
+    break
+  fi
   sleep 1
 done
-note "A probe: $PA"
-note "B probe: $PB"
-case "$PA" in *peer=blocked*) pass 4.1 "egress:false guest cannot reach the upstream server ($PA)";; *) fail 4.1 "egress:false guest reached upstream ($PA)";; esac
-case "$PB" in *peer=REACHED*) pass 4.2 "egress:true guest reaches the upstream server ($PB)";; *) fail 4.2 "egress:true guest did NOT reach upstream ($PB)";; esac
-case "$PB" in *host=blocked*) pass 4.3 "egress:true guest cannot reach the host side of its own tap ($PB)";; *) fail 4.3 "egress:true guest reached the host side of its tap ($PB)";; esac
-if [ "$(echo "$PB" | sed -n 's/.*scan=\([a-z]*\).*/\1/p')" = blocked ] &&
-   [ "$(echo "$PA" | sed -n 's/.*scan=\([a-z]*\).*/\1/p')" = blocked ]; then
-  pass 4.4 "neither guest can reach the other guest's address (A and B scan=blocked)"
+note "A probe: ${PA:-<empty>}"
+note "B probe: ${PB:-<empty>}"
+if probe_peer_is "$PA" blocked; then
+  pass 4.1 "egress:false guest cannot reach the upstream server ($PA)"
 else
-  fail 4.4 "cross-guest scan was not blocked (A='$PA' B='$PB')"
+  fail 4.1 "egress:false guest did not report a valid peer=blocked probe (empty/unparseable fails closed): '${PA:-<empty>}'"
 fi
+if probe_peer_is "$PB" REACHED; then
+  pass 4.2 "egress:true guest reaches the upstream server ($PB)"
+else
+  fail 4.2 "egress:true guest did NOT report a valid peer=REACHED probe: '${PB:-<empty>}'"
+fi
+if probe_host_is "$PB" blocked; then
+  pass 4.3 "egress:true guest cannot reach the host side of its own tap ($PB)"
+else
+  fail 4.3 "egress:true guest did not report a valid host=blocked probe: '${PB:-<empty>}'"
+fi
+if probe_scan_blocked "$PA" && probe_scan_blocked "$PB"; then
+  pass 4.4 "neither guest can reach the other guest's address (A and B report a valid scan=blocked)"
+else
+  fail 4.4 "cross-guest scan was not a valid blocked result (A='${PA:-<empty>}' B='${PB:-<empty>}'); empty/unparseable/error fails closed"
+fi
+
+# ---------------------------------------------------------------------------
+# 4.5/4.6 controls: while BOTH real guests are still alive, flush the agent
+# rules and require (a) the egress-true guest to reach the host side of its tap
+# and (b) at least one cross-guest scan to become REACHED. Without (b), a guest
+# whose nc probe is broken would report scan=blocked and 4.4/7.2 would pass for
+# the wrong reason. The exact pre-flush ruleset is snapshotted and restored.
+# ---------------------------------------------------------------------------
+note "-- 4.5/4.6 control: flush all agent rules while both guests are alive, then restore them"
+RULESET_SNAPSHOT=$RUN/out/ruleset-before-4.5.nft
+nft list ruleset >"$RULESET_SNAPSHOT"
+nft flush table inet rctf_fc
+nft flush table arp rctf_fc_arp
+PA2=
+PB2=
+for i in $(seq 1 30); do
+  PA2=$(probe "$A_HOSTNAME")
+  PB2=$(probe "$B_HOSTNAME")
+  if probe_host_is "$PB2" REACHED &&
+     { probe_scan_reached "$PA2" || probe_scan_reached "$PB2"; }; then
+    break
+  fi
+  sleep 1
+done
+note "A probe after flush: ${PA2:-<empty>}"
+note "B probe after flush: ${PB2:-<empty>}"
+if probe_host_is "$PB2" REACHED; then
+  pass 4.5 "control: with the rules flushed the same guest probe reaches the host tap side ($PB2)"
+else
+  fail 4.5 "control failed: probe did not report a valid host=REACHED with rules flushed ('${PB2:-<empty>}')"
+fi
+if probe_scan_reached "$PA2" || probe_scan_reached "$PB2"; then
+  pass 4.6 "control: after the flush the cross-guest scan probe is live (scan=REACHED), so blocked scans are not dead-probe results"
+else
+  fail 4.6 "control failed: no guest reported a valid scan=REACHED after the flush (A='${PA2:-<empty>}' B='${PB2:-<empty>}')"
+fi
+# Restore the exact pre-flush ruleset: the table objects still exist but are
+# empty after `flush table`, so delete them first and re-apply the snapshot.
+nft delete table inet rctf_fc 2>/dev/null || true
+nft delete table arp rctf_fc_arp 2>/dev/null || true
+if ! nft -f "$RULESET_SNAPSHOT"; then
+  fail 4.6 "control cleanup failed: could not restore the agent ruleset from $RULESET_SNAPSHOT"
+  exit 1
+fi
+note "agent ruleset restored after the 4.5/4.6 control"
 
 # ===========================================================================
 # 7. nmap from the outside netns against the host address
 # ===========================================================================
 note "-- 7.1 nmap from outside against 203.0.113.1 (all 65535 ports)"
-NMAP=$(nsenter -t "$OUT_PID" -n timeout 180 nmap -sT -Pn -n -T4 -p- 203.0.113.1 -oG - 2>/dev/null || true)
+NMAP_XML=$RUN/out/nmap.xml
+NMAP_RC=0
+NMAP=$(nsenter -t "$OUT_PID" -n timeout 180 nmap -sT -Pn -n -T4 -p- 203.0.113.1 \
+  -oG - -oX "$NMAP_XML" 2>/dev/null) || NMAP_RC=$?
 OPEN=$(echo "$NMAP" | grep -oE '[0-9]+/open/tcp' | sed 's#/open/tcp##' | sort -n | tr '\n' ' ' | sed 's/ $//')
 EXPECT=$(printf '%s\n' 8088 "$A_PUB" "$A_HOLD" "$B_PUB" "$B_HOLD" | sort -n | tr '\n' ' ' | sed 's/ $//')
-if [ "$OPEN" = "$EXPECT" ]; then
-  pass 7.1 "only published ports are open on the host: $OPEN"
+SCANINFO=$(grep -o '<scaninfo[^>]*>' "$NMAP_XML" 2>/dev/null | head -1)
+FULLSCAN=0
+if echo "$SCANINFO" | grep -q 'numservices="65535"' &&
+   echo "$SCANINFO" | grep -q 'services="1-65535"'; then
+  FULLSCAN=1
+fi
+if [ "$NMAP_RC" -ne 0 ]; then
+  fail 7.1 "nmap exited $NMAP_RC (124 = timeout/partial scan); open ports '$OPEN' cannot be trusted"
+elif [ "$FULLSCAN" -ne 1 ]; then
+  fail 7.1 "nmap did not prove a full 65535-port scan (scaninfo='${SCANINFO:-<missing>}')"
+elif [ "$OPEN" = "$EXPECT" ]; then
+  pass 7.1 "only published ports are open on the host: $OPEN (nmap exit 0, 65535/65535 ports scanned)"
 else
   fail 7.1 "nmap open ports '$OPEN' != expected published '$EXPECT'"
 fi
@@ -502,42 +605,26 @@ else
   fail 5.6 "quarantine violated: C state=$st tap=$C_TAP guest=$C_GUEST port=$C_PUB"
 fi
 CT=$(conntrack -L 2>/dev/null || true)
-# The old DNAT tuple used client port 55555 to the released port. It must not
-# exist any more; C's own readiness probe is a new flow and is expected.
+# C holds a DIFFERENT /30 (5.6), so this is not a reuse assertion. It only
+# proves the released flow tuple is gone. The real reuse-without-inheritance
+# path (same /30 + public port handed to a new guest, quarantine 0) is executed
+# in phase-veth 5.9-5.12; the 120 s quarantine here deliberately prevents it.
 if echo "$CT" | grep -q "sport=55555"; then
-  fail 5.7 "the reused /30 still carries the old flow: $(echo "$CT" | grep "sport=55555" | head -2)"
+  fail 5.7 "the old released flow tuple (client port 55555) still exists: $(echo "$CT" | grep "sport=55555" | head -2)"
 else
-  pass 5.7 "the reused /30 carries no inherited flow (the released flow tuple is gone)"
+  pass 5.7 "old released flow tuple (client port 55555) is gone after release; C holds a different /30, so real reuse is phase-veth 5.9-5.12"
 fi
 api -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:7001/v1/instances/$IDC" >/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 4.5 control: flush the rules; the egress-true guest must now reach the host
-# side of its own tap, proving the probe is sensitive (not a false negative).
-# ---------------------------------------------------------------------------
-note "-- 4.5 control: flush all agent rules; egress-true guest must now reach the host tap side"
-nft flush table inet rctf_fc
-nft flush table arp rctf_fc_arp
-PB2=
-for i in $(seq 1 30); do
-  PB2=$(out_curl -H "Host: $B_HOSTNAME" "http://203.0.113.1:8088/probe.txt" 2>/dev/null || true)
-  case "$PB2" in *host=REACHED*) break;; esac
-  sleep 1
-done
-note "B probe after flush: $PB2"
-case "$PB2" in
-  *host=REACHED*) pass 4.5 "control: with the rules flushed the same guest probe reaches the host tap side ($PB2)" ;;
-  *) fail 4.5 "control failed: probe still blocked with rules flushed ($PB2)" ;;
-esac
-
-# ---------------------------------------------------------------------------
-# 7.2 real guests: bushybox nc scan from guest A to guest B (already collected
+# 7.2 real guests: busybox nc scan from guest A to guest B (already collected
 # by the probe loop above; A's SCAN_PEER is B's address).
 # ---------------------------------------------------------------------------
-case "$PA" in
-  *scan=blocked*) pass 7.2 "busybox nc connect from inside real guest A to guest B's address was blocked ($PA)" ;;
-  *) fail 7.2 "real guest A reached guest B's address ($PA)" ;;
-esac
+if probe_scan_blocked "$PA"; then
+  pass 7.2 "busybox nc connect from inside real guest A to guest B's address was blocked ($PA; 4.6 shows the probe is live)"
+else
+  fail 7.2 "real guest A did not report a valid scan=blocked result ('${PA:-<empty>}'); empty/error fails closed"
+fi
 
 api -o /dev/null -w '%{http_code}' -X DELETE "http://127.0.0.1:7001/v1/instances/$IDB" >/dev/null || true
 echo "RESULT agent done"

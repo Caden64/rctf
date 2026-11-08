@@ -5,6 +5,7 @@ Usage: hold_client.py ADDR PORT [SOURCE_PORT] [SECONDS]
 Prints "connected", then "closed" if the peer/connection goes away, or
 "failed: ..."; exits 0 when it connected at least once.
 """
+import os
 import socket
 import sys
 import time
@@ -38,10 +39,16 @@ while True:
         time.sleep(0.2)
 print("connected", flush=True)
 deadline = time.time() + seconds
+quiet = os.environ.get("HOLD_QUIET", "0") == "1"
 try:
     s.settimeout(0.2)
     last_send = 0.0
     while time.time() < deadline:
+        if quiet:
+            # Keep the socket (and therefore its conntrack tuple) open without
+            # sending: no new packet can recreate the entry after a flush.
+            time.sleep(0.2)
+            continue
         now = time.time()
         # Keep the flow alive so the harness can observe release tearing it
         # down (a silent socket would not notice until the hold expires).

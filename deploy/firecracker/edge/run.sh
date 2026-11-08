@@ -20,7 +20,10 @@ fail() { echo "edge-test: $*" >&2; exit 2; }
 [ -x "$ARTIFACTS/firecracker" ] || fail "missing $ARTIFACTS/firecracker (run deploy/firecracker/smoke/fetch-artifacts.sh once)"
 [ -f "$ARTIFACTS/images/smoke/vmlinux" ] || fail "missing $ARTIFACTS/images/smoke/vmlinux"
 [ -f "$ARTIFACTS/images/smoke/rootfs.ext4" ] || fail "missing $ARTIFACTS/images/smoke/rootfs.ext4"
-[ -x "$TRAEFIK" ] || fail "missing Traefik $TRAEFIK (run $HERE/fetch-traefik.sh)"
+# Re-hash the cached Traefik binary against the sha256 pinned in the repo on
+# every run; a modified/corrupted cache is fatal.
+"$HERE/fetch-traefik.sh" --verify >/dev/null 2>&1 ||
+  fail "Traefik $TRAEFIK failed sha256 verification (run $HERE/fetch-traefik.sh)"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm is not accessible"
 command -v bun >/dev/null || fail "bun is required on PATH"
 command -v nft >/dev/null || fail "nft is required"
