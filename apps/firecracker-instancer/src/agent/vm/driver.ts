@@ -1145,16 +1145,15 @@ export const createVmDriver = (
   }
 
   const isAlive = async (handle: VmHandle): Promise<boolean> => {
-    const trust = trustFromHandle(handle)
-    const persisted =
-      trust === undefined && handle !== undefined
-        ? await persistedIdentity(handle.instanceId)
-        : undefined
-    const fallbackTrust: InstanceTrust | undefined =
-      trust ??
-      (persisted === undefined
-        ? undefined
-        : {
+    const fromHandle = trustFromHandle(handle)
+    let trusts: InstanceTrust[] = []
+    if (fromHandle !== undefined) {
+      trusts = [fromHandle]
+    } else {
+      const persisted = await persistedIdentity(handle.instanceId)
+      if (persisted !== undefined) {
+        trusts = [
+          {
             instanceId: handle.instanceId,
             exe: persisted.exe,
             exePath: persisted.exePath,
@@ -1162,21 +1161,39 @@ export const createVmDriver = (
             ...(persisted.jailRoot === undefined
               ? {}
               : { jailRoot: persisted.jailRoot }),
-          })
-    const expectation =
-      fallbackTrust === undefined ? undefined : trustExpectation(fallbackTrust)
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const identity =
-        expectation === undefined
-          ? await inspectProcessLegacy(
-              handle.pid,
-              firecrackerExeNames,
-              handle.instanceId
-            )
-          : await inspectProcess(handle.pid, expectation)
-      if (identity !== undefined) {
-        return identity.startTicks === handle.pidStartTicks
+          },
+        ]
+      } else {
+        // A handle written by an older agent (or one whose optional identity
+        // fields were stripped by the manager's persisted-record schema) still
+        // recovers its trust anchor from the jail copy/marker on disk.
+        trusts = await trustsForInstance(handle.instanceId)
       }
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let sawProcess = false
+      for (const trust of trusts) {
+        const identity = await inspectProcess(
+          handle.pid,
+          trustExpectation(trust)
+        )
+        if (identity === undefined) continue
+        sawProcess = true
+        if (identity.startTicks === handle.pidStartTicks) return true
+      }
+      if (trusts.length === 0) {
+        // Previous-version fallback only when there is no inode anchor at all.
+        const legacy = await inspectProcessLegacy(
+          handle.pid,
+          firecrackerExeNames,
+          handle.instanceId
+        )
+        if (legacy !== undefined) {
+          return legacy.startTicks === handle.pidStartTicks
+        }
+      }
+      if (sawProcess) return false
       if ((await readStartTicks(handle.pid)) === undefined) return false
       // A process that is mid-exec briefly exposes an empty cmdline. Retry a
       // few times before calling it dead.

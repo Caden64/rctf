@@ -678,6 +678,16 @@ describe('configured binary changes after a restart', () => {
         0
       )
       expect(await driverB.isAlive(handle)).toBe(true)
+      const reloaded: VmHandle = {
+        instanceId: id,
+        pid: handle.pid,
+        pidStartTicks: handle.pidStartTicks,
+        apiSocket: handle.apiSocket,
+        dir: handle.dir,
+      }
+      // A manager reload strips unknown handle fields; the sidecar marker is
+      // the fallback trust anchor.
+      expect(await driverB.isAlive(reloaded)).toBe(true)
       const adopted = await driverB.adopt(id)
       expect(adopted?.pid).toBe(handle.pid)
       expect(
@@ -740,6 +750,15 @@ printf '%s\\n' "$!" > "$dir/$b.pid"
       })
       expect(await driverB.listInstanceIds()).toContain(id)
       expect(await driverB.isAlive(handle)).toBe(true)
+      const reloaded: VmHandle = {
+        instanceId: id,
+        pid: handle.pid,
+        pidStartTicks: handle.pidStartTicks,
+        apiSocket: handle.apiSocket,
+        dir: handle.dir,
+      }
+      // No marker and no identity fields: the old jail copy still anchors it.
+      expect(await driverB.isAlive(reloaded)).toBe(true)
       const adopted = await driverB.adopt(id)
       expect(adopted?.pid).toBe(handle.pid)
       expect(adopted?.apiSocket).toBe(path.join(oldJail, 'root', 'api.sock'))
