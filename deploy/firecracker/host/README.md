@@ -357,9 +357,20 @@ unprivileged QEMU):
   namespace, conntrack flushing on release, and reuse quarantine;
 - team isolation measured from inside the guests, with a rules-removed positive control.
 
+**Verified with the real Traefik and the real controller** (unprivileged, `../edge/`, `../e2e/`; Traefik
+v3.7.15 with the repository's file-provider config over plain HTTP): two teams routed by Host header with
+unknown Hosts getting 404, route removal on delete, malformed YAML not breaking other routes, DNAT and egress
+masquerade from an outside namespace, conntrack flushing, anti-spoofing and nmap exposure; and the rCTF
+provider, controller and agent against real microVMs for lifecycle, expiry, restarts, capacity, ambiguous
+creates and orphan cleanup.
+
+**Verified across two hosts** (`../multihost/`, two root QEMU VMs with a controller): scheduling and per-host
+pinning, capacity races, drain, host loss, partition, clock skew and token mismatch.
+
 **Not verified:**
 
-- Traefik actually loading the generated dynamic files and proxying, and TLS;
+- TLS and certificate loading (the harnesses use plain HTTP);
+- physical networks and real multi-host failure modes (the two hosts are QEMU VMs on one machine);
 - your specific distro/systemd/kernel/Firecracker combination (capability and namespace
-  requirements can change between releases) — the vmtest results are for the versions above;
-- more than one host.
+  requirements can change between releases) — the harness results are for the versions recorded in
+  each `RESULTS.md`.

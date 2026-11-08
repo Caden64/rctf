@@ -62,14 +62,13 @@ and is short on purpose: Firecracker rejects unix socket paths longer than 107 b
 
 ## What it does NOT verify
 
-- **Jailer mode.** The jailer needs real root (chroot, mknod, cgroups); this test uses `mode: direct`.
-- **Traefik routing and TLS, `egress: true` masquerade, public DNAT from outside** (only a locally generated
-  connection is possible in the namespace), **conntrack flushing** (conntrack-tools is not required here),
-  and **systemd hardening**.
-- The controller, scheduler, multi-host behaviour and the rCTF provider. Those are covered by the unit and
-  end-to-end tests in `tests/server/tests/unit/firecracker-*.test.ts` with fake agents, not by this script.
-- Behaviour on other kernels, guests, or Firecracker versions than the pinned ones (Firecracker
-  v1.17.0, kernel 6.1.155 from the Firecracker CI bucket, busybox 1.35.0, jq 1.8.2).
+This script alone does not cover jailer mode, Traefik, NAT, conntrack, systemd, the controller or multiple
+hosts. Those are covered by the sibling harnesses: `../e2e/` (provider, controller and real agent),
+`../edge/` (Traefik, NAT, conntrack, anti-spoof, nmap), `../vmtest/` (root VM: jailer, systemd, host setup)
+and `../multihost/` (two root VMs and a controller); see their READMEs and `RESULTS.md`. Still unverified by
+any of them: TLS, physical networks, and other distros/kernels/Firecracker versions than the ones recorded in
+the `RESULTS.md` files (Firecracker v1.17.0, kernel 6.1.155 from the Firecracker CI bucket, busybox 1.35.0,
+jq 1.8.2 for this script).
 
 Run these on a real root host before an event: `host/README.md` lists the checks, and
 `FC_REAL=1 sudo bun test apps/firecracker-instancer/test/net` runs the privileged network tests.
