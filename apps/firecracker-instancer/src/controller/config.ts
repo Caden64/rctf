@@ -1,23 +1,59 @@
 import { readFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import * as z from 'zod/mini'
+import {
+  loadCaBundle,
+  loadCaFile,
+  loadTlsIdentity,
+  type LoadedTlsMaterial,
+} from '../util/tls'
 
 /** Owner: track 5 (controller). Extend freely; keep the export names. */
-export const hostConfigSchema = z.object({
-  id: z.string(),
-  url: z.string(),
-  /** Bearer token for the agent; env FIRECRACKER_HOST_TOKEN_<ID upper, - => _> overrides. */
-  token: z.optional(z.string()),
-  /** Optional PEM CA to trust for https agents. */
-  caCertificate: z.optional(z.string()),
-  capacity: z.object({
-    vcpus: z.int(),
-    memMiB: z.int(),
-    diskMiB: z.int(),
-    maxInstances: z.int(),
-  }),
-})
-export type HostConfig = z.output<typeof hostConfigSchema>
+export const hostConfigSchema = z
+  .object({
+    id: z.string(),
+    url: z.string(),
+    /** Bearer token for the agent; env FIRECRACKER_HOST_TOKEN_<ID upper, - => _> overrides. */
+    token: z.optional(z.string()),
+    /** Optional inline PEM CA to trust for https agents. */
+    caCertificate: z.optional(z.string()),
+    /** Optional path to a PEM CA bundle; alternative to `caCertificate`. */
+    caCertificateFile: z.optional(z.string()),
+    /** Client certificate/key for agent mTLS; both or neither. */
+    clientCertFile: z.optional(z.string()),
+    clientKeyFile: z.optional(z.string()),
+    capacity: z.object({
+      vcpus: z.int(),
+      memMiB: z.int(),
+      diskMiB: z.int(),
+      maxInstances: z.int(),
+    }),
+  })
+  .check(
+    z.refine(
+      host =>
+        !(
+          host.caCertificate !== undefined &&
+          host.caCertificateFile !== undefined
+        ),
+      { message: 'caCertificate and caCertificateFile are mutually exclusive' }
+    )
+  )
+  .check(
+    z.refine(
+      host =>
+        (host.clientCertFile === undefined) ===
+        (host.clientKeyFile === undefined),
+      { message: 'clientCertFile and clientKeyFile must be set together' }
+    )
+  )
+export type HostConfig = z.output<typeof hostConfigSchema> & {
+  /**
+   * Loaded and validated at config-load time. Never logged or serialized: it
+   * contains the client private key when mTLS is configured.
+   */
+  tls?: LoadedTlsMaterial
+}
 
 export const controllerConfigSchema = z.object({
   listen: z.optional(
@@ -95,7 +131,12 @@ export const controllerConfigSchema = z.object({
    */
   shutdownTimeoutSeconds: z.optional(z.prefault(z.number(), 10)),
 })
-export type ControllerConfig = z.output<typeof controllerConfigSchema>
+export type ControllerConfig = Omit<
+  z.output<typeof controllerConfigSchema>,
+  'hosts'
+> & {
+  hosts: HostConfig[]
+}
 
 const formatIssues = (error: {
   issues: readonly { path: readonly PropertyKey[]; message: string }[]
@@ -110,6 +151,72 @@ const formatIssues = (error: {
 
 const hostTokenEnvKey = (hostId: string): string =>
   `FIRECRACKER_HOST_TOKEN_${hostId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`
+
+/**
+ * Resolve one host's TLS settings to the PEM strings `fetch` needs. Called at
+ * config load time (fail-fast) and again by HttpAgentClient for callers that
+ * construct a HostConfig directly.
+ *
+ * TLS settings on a plain `http://` URL are a configuration error: silently
+ * ignoring them would leave an operator believing the link is authenticated.
+ */
+export const resolveHostTls = (
+  host: z.output<typeof hostConfigSchema>
+): LoadedTlsMaterial | undefined => {
+  const label = `host ${host.id}`
+  if (
+    (host.clientCertFile === undefined) !==
+    (host.clientKeyFile === undefined)
+  ) {
+    throw new Error(
+      `${label}: clientCertFile and clientKeyFile must be set together`
+    )
+  }
+  if (
+    host.caCertificate !== undefined &&
+    host.caCertificateFile !== undefined
+  ) {
+    throw new Error(
+      `${label}: caCertificate and caCertificateFile are mutually exclusive`
+    )
+  }
+
+  const hasTlsSettings =
+    host.caCertificate !== undefined ||
+    host.caCertificateFile !== undefined ||
+    host.clientCertFile !== undefined
+  if (!hasTlsSettings) return undefined
+  if (!/^https:\/\//i.test(host.url)) {
+    throw new Error(
+      `${label}: TLS settings require an https url (got ${host.url})`
+    )
+  }
+
+  const ca =
+    host.caCertificateFile !== undefined
+      ? loadCaFile(host.caCertificateFile, {
+          label: `${label} caCertificateFile`,
+        })
+      : host.caCertificate !== undefined
+        ? loadCaBundle(host.caCertificate, {
+            label,
+            source: `${label} caCertificate`,
+          })
+        : undefined
+
+  if (host.clientCertFile !== undefined && host.clientKeyFile !== undefined) {
+    const identity = loadTlsIdentity(
+      { certFile: host.clientCertFile, keyFile: host.clientKeyFile },
+      { label: `${label} client certificate` }
+    )
+    return {
+      cert: identity.cert,
+      key: identity.key,
+      ...(ca === undefined ? {} : { ca }),
+    }
+  }
+  return ca === undefined ? undefined : { ca }
+}
 
 const intEnv = (
   env: Record<string, string | undefined>,
@@ -199,5 +306,14 @@ export const loadControllerConfig = (
   if (!parsed.success) {
     throw new Error(`invalid controller config: ${formatIssues(parsed.error)}`)
   }
-  return parsed.data
+  // Resolve TLS once, at startup: a missing/unreadable/expired certificate or
+  // a mismatched client key must stop the controller, not fail the first
+  // heartbeat (or worse, silently fall back to plaintext).
+  return {
+    ...parsed.data,
+    hosts: parsed.data.hosts.map(host => {
+      const tls = resolveHostTls(host)
+      return tls === undefined ? host : { ...host, tls }
+    }),
+  }
 }

@@ -3,11 +3,14 @@ import { AgentRejectedError, AgentUnreachableError } from '../../src/interfaces'
 import { HttpAgentClient } from '../../src/controller/agent-client'
 import type { HostConfig } from '../../src/controller/config'
 import { makeAgentSpec } from './helpers'
+import { cleanupDir, fixture, installFixtures, testDir } from '../tls/helpers'
 
 const servers: Array<{ stop: (force?: boolean) => void }> = []
+const dirs: string[] = []
 
 afterAll(() => {
   for (const server of servers) server.stop(true)
+  while (dirs.length > 0) cleanupDir(dirs.pop()!)
 })
 
 const agentInfo = {
@@ -318,5 +321,99 @@ describe('HttpAgentClient', () => {
     })
     expect((await client().get(agentInstance.id))?.state).toBe('running')
     expect(await client().list()).toHaveLength(1)
+  })
+})
+
+describe('HttpAgentClient TLS options', () => {
+  type SeenInit = RequestInit & {
+    tls?: {
+      ca?: string
+      cert?: string
+      key?: string
+      rejectUnauthorized?: boolean
+    }
+  }
+
+  const capture = (): {
+    seen: () => SeenInit | undefined
+    fetch: typeof fetch
+  } => {
+    let seen: SeenInit | undefined
+    const spy = (async (_input: string, init?: SeenInit) => {
+      seen = init
+      return json(agentInfo)
+    }) as unknown as typeof fetch
+    return { seen: () => seen, fetch: spy }
+  }
+
+  const baseConfig = (overrides: Partial<HostConfig> = {}): HostConfig => ({
+    id: 'host-a',
+    url: 'https://127.0.0.1:7001',
+    token: 'host-token',
+    capacity: { vcpus: 8, memMiB: 4096, diskMiB: 4096, maxInstances: 10 },
+    ...overrides,
+  })
+
+  test('passes an inline CA and explicit verification to fetch', async () => {
+    const spy = capture()
+    const client = new HttpAgentClient(
+      baseConfig({ caCertificate: fixture('ca.crt') }),
+      { fetch: spy.fetch }
+    )
+    await client.info()
+    const init = spy.seen()
+    expect(init?.tls).toEqual({
+      ca: fixture('ca.crt'),
+      rejectUnauthorized: true,
+    })
+    const headers = init?.headers as Record<string, string> | undefined
+    expect(headers?.Authorization).toBe('Bearer host-token')
+  })
+
+  test('passes CA, client certificate and key loaded from files', async () => {
+    const dir = testDir()
+    dirs.push(dir)
+    const paths = installFixtures(dir)
+    const spy = capture()
+    const client = new HttpAgentClient(
+      baseConfig({
+        caCertificateFile: paths.caCert,
+        clientCertFile: paths.clientCert,
+        clientKeyFile: paths.clientKey,
+      }),
+      { fetch: spy.fetch }
+    )
+    await client.info()
+    expect(spy.seen()?.tls).toEqual({
+      ca: fixture('ca.crt'),
+      cert: fixture('client.crt'),
+      key: fixture('client.key'),
+      rejectUnauthorized: true,
+    })
+  })
+
+  test('omits tls entirely when the host has no TLS settings', async () => {
+    const spy = capture()
+    const client = new HttpAgentClient(
+      baseConfig({ url: 'http://127.0.0.1:7001' }),
+      { fetch: spy.fetch }
+    )
+    await client.info()
+    expect(spy.seen()?.tls).toBeUndefined()
+  })
+
+  test('fails closed when both CA forms are set on a direct config', () => {
+    const dir = testDir()
+    dirs.push(dir)
+    const paths = installFixtures(dir)
+    expect(
+      () =>
+        new HttpAgentClient(
+          baseConfig({
+            caCertificate: fixture('ca.crt'),
+            caCertificateFile: paths.caCert,
+          })
+        )
+    ).toThrow(/mutually exclusive/)
   })
 })

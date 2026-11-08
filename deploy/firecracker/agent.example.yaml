@@ -4,6 +4,16 @@ hostId: fc1 # must match hosts[].id in the controller config
 listen:
   host: 10.0.0.11 # PRIVATE address reachable only from the controller (never 0.0.0.0 on a public NIC)
   port: 7001
+# Native TLS (optional). Without this block the agent serves plain HTTP, so keep
+# the listener on a private address and firewall it to the controller.
+# The agent runs as root: install the key and certificate root-owned and mode
+# 0600 (startup refuses group/world-accessible cert or key files).
+# tls:
+#   certFile: /etc/rctf-firecracker/tls/agent.crt
+#   keyFile: /etc/rctf-firecracker/tls/agent.key
+#   # Setting caFile requires and verifies a client certificate (mTLS). The
+#   # controller must then set clientCertFile/clientKeyFile for this host.
+#   caFile: /etc/rctf-firecracker/tls/clients-ca.crt
 stateDir: /var/lib/rctf-firecracker/state
 capacity: # what this host may run (the controller reserves against min(its config, this))
   vcpus: 32

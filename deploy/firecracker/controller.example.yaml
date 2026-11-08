@@ -12,9 +12,16 @@ databasePath: /var/lib/rctf-firecracker/controller.sqlite
 
 hosts:
   - id: fc1
-    url: http://10.0.0.11:7001 # the agent's listen address (plain HTTP: keep it on a private network, or front it with a TLS proxy and use https + caCertificate)
-    # caCertificate: |            # PEM to trust when the agent uses a private CA
+    url: http://10.0.0.11:7001 # use https:// when the agent has a tls block; plain HTTP must stay on a private network
+    # TLS for an https agent. caCertificateFile and caCertificate (inline PEM)
+    # are mutually exclusive; clientCertFile/clientKeyFile enable mTLS and must
+    # be set together. Files must be root/owner-owned and mode 0600 for the key
+    # and client certificate (startup fails otherwise).
+    # caCertificateFile: /etc/rctf-firecracker/tls/agent-ca.crt
+    # caCertificate: |            # inline alternative to caCertificateFile
     #   -----BEGIN CERTIFICATE-----
+    # clientCertFile: /etc/rctf-firecracker/tls/controller.crt
+    # clientKeyFile: /etc/rctf-firecracker/tls/controller.key
     capacity: # must not exceed what the host can really run
       vcpus: 32
       memMiB: 65536

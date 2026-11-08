@@ -44,8 +44,9 @@ describe('shipped example configs', () => {
     }
   })
 
-  test('the controller example speaks the same scheme the agent serves (plain HTTP)', () => {
-    // The agent has no TLS listener; an https:// URL here fails every heartbeat.
+  test('the controller example points at the agent default plain-HTTP listener', () => {
+    // The example leaves the agent's tls block commented out, so its host URL
+    // must stay http://; enabling TLS requires changing both sides.
     const controller = load('controller.example.yaml') as {
       hosts: { url: string }[]
     }

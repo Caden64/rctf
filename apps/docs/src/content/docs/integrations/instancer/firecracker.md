@@ -9,7 +9,7 @@ The Firecracker instancer boots a prebuilt kernel and root filesystem in a [Fire
 For the participant controls, common `<red>instancerConfig</red>` fields, and endpoint types, see [Instancer](/integrations/instancer).
 
 :::warning[Hardware and verification status]
-This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. Most of the unit tests fake the privileged edges, so the repository also ships harnesses that run the real programs. Unprivileged, in a throwaway user and network namespace: `deploy/firecracker/smoke/{:dir}` (real Firecracker v1.17.0, agent, taps and nftables), `deploy/firecracker/e2e/{:dir}` (rCTF provider, controller, real agent and real microVMs: lifecycle, expiry, restarts, capacity, ambiguous-create fencing, orphan cleanup, drain, auth) and `deploy/firecracker/edge/{:dir}` (real Traefik routing over plain HTTP, DNAT and egress masquerade from an outside namespace, conntrack flushing, anti-spoofing, nmap). As root inside throwaway QEMU VMs on nested KVM: `deploy/firecracker/vmtest/{:dir}` (the shipped `host-setup.sh` and systemd unit, real jailer mode, restart and `kill -9`, conntrack, NAT) and `deploy/firecracker/multihost/{:dir}` (one controller scheduling across two such hosts, including host loss, partition, clock skew and token mismatch). Not covered: TLS and certificate loading, physical multi-host networking and failure behaviour, and distro, systemd, kernel or Firecracker combinations other than the ones recorded in each harness's `RESULTS.md`. Run the checks in [Verify a host](#verify-a-host) as root on your own hardware before trusting this with a live event.
+This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. Most of the unit tests fake the privileged edges, so the repository also ships harnesses that run the real programs. Unprivileged, in a throwaway user and network namespace: `deploy/firecracker/smoke/{:dir}` (real Firecracker v1.17.0, agent, taps and nftables), `deploy/firecracker/e2e/{:dir}` (rCTF provider, controller, real agent and real microVMs: lifecycle, expiry, restarts, capacity, ambiguous-create fencing, orphan cleanup, drain, auth) and `deploy/firecracker/edge/{:dir}` (real Traefik routing over plain HTTP, DNAT and egress masquerade from an outside namespace, conntrack flushing, anti-spoofing, nmap). As root inside throwaway QEMU VMs on nested KVM: `deploy/firecracker/vmtest/{:dir}` (the shipped `host-setup.sh` and systemd unit, real jailer mode, restart and `kill -9`, conntrack, NAT) and `deploy/firecracker/multihost/{:dir}` (one controller scheduling across two such hosts, including host loss, partition, clock skew and token mismatch). The control-plane TLS path is covered in-process by unit tests: an ephemeral CA, server leaf and client certificate are generated with `openssl` at test time and a real `Bun.serve` TLS/mTLS listener is driven through the controller's `HttpAgentClient` (correct CA succeeds, wrong CA fails, mTLS rejects a missing or foreign client certificate, and bearer auth still applies over TLS). Not covered: real certificate lifecycle and CA operations, physical multi-host networking and failure behaviour, and distro, systemd, kernel or Firecracker combinations other than the ones recorded in each harness's `RESULTS.md`. Run the checks in [Verify a host](#verify-a-host) as root on your own hardware before trusting this with a live event.
 :::
 
 ## Architecture
@@ -106,7 +106,15 @@ Copy `agent.example.yaml` to `/etc/rctf-firecracker/agent.yaml{:file}`, set `hos
 $ <red>FIRECRACKER_AGENT_TOKEN</red>=<green><host-token></green> <red>bun</red> apps/firecracker-instancer/src/agent/index.ts /etc/rctf-firecracker/agent.yaml
 ```
 
-Use `host/rctf-firecracker-agent.service{:file}` to run it under systemd. The agent API controls root-level operations and serves plain HTTP. Bind it to a private address and firewall it to the controller only, or put a TLS reverse proxy in front of it and give the controller an `https` URL plus `caCertificate`.
+Use `host/rctf-firecracker-agent.service{:file}` to run it under systemd. The agent API controls root-level operations. By default it serves plain HTTP: bind it to a private address and firewall it to the controller only, or enable native TLS with a `tls` block (`certFile`, `keyFile`, and optionally `caFile`) and give the controller an `https` URL plus `caCertificateFile`. Setting `caFile` makes the listener mTLS: it requests a client certificate and rejects any that does not verify against that CA. Install the agent key and certificate root-owned with mode `0600`; startup fails if the key or certificate is group/world-accessible, if the PEM does not parse, if the certificate has expired (60-second margin), or if the certificate does not match the key. The private key is never logged.
+
+```yaml title="/etc/rctf-firecracker/agent.yaml (TLS excerpt)"
+tls:
+  certFile: /etc/rctf-firecracker/tls/agent.crt
+  keyFile: /etc/rctf-firecracker/tls/agent.key
+  caFile: /etc/rctf-firecracker/tls/clients-ca.crt # optional: require mTLS
+```
+
 
 ### 4. Configure and start the controller
 
@@ -120,6 +128,18 @@ FIRECRACKER_HOST_TOKEN_FC1=<host-token>
 ```
 
 The controller refuses to start without `FIRECRACKER_TEAM_KEY_SECRET`, and `authToken` must differ from `adminToken`. The `FIRECRACKER_HOST_TOKEN_<ID>` suffix is the host id in upper case with non-alphanumerics replaced by `_`. Use `deploy/firecracker/rctf-firecracker-controller.service{:file}` to run it under systemd.
+
+For an `https` agent, configure one trust anchor per host: either `caCertificateFile` (path) or inline `caCertificate` PEM, never both. If the agent sets `caFile`, also set `clientCertFile` and `clientKeyFile` (both or neither); they are presented as the mTLS client certificate. The controller loads and validates all of this before it starts: missing files, unparseable PEM, expired or not-yet-valid certificates, a certificate/key mismatch, a key or client certificate readable by group/other, a CA bundle writable by group/other, and TLS settings on an `http` URL are startup errors. It verifies the agent certificate with `rejectUnauthorized: true` even if `NODE_TLS_REJECT_UNAUTHORIZED=0` is set, and never logs the key material.
+
+```yaml title="/etc/rctf-firecracker/controller.yaml (TLS excerpt)"
+hosts:
+  - id: fc1
+    url: https://10.0.0.11:7001
+    caCertificateFile: /etc/rctf-firecracker/tls/agent-ca.crt
+    clientCertFile: /etc/rctf-firecracker/tls/controller.crt # only for mTLS
+    clientKeyFile: /etc/rctf-firecracker/tls/controller.key
+```
+
 
 ### 5. Point rCTF at the controller
 
@@ -236,7 +256,7 @@ $ <red>deploy/firecracker/smoke/fetch-artifacts.sh</red>
 $ <red>deploy/firecracker/smoke/run.sh</red>
 ```
 
-It covers 24 checks, listed with its limits in `deploy/firecracker/smoke/README.md{:file}`. The privileged harness in `deploy/firecracker/vmtest/{:dir}` additionally covers jailer mode, the shipped systemd unit, egress masquerade, conntrack and public DNAT as root in a throwaway Ubuntu 24.04 VM, so you can run it on a development machine without touching that machine (only QEMU runs unprivileged there). `deploy/firecracker/edge/{:dir}` covers real Traefik routing, and `deploy/firecracker/multihost/{:dir}` covers scheduling across two hosts. Then, on the real host as root, cover what none of them can: TLS and certificate loading, your physical network, and your distro's systemd/kernel combination.
+It covers 24 checks, listed with its limits in `deploy/firecracker/smoke/README.md{:file}`. The privileged harness in `deploy/firecracker/vmtest/{:dir}` additionally covers jailer mode, the shipped systemd unit, egress masquerade, conntrack and public DNAT as root in a throwaway Ubuntu 24.04 VM, so you can run it on a development machine without touching that machine (only QEMU runs unprivileged there). `deploy/firecracker/edge/{:dir}` covers real Traefik routing, and `deploy/firecracker/multihost/{:dir}` covers scheduling across two hosts. Then, on the real host as root, cover what none of them can: your real certificates and their DNS names (the in-process TLS test uses ephemeral certificates and `127.0.0.1`), CA rotation and renewal, your physical network, and your distro's systemd/kernel combination.
 
 ```ansi
 $ <red>FC_REAL</red>=1 <red>sudo</red> bun test apps/firecracker-instancer/test/net

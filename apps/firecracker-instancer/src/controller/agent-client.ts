@@ -37,14 +37,17 @@ import {
   AgentUnreachableError,
   type AgentClient,
 } from '../interfaces'
-import type { HostConfig } from './config'
+import type { LoadedTlsMaterial } from '../util/tls'
+import { resolveHostTls, type HostConfig } from './config'
 
 const DEFAULT_TIMEOUT_MS = 10_000
 const CREATE_TIMEOUT_MS = 30_000
 
+type FetchTlsOptions = LoadedTlsMaterial & { rejectUnauthorized?: boolean }
+
 type AgentFetch = (
   input: string,
-  init?: RequestInit & { tls?: { ca?: string } }
+  init?: RequestInit & { tls?: FetchTlsOptions }
 ) => Promise<Response>
 
 type CallResult =
@@ -86,6 +89,7 @@ export class HttpAgentClient implements AgentClient {
   readonly hostId: string
   private readonly baseUrl: string
   private readonly fetchImpl: AgentFetch
+  private readonly tls: FetchTlsOptions | undefined
   private readonly timeoutMs: number
   private readonly timeoutOverride: number | undefined
 
@@ -96,6 +100,15 @@ export class HttpAgentClient implements AgentClient {
     this.hostId = config.id
     this.baseUrl = config.url.replace(/\/+$/, '')
     this.fetchImpl = (opts?.fetch ?? fetch) as unknown as AgentFetch
+    // loadControllerConfig already resolved and validated this; resolving a
+    // directly-constructed config keeps the same fail-closed behaviour.
+    const material = config.tls ?? resolveHostTls(config)
+    this.tls =
+      material === undefined
+        ? undefined
+        : // Verify the server certificate even if the process environment sets
+          // NODE_TLS_REJECT_UNAUTHORIZED=0.
+          { ...material, rejectUnauthorized: true }
     this.timeoutOverride = opts?.timeoutMs
     this.timeoutMs = opts?.timeoutMs ?? DEFAULT_TIMEOUT_MS
   }
@@ -111,7 +124,7 @@ export class HttpAgentClient implements AgentClient {
     if (this.config.token !== undefined && this.config.token !== '') {
       headers.Authorization = `Bearer ${this.config.token}`
     }
-    const init: RequestInit & { tls?: { ca?: string } } = {
+    const init: RequestInit & { tls?: FetchTlsOptions } = {
       method,
       headers,
       // A create body carries flags: never replay it (or the bearer token's
@@ -123,8 +136,8 @@ export class HttpAgentClient implements AgentClient {
       headers['Content-Type'] = 'application/json'
       init.body = JSON.stringify(body)
     }
-    if (this.config.caCertificate !== undefined) {
-      init.tls = { ca: this.config.caCertificate }
+    if (this.tls !== undefined) {
+      init.tls = this.tls
     }
 
     let response: Response
