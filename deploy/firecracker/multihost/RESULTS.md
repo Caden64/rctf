@@ -25,7 +25,113 @@ Dated log of what actually ran. All runs are on the reference development host:
   Results below dated before this hardening pass describe the multicast link
   that was in use then; they are kept as history.
 
-## Final run (link + pidfile hardening) — 2026-11-08 13:52:43–13:59:58 (America/Denver)
+## Final run (pidfd + fail-closed observation hardening) — 2026-11-08 14:25:48–14:33:02 (America/Denver)
+
+Command:
+
+```sh
+./deploy/firecracker/multihost/run.sh
+```
+
+Dynamic identifiers for this run: run dir `/tmp/opencode/fcmh-2KS6vh`, ssh ports
+`55501` / `49641`, controller forward `52017`, private link
+`/tmp/opencode/fcmh-2KS6vh/link/{host-a,host-b}.sock` (QEMU unix-datagram, no
+multicast group or port). Exit code **0**. The 7m14s includes the two boots,
+provisioning, the 20-way race, the partition/host-loss restarts and both agent
+restarts.
+
+```
+==> pidfile authentication selftest (unprivileged decoy processes)
+pidfile selftest passed (35 checks)
+...
+PASS [link.24] the controller API binds loopback only (reached through the ssh forward)
+private-link checks: 24 passed, 0 failed
+private link works and is host-local only
+...
+RESULT: 137 passed, 0 failed, 137 assertions
+driver exit code: 0
+```
+
+Both QEMUs were stopped through their authenticated pidfiles by the EXIT trap;
+`pgrep -x qemu-system-x86` returned nothing afterwards, `vm.sh status` printed
+`stopped name=host-a` / `stopped name=host-b`, and the cleanup removed both link
+socket files (the `link/` directory remains mode 0700). The host ran no
+privileged command: only QEMU, the seed HTTP servers and the ssh client ran as
+the login user.
+
+### What changed in this pass
+
+1. **All signalling goes through a pidfd.** The shared helper
+   `deploy/firecracker/vmtest/pidguard.py` is now used by this `vm.sh` too
+   (looked up next to the script, then `../vmtest/pidguard.py`). It opens
+   `os.pidfd_open(pid)` first, validates the recorded boot id, start ticks,
+   executable, required argv and recorded argv while holding the fd, re-reads
+   the start ticks immediately before the signal, and sends TERM/KILL only
+   with `signal.pidfd_send_signal` on that same fd. A reused PID makes the
+   signal fail with ESRCH instead of resolving the PID again. `stop_recorded`
+   is now one helper invocation (authenticate + signal + wait), so there is no
+   check-then-`kill <pid>` gap for QEMU or the seed server.
+2. **The host-loss crash no longer reads a PID and calls `process.kill`.**
+   `driver.ts` scenario 5 invokes `vm.sh kill`, which authenticates the
+   recorded QEMU and SIGKILLs it through the pidfd (new `pidkill`). The driver
+   fails the scenario if that command does not exit 0. `process.kill` is no
+   longer used anywhere in the driver.
+3. **Link endpoints are only removed when provably ours.** `prepare_link`
+   rejects `.`/`..` components, symlinked link directories, and directories
+   that are not mode 0700 owned by the current uid. `cleanup_link_endpoint`
+   only removes an entry that is an AF_UNIX socket (not a regular file,
+   symlink or directory) owned by the current uid inside such a directory, and
+   `cleanup_link_endpoint_if_stopped` first proves through the authenticated
+   pidfile that the VM is not running. Boot's unconditional `rm -f
+   "$LINK_LOCAL"` and stop's unconditional unlink are both gone.
+4. **Lifecycle operations are serialised.** `create`, `start`, `stop`,
+   `destroy` and `kill` hold an exclusive `flock` on
+   `$VM_DIR/.lifecycle.lock` for the whole operation; QEMU and the seed server
+   close fd 9 (`9>&-`) so the daemons do not inherit the lock. `destroy` now
+   calls the stop functions directly instead of re-execing `vm.sh stop` (which
+   would deadlock on its own lock).
+5. **Host observation is fail-closed.** `hoststats.sh` checks the exit status
+   of `pgrep`, `ip` and `find` separately, treats only `pgrep` exit 1 as
+   "no match", and reports `-1` plus an `observationErrors` entry for anything
+   else (including an unreadable state directory or state record). The driver
+   rejects any `-1`/`observationErrors` in `hostStats()`, so `waitDestroyed`,
+   the leftover assertions and every other absence check fail instead of
+   passing on an unobserved zero.
+6. **The Firecracker probe preserves pgrep's status.** `probeFirecracker` runs
+   `pgrep -a -x firecracker` without `|| true`: exit 1 means no process, any
+   other status (127 missing binary, 2 error, ssh failure) is a probe error
+   that fails the assertion.
+7. **The self-test grew from 19 to 35 checks.** New: the two PID-reuse race
+   cases (changed start ticks before the signal; naive re-resolution to a
+   second decoy after validation, which must not be signalled) and three link
+   cases (a regular file given as `--link-local` and a symlink are not
+   deleted; a socket of a still-running authenticated QEMU is not unlinked),
+   plus a positive control that the leftover socket of a stopped QEMU is
+   removed.
+
+### Residual races (honest)
+
+- The pidfile *record* is sampled after QEMU writes it, without a pidfd. A PID
+  reuse in that microsecond window could record a different process, but that
+  record cannot authenticate: verification also requires this VM_DIR's
+  `-pidfile` argv and the recorded argv (including the run-specific link
+  spec), which an unrelated replacement does not carry. The record is never a
+  direct signal target.
+- The link endpoint's owning QEMU is proven gone through the authenticated
+  pidfile, not through the socket. A process that is not this VM_DIR's QEMU
+  and that deliberately bound a socket at this run-specific path could not be
+  distinguished, but the path is inside a per-run 0700 directory that no other
+  local user can reach; a regular file or symlink is never removed.
+- `flock` serialises cooperation through this script. A caller that edits or
+  removes pidfiles directly bypasses it, but no signal is sent without the
+  full identity check.
+- A process stuck in uninterruptible sleep after SIGKILL makes the helper exit
+  3; the pidfile is left in place, `stop` reports it, and the link endpoint is
+  not unlinked (the running check still authenticates the QEMU).
+- `pidguard.py` needs Linux >= 5.3 and Python >= 3.9; without pidfd support the
+  selftest fails and `run.sh` refuses to continue.
+
+## Previous run (link + pidfile hardening) — 2026-11-08 13:52:43–13:59:58 (America/Denver)
 
 Command:
 

@@ -81,19 +81,49 @@ ssh_opts=(
 )
 
 # ---------------------------------------------------------------------------
-# PID file authentication
+# PID file authentication and pidfd signalling
 # ---------------------------------------------------------------------------
 # A bare PID cannot identify a process: PIDs are reused, and a pidfile can
 # outlive a reboot. Every pidfile written by this script is therefore versioned
 # and contains the kernel boot id, the process start time (/proc/<pid>/stat
 # field 22, clock ticks since boot), the canonical executable, and the
 # run-specific argv elements (this VM_DIR's pidfile / seed directory). A signal
-# is sent only when *all* of them still match. Anything else is treated as a
-# stale pidfile: it is removed with a warning and no process is signalled.
+# is sent only when *all* of them still match.
+#
+# Verification alone is not enough: a check-then-`kill <pid>` sequence still
+# has a window in which the target exits and the PID is reused. All signalling
+# therefore goes through pidguard.py, which opens a pidfd FIRST, validates the
+# recorded identity while holding it, re-reads the start ticks immediately
+# before the signal and sends TERM/KILL only through that same pidfd. Any
+# mismatch is a stale pidfile: it is removed with a warning and no process is
+# signalled.
+PIDGUARD=$(cd -- "$(dirname -- "$0")" && pwd)/pidguard.py
+[ -f "$PIDGUARD" ] || die "pidguard helper is missing at $PIDGUARD"
+# Only the self-test populates this (with --test-hook=... entries).
+PIDGUARD_HOOKS=()
+
 current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 process_start_ticks() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 process_exe() { readlink "/proc/$1/exe" 2>/dev/null; }
-cmdline_digest() { sha256sum "/proc/$1/cmdline" 2>/dev/null | awk '{print $1}'; }
+
+# Required argv elements per process kind, as --require-arg=... options for
+# pidguard.py. Recorded arguments from the pidfile are always checked too; the
+# required ones pin this VM_DIR even if the record itself was tampered with.
+pidguard_fill_required() { # <kind>; sets PIDGUARD_REQ
+  PIDGUARD_REQ=()
+  case "$1" in
+    qemu) PIDGUARD_REQ=(--require-arg=-pidfile "--require-arg=$QEMU_PID") ;;
+    seed)
+      PIDGUARD_REQ=(
+        --require-arg=-m --require-arg=http.server
+        "--require-arg=$VM_SEED_PORT" --require-arg=--bind
+        --require-arg=127.0.0.1 --require-arg=--directory
+        "--require-arg=$SEED_DIR"
+      )
+      ;;
+    *) return 1 ;;
+  esac
+}
 
 pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
   local file=$1 kind=$2 pid=$3 a tmp=$1.tmp.$$
@@ -112,79 +142,31 @@ pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
 }
 
 pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID, returns 0 on match
-  local file=$1 kind=$2 line key val
-  local version= pid= boot= start= exe=
-  local -a recorded=() live=() required=()
+  local file=$1 kind=$2 errf rc out
   PIDFILE_PID=
   PIDFILE_REASON=
-  [ -f "$file" ] || { PIDFILE_REASON="file is missing"; return 1; }
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    if [[ $line != *=* ]]; then
-      PIDFILE_REASON="unsupported legacy pidfile (bare PID '$line'); cannot authenticate"
+  if ! pidguard_fill_required "$kind"; then
+    PIDFILE_REASON="unknown process kind '$kind'"
+    return 1
+  fi
+  errf=$(mktemp "${TMPDIR:-/tmp}/rctf-pidguard.XXXXXX") || {
+    PIDFILE_REASON="could not create a temporary file"
+    return 1
+  }
+  rc=0
+  out=$(python3 "$PIDGUARD" verify --pidfile "$file" --kind "$kind" \
+    "${PIDGUARD_REQ[@]}" 2>"$errf") || rc=$?
+  PIDFILE_REASON=$(tr '\n' ' ' <"$errf" | sed -e 's/[[:space:]]*$//')
+  rm -f "$errf"
+  case "$rc" in
+    0) PIDFILE_PID=$out; return 0 ;;
+    1) return 1 ;;
+    *)
+      [ -n "$PIDFILE_REASON" ] ||
+        PIDFILE_REASON="pidguard verify failed (exit $rc)"
       return 1
-    fi
-    key=${line%%=*}
-    val=${line#*=}
-    case "$key" in
-      version) version=$val ;;
-      kind) [ "$val" = "$kind" ] || { PIDFILE_REASON="kind is '$val', expected '$kind'"; return 1; } ;;
-      pid) pid=$val ;;
-      boot_id) boot=$val ;;
-      start_ticks) start=$val ;;
-      exe) exe=$val ;;
-      arg) recorded+=("$val") ;;
-      *) PIDFILE_REASON="unknown field '$key'"; return 1 ;;
-    esac
-  done <"$file"
-  [ "$version" = 2 ] || { PIDFILE_REASON="unsupported pidfile version '${version:-none}'"; return 1; }
-  case "$pid" in '' | *[!0-9]*) PIDFILE_REASON="invalid pid '$pid'"; return 1 ;; esac
-  if [ "$boot" != "$(current_boot_id)" ]; then
-    PIDFILE_REASON="recorded boot id '${boot:-none}' != current '$(current_boot_id)' (stale after reboot)"
-    return 1
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    PIDFILE_REASON="pid $pid is not running"
-    return 1
-  fi
-  if [ "$start" != "$(process_start_ticks "$pid")" ]; then
-    PIDFILE_REASON="pid $pid start ticks '${start:-none}' != live '$(process_start_ticks "$pid")' (pid reused)"
-    return 1
-  fi
-  if [ "$exe" != "$(process_exe "$pid")" ]; then
-    PIDFILE_REASON="pid $pid executable '${exe:-none}' != live '$(process_exe "$pid")'"
-    return 1
-  fi
-
-  while IFS= read -r -d '' val; do live+=("$val"); done <"/proc/$pid/cmdline" 2>/dev/null || true
-  case "$kind" in
-    qemu) required=(-pidfile "$QEMU_PID") ;;
-    seed) required=(-m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR") ;;
-    *) PIDFILE_REASON="unknown process kind '$kind'"; return 1 ;;
+      ;;
   esac
-  local needle candidate found
-  for needle in "${required[@]}"; do
-    found=0
-    for candidate in "${live[@]}"; do
-      if [ "$candidate" = "$needle" ]; then found=1; break; fi
-    done
-    if [ "$found" = 0 ]; then
-      PIDFILE_REASON="pid $pid cmdline lacks required argument '$needle' (not this VM_DIR)"
-      return 1
-    fi
-  done
-  for needle in "${recorded[@]}"; do
-    found=0
-    for candidate in "${live[@]}"; do
-      if [ "$candidate" = "$needle" ]; then found=1; break; fi
-    done
-    if [ "$found" = 0 ]; then
-      PIDFILE_REASON="pid $pid cmdline lacks recorded argument '$needle'"
-      return 1
-    fi
-  done
-  PIDFILE_PID=$pid
-  return 0
 }
 
 pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and return 1
@@ -201,30 +183,35 @@ pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and
 
 is_running() { pidfile_take "$QEMU_PID" qemu >/dev/null; }
 
-# Stop a process recorded in a pidfile. The identity is snapshotted before the
-# first signal so a SIGKILL is only sent to the same process (qemu may unlink its
-# own pidfile on the way out, and the PID may have been reused by then).
+# Stop a process recorded in a pidfile. pidguard.py does the whole
+# authenticate -> TERM -> wait -> KILL sequence in one invocation, opening the
+# pidfd before it validates and signalling only through that fd (see the file
+# header). A stale record is removed and no process is signalled.
 stop_recorded() { # stop_recorded <file> <kind> <label> <term-wait-ticks>
-  local file=$1 kind=$2 label=$3 wait=$4 pid boot start exe digest
-  pid=$(pidfile_take "$file" "$kind") || return 0
-  boot=$(current_boot_id)
-  start=$(process_start_ticks "$pid")
-  exe=$(process_exe "$pid")
-  digest=$(cmdline_digest "$pid")
-  log "stopping $label (pid $pid)"
-  kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 "$wait"); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-  if kill -0 "$pid" 2>/dev/null; then
-    if [ "$(current_boot_id)" = "$boot" ] &&
-      [ "$(process_start_ticks "$pid")" = "$start" ] &&
-      [ "$(process_exe "$pid")" = "$exe" ] &&
-      [ "$(cmdline_digest "$pid")" = "$digest" ]; then
-      kill -9 "$pid" 2>/dev/null || true
-    else
-      log "WARNING: $label pid $pid changed identity before SIGKILL; not signalling"
-    fi
+  local file=$1 kind=$2 label=$3 wait=$4 rc out reason
+  [ -f "$file" ] || return 0
+  if ! pidguard_fill_required "$kind"; then
+    log "WARNING: refusing to stop $label: unknown process kind '$kind'"
+    return 0
   fi
-  rm -f "$file"
+  rc=0
+  out=$(python3 "$PIDGUARD" stop --pidfile "$file" --kind "$kind" \
+    --label "$label" --term-wait-ticks "$wait" "${PIDGUARD_REQ[@]}" \
+    ${PIDGUARD_HOOKS[@]+"${PIDGUARD_HOOKS[@]}"} 2>&1) || rc=$?
+  reason=${out//$'\n'/ }
+  case "$rc" in
+    0)
+      [ -z "$out" ] || printf '%s\n' "$out" >&2
+      rm -f "$file"
+      ;;
+    1)
+      log "WARNING: removing stale pidfile $file ($reason); not signalling any process"
+      rm -f "$file"
+      ;;
+    *)
+      log "WARNING: could not authenticate $label ($reason); leaving $file in place and not signalling"
+      ;;
+  esac
 }
 
 stop_seed_server() { stop_recorded "$SEED_PID" seed "cloud-init seed server" 25; }
@@ -511,7 +498,7 @@ boot() {
 # process is never signalled (while a correctly recorded one still is).
 # ---------------------------------------------------------------------------
 selftest() {
-  local fail=0 line
+  local fail=0 line decoy start replacement
   local save_vm_dir=$VM_DIR save_qpid=$QEMU_PID save_spid=$SEED_PID
   local save_seed=$SEED_DIR save_sport=$VM_SEED_PORT
   SELFTEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vmtest-selftest.XXXXXX")
@@ -616,7 +603,44 @@ selftest() {
   st_dead "$decoy" "positive control"
   st_removed "positive control"
 
-  # 6. A stale seed-server pidfile is also not signalled.
+  # 6. PID-reuse race at the signal: the record validates, then the live start
+  # ticks change before TERM (simulated through the helper's test hook). The
+  # helper must re-check immediately before signalling and refuse.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the pid-reuse-race pidfile"
+  PIDGUARD_HOOKS=(--test-hook=start-delta-after-validate=1)
+  stop_recorded "$QEMU_PID" qemu "selftest pid-reuse decoy" 2 >"$tmp/stop.out" 2>&1
+  PIDGUARD_HOOKS=()
+  st_alive "$decoy" "pid-reuse race"
+  st_message "pid-reuse race" "changed identity before SIGTERM"
+  st_removed "pid-reuse race"
+
+  # 7. A naive implementation re-resolves the PID after validation and could
+  # signal the recycled PID. The hook makes the helper re-resolve to a second
+  # live decoy; the pidfd still holds the validated target, so only that one is
+  # stopped and the replacement is never signalled.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  python3 -c 'import time; time.sleep(300)' >/dev/null 2>&1 &
+  replacement=$!
+  SELFTEST_DECOYS+=("$replacement")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the pid-reuse replacement pidfile"
+  PIDGUARD_HOOKS=(--test-hook="reuse-after-validate=$replacement")
+  stop_recorded "$QEMU_PID" qemu "selftest pid-reuse replacement" 25 >"$tmp/stop.out" 2>&1
+  PIDGUARD_HOOKS=()
+  st_dead "$decoy" "pid-reuse replacement: authenticated target"
+  st_alive "$replacement" "pid-reuse replacement: recycled pid"
+  st_message "pid-reuse replacement" "signalling only through the pidfd"
+  st_removed "pid-reuse replacement"
+
+  # 8. A stale seed-server pidfile is also not signalled.
   sleep 300 >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")

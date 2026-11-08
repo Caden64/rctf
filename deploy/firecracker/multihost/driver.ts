@@ -271,15 +271,47 @@ interface HostStats {
   stateRunning: number
   nftLeaseRules: number
   instances: AgentInstance[] | null
+  /** Producer failures reported by hoststats.sh (values are -1 as well). */
+  observationErrors?: string[]
 }
 
-const hostStats = (host: string): HostStats =>
-  JSON.parse(
+const HOSTSTATS_COUNTERS = [
+  'firecrackerProcs',
+  'taps',
+  'stateRecords',
+  'stateRunning',
+  'nftLeaseRules',
+] as const
+
+/**
+ * Read hoststats.sh and reject an observation failure marker.
+ *
+ * A failed `pgrep`/`ip`/`find`/`nft` in hoststats.sh reports -1 (and names the
+ * field in observationErrors). That is NOT "zero leaked processes": treating it
+ * as one would let every absence assertion pass vacuously. Callers either
+ * retry (probe*) or fail; none may see a zero they did not observe.
+ */
+const hostStats = (host: string): HostStats => {
+  const stats = JSON.parse(
     remoteOut(
       host,
       `sudo bash /opt/rctf-firecracker/deploy/firecracker/multihost/hoststats.sh ${ipOf(host)}`
     )
   ) as HostStats
+  const failed = new Set(stats.observationErrors ?? [])
+  for (const field of HOSTSTATS_COUNTERS) {
+    const value = stats[field]
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      failed.add(field)
+    }
+  }
+  if (failed.size > 0) {
+    throw new Error(
+      `host observation failed on ${host}: ${[...failed].join(', ')} (counts were not observed, not zero)`
+    )
+  }
+  return stats
+}
 
 // --- fail-closed probes ----------------------------------------------------
 //
@@ -360,9 +392,16 @@ interface FcProbe {
 
 /** `pgrep -a -x firecracker` on the host (pid + argv for every guest). */
 const probeFirecracker = (host: string): FcProbe => {
-  const result = remote(host, 'pgrep -a -x firecracker 2>/dev/null || true')
+  // No `|| true` and no discarded stderr: only pgrep's own exit 1 means "no
+  // match". 127 (pgrep missing), 2 (syntax/operating error) or an ssh failure
+  // is a probe error and must fail the check, never look like an empty list.
+  const result = remote(host, 'pgrep -a -x firecracker')
+  if (result.code === 1) return { ok: true, lines: [] }
   if (result.code !== 0) {
-    return { ok: false, error: `pgrep failed (${result.code})` }
+    return {
+      ok: false,
+      error: `pgrep failed (${result.code}): ${result.stderr.trim() || result.stdout.slice(-200) || 'no output'}`,
+    }
   }
   return {
     ok: true,
@@ -2260,19 +2299,26 @@ const scenarioHostLoss = async (): Promise<void> => {
         `HTTP ${healthyRemoval.status}`
       )
 
-      const pidRaw = shell([
-        VMCTL,
-        '--name',
-        B,
-        '--ssh-port',
-        String(B_SSH),
-        'pid',
-      ])
-      const qemuPid = Number(pidRaw.stdout.trim())
-      if (!Number.isInteger(qemuPid) || qemuPid <= 0) {
-        throw new Error(`could not read host-b qemu pid: ${short(pidRaw)}`)
+      // Simulate a host crash. The VM pid is authenticated inside vm.sh and
+      // SIGKILLed through a pidfd (pidguard.py): reading the PID here and
+      // calling process.kill() afterwards had a window in which the PID could
+      // be reused, killing an unrelated process.
+      const crash = shell(
+        [
+          VMCTL,
+          '--name',
+          B,
+          '--ssh-port',
+          String(B_SSH),
+          'kill',
+        ],
+        30_000
+      )
+      if (crash.code !== 0) {
+        throw new Error(
+          `could not crash host-b through the authenticated pidfd: ${short(crash)}`
+        )
       }
-      process.kill(qemuPid, 'SIGKILL')
       const killedAt = Date.now()
       const unhealthyMs = await waitHostHealth(B, 'unhealthy', 30_000)
       report.check(

@@ -25,10 +25,13 @@ override with `VM_SSH_PORT` / `VM_SEED_PORT`. `vm.sh` refuses to boot when
 either port is already bound by a process it did not record (it never kills by
 process name). Pidfiles are versioned and record the machine boot id, the
 process start time (`/proc/<pid>/stat` field 22), the executable and the
-run-specific argv elements; `stop`/`destroy` signal a process only after all of
-them match, otherwise the stale pidfile is removed with a warning and nothing is
-signalled. `./vm.sh selftest` runs that check unprivileged on the host (decoy
-processes, no VM) and `run.sh` runs it before booting.
+run-specific argv elements. All signalling goes through `pidguard.py`, which
+opens a pidfd first, validates that identity while holding it, re-reads the
+start ticks immediately before the signal, and sends TERM/KILL only through the
+same pidfd (so a reused PID is never signalled). A mismatch is a stale pidfile:
+it is removed with a warning and nothing is signalled. `./vm.sh selftest` runs
+that check unprivileged on the host (decoy processes, no VM; 23 checks,
+including two simulated PID-reuse races) and `run.sh` runs it before booting.
 
 ## Requirements
 
@@ -36,8 +39,9 @@ Host (unprivileged):
 
 - `/dev/kvm` readable/writable, AMD-V/Intel-VT with nested virtualization
   enabled for the guest (the VM must expose `/dev/kvm` to Firecracker),
-- `qemu-system-x86_64`, `qemu-img`, `ssh`, `ssh-keygen`, `curl`, `python3`,
-  `tar`, `/dev/kvm`,
+- `qemu-system-x86_64`, `qemu-img`, `ssh`, `ssh-keygen`, `curl`, `python3`
+  (>= 3.9 with Linux pidfd support: `os.pidfd_open` /
+  `signal.pidfd_send_signal`), `tar`, `/dev/kvm`,
 - ~5 GiB RAM free (VM uses 4 GiB by default) and ~10 GiB disk.
 
 The Firecracker v1.17.0, kernel, busybox and rootfs artifacts are shared with
@@ -87,7 +91,8 @@ An HTTP service on `192.0.2.2:9999` represents the internet. `nmap` runs in
 
 | Path           | Purpose                                                       |
 | -------------- | ------------------------------------------------------------- |
-| `vm.sh`        | create/start/ssh/status/stop/destroy/selftest the VM (idempotent, port-ownership checks, authenticated pidfiles, verified base image) |
+| `vm.sh`        | create/start/ssh/status/stop/destroy/selftest the VM (idempotent, port-ownership checks, authenticated pidfiles, pidfd signalling, verified base image) |
+| `pidguard.py`  | authenticate a v2 pidfile and TERM/KILL it through a pidfd (shared with `../multihost/vm.sh`) |
 | `provision.sh` | runs as root in the VM: packages, Bun, checkout, guest image  |
 | `run.sh`       | host driver: boot, copy, provision, run checks, stop, summary |
 | `guest-start`  | test-only guest service (flag on tmpfs + probe results)       |

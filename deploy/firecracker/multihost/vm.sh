@@ -134,6 +134,23 @@ SEED_PID=$VM_DIR/seed-http.pid
 # Keep the serial log path short: qemu writes it by absolute path.
 CONSOLE=$VM_DIR/console.log
 
+# ---------------------------------------------------------------------------
+# Lifecycle serialisation
+# ---------------------------------------------------------------------------
+# Two concurrent `vm.sh stop` / `create` calls for the same name (run.sh's
+# cleanup trap racing a manual stop, two shells debugging the same VM) could
+# otherwise interleave pidfile checks and link cleanup. Every lifecycle command
+# holds an exclusive flock for the whole operation. Daemons started here close
+# fd 9 explicitly (9>&-) so they do not inherit the lock for their lifetime.
+case "$CMD" in
+  create | start | stop | destroy | kill)
+    mkdir -p "$VM_DIR"
+    exec 9>"$VM_DIR/.lifecycle.lock"
+    flock -w "${MH_LOCK_TIMEOUT:-300}" 9 ||
+      die "could not acquire the lifecycle lock $VM_DIR/.lifecycle.lock"
+    ;;
+esac
+
 ssh_opts=(
   -i "$SSH_KEY"
   -p "${SSH_PORT:-0}"
@@ -153,21 +170,47 @@ ssh_opts=(
 # leave the host: there is no multicast group, no UDP/TCP port and no host
 # interface. The directory holding the sockets must be 0700 (and owned by this
 # user) so no other local user can connect either.
+#
+# The directory, not the caller, is the trust boundary: a path outside it (or
+# one with `.`/`..` components) is rejected, and an existing directory is never
+# loosened or replaced. `cleanup_link_endpoint` below is the only code that
+# removes a link path and it only ever removes a socket owned by this uid in
+# such a directory, after the authenticated pidfile proved the VM is stopped.
+link_dir_valid() { # link_dir_valid <dir>; 0 only for a real 0700 dir owned by us
+  local dir=$1
+  [ -n "$dir" ] || return 1
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+  [ "$(stat -c '%a' -- "$dir" 2>/dev/null)" = 700 ] || return 1
+  [ "$(stat -c '%u' -- "$dir" 2>/dev/null)" = "$(id -u)" ] || return 1
+}
+
 prepare_link() {
   [ -n "$LINK_LOCAL" ] || die "--link-local is required"
   [ -n "$LINK_PEER" ] || die "--link-peer is required"
   [ "$LINK_LOCAL" != "$LINK_PEER" ] || die "--link-local and --link-peer must differ"
-  local dir peer_dir mode owner
+  local dir peer_dir mode owner base
+  case "$LINK_LOCAL" in
+    */../* | */.. | */./* | */.) die "link socket paths must not contain '.' or '..' components: $LINK_LOCAL" ;;
+  esac
+  case "$LINK_PEER" in
+    */../* | */.. | */./* | */.) die "link socket paths must not contain '.' or '..' components: $LINK_PEER" ;;
+  esac
   dir=$(dirname -- "$LINK_LOCAL")
   peer_dir=$(dirname -- "$LINK_PEER")
   [ "$dir" = "$peer_dir" ] || die "link socket paths must share one directory ($dir vs $peer_dir)"
   case "$dir" in /*) ;; *) die "link directory must be absolute: $dir" ;; esac
+  base=$(basename -- "$LINK_LOCAL")
+  case "$base" in '' | . | ..) die "invalid link socket name '$base' in $LINK_LOCAL" ;; esac
+  base=$(basename -- "$LINK_PEER")
+  case "$base" in '' | . | ..) die "invalid link socket name '$base' in $LINK_PEER" ;; esac
   [ ${#LINK_LOCAL} -le 103 ] || die "unix socket path is too long (${#LINK_LOCAL} > 103): $LINK_LOCAL"
   [ ${#LINK_PEER} -le 103 ] || die "unix socket path is too long (${#LINK_PEER} > 103): $LINK_PEER"
-  if [ ! -d "$dir" ]; then
+  if [ ! -e "$dir" ]; then
     mkdir -p -- "$dir"
     chmod 700 -- "$dir"
   fi
+  [ ! -L "$dir" ] || die "link directory $dir is a symlink (refusing to use it)"
+  [ -d "$dir" ] || die "link directory $dir is not a directory"
   mode=$(stat -c '%a' -- "$dir")
   owner=$(stat -c '%u' -- "$dir")
   [ "$mode" = 700 ] || die "link directory $dir is mode $mode, expected 700 (would expose the private link)"
@@ -175,21 +218,94 @@ prepare_link() {
   LINK_SPEC="dgram,id=n1,local.type=unix,local.path=$LINK_LOCAL,remote.type=unix,remote.path=$LINK_PEER"
 }
 
+# Remove a link endpoint only when it is provably ours: the parent is a real
+# 0700 directory owned by this uid, the entry itself is an AF_UNIX socket (not
+# a regular file, symlink or directory) owned by this uid. Anything else is
+# reported and left alone.
+cleanup_link_endpoint() { # cleanup_link_endpoint <path> <label>
+  local path=$1 label=$2 dir type owner
+  [ -n "$path" ] || return 0
+  dir=$(dirname -- "$path")
+  if ! link_dir_valid "$dir"; then
+    log "WARNING: not unlinking $label $path: $dir is not a real 0700 directory owned by uid $(id -u)"
+    return 0
+  fi
+  if [ -L "$path" ]; then
+    log "WARNING: refusing to unlink $label $path: it is a symlink, not a socket"
+    return 0
+  fi
+  [ -e "$path" ] || return 0
+  type=$(stat -c '%F' -- "$path" 2>/dev/null)
+  owner=$(stat -c '%u' -- "$path" 2>/dev/null)
+  if [ "$type" != socket ]; then
+    log "WARNING: refusing to unlink $label $path: it is a ${type:-unknown type}, not a unix socket"
+    return 0
+  fi
+  if [ "$owner" != "$(id -u)" ]; then
+    log "WARNING: refusing to unlink $label $path: owned by uid ${owner:-?}, not $(id -u)"
+    return 0
+  fi
+  rm -f -- "$path"
+}
+
+# The only caller-facing form: never unlink while an authenticated QEMU for
+# this VM_DIR still runs, and then apply the socket/ownership checks above.
+cleanup_link_endpoint_if_stopped() { # <path> <label>
+  [ -n "${1:-}" ] || return 0
+  if is_running; then
+    log "WARNING: not unlinking $2 $1: an authenticated QEMU is still running"
+    return 0
+  fi
+  cleanup_link_endpoint "$1" "$2"
+}
+
 # ---------------------------------------------------------------------------
-# PID file authentication (ported from deploy/firecracker/vmtest/vm.sh)
+# PID file authentication and pidfd signalling
+# (ported from deploy/firecracker/vmtest/vm.sh; see pidguard.py)
 # ---------------------------------------------------------------------------
 # A bare PID cannot identify a process: PIDs are reused, and a pidfile can
 # outlive a reboot. Every pidfile written by this script is therefore versioned
 # and contains the kernel boot id, the process start time (/proc/<pid>/stat
 # field 22, clock ticks since boot), the canonical executable, and the
 # run-specific argv elements (this VM_DIR's pidfile / seed directory / link).
-# A signal is sent only when *all* of them still match. Anything else is
-# treated as a stale pidfile: it is removed with a warning and no process is
+#
+# Verification alone is not enough: a check-then-`kill <pid>` sequence still
+# has a window in which the target exits and the PID is reused. All signalling
+# therefore goes through pidguard.py, which opens a pidfd FIRST, validates the
+# recorded identity while holding it, re-reads the start ticks immediately
+# before the signal and sends TERM/KILL only through that same pidfd. Any
+# mismatch is a stale pidfile: it is removed with a warning and no process is
 # signalled.
+PIDGUARD=$(cd -- "$(dirname -- "$0")" && pwd)/pidguard.py
+if [ ! -f "$PIDGUARD" ]; then
+  # The canonical helper lives next to the vmtest harness it was copied from.
+  PIDGUARD=$(cd -- "$(dirname -- "$0")/../vmtest" 2>/dev/null && pwd)/pidguard.py
+fi
+[ -f "$PIDGUARD" ] || die "pidguard helper is missing (looked next to this script and in ../vmtest/pidguard.py)"
+# Only the self-test populates this (with --test-hook=... entries).
+PIDGUARD_HOOKS=()
+
 current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 process_start_ticks() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 process_exe() { readlink "/proc/$1/exe" 2>/dev/null; }
-cmdline_digest() { sha256sum "/proc/$1/cmdline" 2>/dev/null | awk '{print $1}'; }
+
+# Required argv elements per process kind, as --require-arg=... options for
+# pidguard.py. Recorded arguments from the pidfile are always checked too; the
+# seed port is dynamic per VM, so the required arguments tie it to the
+# run-specific seed directory and the recorded argv pins the exact port.
+pidguard_fill_required() { # <kind>; sets PIDGUARD_REQ
+  PIDGUARD_REQ=()
+  case "$1" in
+    qemu) PIDGUARD_REQ=(--require-arg=-pidfile "--require-arg=$QEMU_PID") ;;
+    seed)
+      PIDGUARD_REQ=(
+        --require-arg=-m --require-arg=http.server
+        --require-arg=--directory "--require-arg=$SEED_DIR"
+      )
+      ;;
+    *) return 1 ;;
+  esac
+}
 
 pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
   local file=$1 kind=$2 pid=$3 a tmp=$1.tmp.$$
@@ -208,82 +324,31 @@ pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
 }
 
 pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID, returns 0 on match
-  local file=$1 kind=$2 line key val
-  local version= pid= boot= start= exe=
-  local -a recorded=() live=() required=()
+  local file=$1 kind=$2 errf rc out
   PIDFILE_PID=
   PIDFILE_REASON=
-  [ -f "$file" ] || { PIDFILE_REASON="file is missing"; return 1; }
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    if [[ $line != *=* ]]; then
-      PIDFILE_REASON="unsupported legacy pidfile (bare PID '$line'); cannot authenticate"
+  if ! pidguard_fill_required "$kind"; then
+    PIDFILE_REASON="unknown process kind '$kind'"
+    return 1
+  fi
+  errf=$(mktemp "${TMPDIR:-/tmp}/rctf-pidguard.XXXXXX") || {
+    PIDFILE_REASON="could not create a temporary file"
+    return 1
+  }
+  rc=0
+  out=$(python3 "$PIDGUARD" verify --pidfile "$file" --kind "$kind" \
+    "${PIDGUARD_REQ[@]}" 2>"$errf") || rc=$?
+  PIDFILE_REASON=$(tr '\n' ' ' <"$errf" | sed -e 's/[[:space:]]*$//')
+  rm -f "$errf"
+  case "$rc" in
+    0) PIDFILE_PID=$out; return 0 ;;
+    1) return 1 ;;
+    *)
+      [ -n "$PIDFILE_REASON" ] ||
+        PIDFILE_REASON="pidguard verify failed (exit $rc)"
       return 1
-    fi
-    key=${line%%=*}
-    val=${line#*=}
-    case "$key" in
-      version) version=$val ;;
-      kind) [ "$val" = "$kind" ] || { PIDFILE_REASON="kind is '$val', expected '$kind'"; return 1; } ;;
-      pid) pid=$val ;;
-      boot_id) boot=$val ;;
-      start_ticks) start=$val ;;
-      exe) exe=$val ;;
-      arg) recorded+=("$val") ;;
-      *) PIDFILE_REASON="unknown field '$key'"; return 1 ;;
-    esac
-  done <"$file"
-  [ "$version" = 2 ] || { PIDFILE_REASON="unsupported pidfile version '${version:-none}'"; return 1; }
-  case "$pid" in '' | *[!0-9]*) PIDFILE_REASON="invalid pid '$pid'"; return 1 ;; esac
-  if [ "$boot" != "$(current_boot_id)" ]; then
-    PIDFILE_REASON="recorded boot id '${boot:-none}' != current '$(current_boot_id)' (stale after reboot)"
-    return 1
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    PIDFILE_REASON="pid $pid is not running"
-    return 1
-  fi
-  if [ "$start" != "$(process_start_ticks "$pid")" ]; then
-    PIDFILE_REASON="pid $pid start ticks '${start:-none}' != live '$(process_start_ticks "$pid")' (pid reused)"
-    return 1
-  fi
-  if [ "$exe" != "$(process_exe "$pid")" ]; then
-    PIDFILE_REASON="pid $pid executable '${exe:-none}' != live '$(process_exe "$pid")'"
-    return 1
-  fi
-
-  while IFS= read -r -d '' val; do live+=("$val"); done <"/proc/$pid/cmdline" 2>/dev/null || true
-  case "$kind" in
-    qemu) required=(-pidfile "$QEMU_PID") ;;
-    # The seed port is dynamic per VM, so tie the required arguments to the
-    # run-specific seed directory instead; the recorded argv still pins the
-    # exact port and bind address.
-    seed) required=(-m http.server --directory "$SEED_DIR") ;;
-    *) PIDFILE_REASON="unknown process kind '$kind'"; return 1 ;;
+      ;;
   esac
-  local needle candidate found
-  for needle in "${required[@]}"; do
-    found=0
-    for candidate in "${live[@]}"; do
-      if [ "$candidate" = "$needle" ]; then found=1; break; fi
-    done
-    if [ "$found" = 0 ]; then
-      PIDFILE_REASON="pid $pid cmdline lacks required argument '$needle' (not this VM_DIR)"
-      return 1
-    fi
-  done
-  for needle in "${recorded[@]}"; do
-    found=0
-    for candidate in "${live[@]}"; do
-      if [ "$candidate" = "$needle" ]; then found=1; break; fi
-    done
-    if [ "$found" = 0 ]; then
-      PIDFILE_REASON="pid $pid cmdline lacks recorded argument '$needle'"
-      return 1
-    fi
-  done
-  PIDFILE_PID=$pid
-  return 0
 }
 
 pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and return 1
@@ -300,30 +365,68 @@ pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and
 
 is_running() { pidfile_take "$QEMU_PID" qemu >/dev/null; }
 
-# Stop a process recorded in a pidfile. The identity is snapshotted before the
-# first signal so a SIGKILL is only sent to the same process (qemu may unlink
-# its own pidfile on the way out, and the PID may have been reused by then).
+# Stop a process recorded in a pidfile. pidguard.py does the whole
+# authenticate -> TERM -> wait -> KILL sequence in one invocation, opening the
+# pidfd before it validates and signalling only through that fd (see the file
+# header). A stale record is removed and no process is signalled.
 stop_recorded() { # stop_recorded <file> <kind> <label> <term-wait-ticks>
-  local file=$1 kind=$2 label=$3 wait=$4 pid boot start exe digest
-  pid=$(pidfile_take "$file" "$kind") || return 0
-  boot=$(current_boot_id)
-  start=$(process_start_ticks "$pid")
-  exe=$(process_exe "$pid")
-  digest=$(cmdline_digest "$pid")
-  log "stopping $label (pid $pid)"
-  kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 "$wait"); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-  if kill -0 "$pid" 2>/dev/null; then
-    if [ "$(current_boot_id)" = "$boot" ] &&
-      [ "$(process_start_ticks "$pid")" = "$start" ] &&
-      [ "$(process_exe "$pid")" = "$exe" ] &&
-      [ "$(cmdline_digest "$pid")" = "$digest" ]; then
-      kill -9 "$pid" 2>/dev/null || true
-    else
-      log "WARNING: $label pid $pid changed identity before SIGKILL; not signalling"
-    fi
+  local file=$1 kind=$2 label=$3 wait=$4 rc out reason
+  [ -f "$file" ] || return 0
+  if ! pidguard_fill_required "$kind"; then
+    log "WARNING: refusing to stop $label: unknown process kind '$kind'"
+    return 0
   fi
-  rm -f "$file"
+  rc=0
+  out=$(python3 "$PIDGUARD" stop --pidfile "$file" --kind "$kind" \
+    --label "$label" --term-wait-ticks "$wait" "${PIDGUARD_REQ[@]}" \
+    ${PIDGUARD_HOOKS[@]+"${PIDGUARD_HOOKS[@]}"} 2>&1) || rc=$?
+  reason=${out//$'\n'/ }
+  case "$rc" in
+    0)
+      [ -z "$out" ] || printf '%s\n' "$out" >&2
+      rm -f "$file"
+      ;;
+    1)
+      log "WARNING: removing stale pidfile $file ($reason); not signalling any process"
+      rm -f "$file"
+      ;;
+    *)
+      log "WARNING: could not authenticate $label ($reason); leaving $file in place and not signalling"
+      ;;
+  esac
+}
+
+# Simulate a host crash: SIGKILL the authenticated QEMU through the pidfd and
+# wait for it to go. Used by driver.ts instead of an authenticated-PID ->
+# process.kill sequence, which had the same reuse window.
+pidkill() { # pidkill <file> <kind> <label>
+  local file=$1 kind=$2 label=$3 rc out reason
+  [ -f "$file" ] || {
+    log "no pidfile $file"
+    return 1
+  }
+  if ! pidguard_fill_required "$kind"; then
+    log "unknown process kind '$kind'"
+    return 1
+  fi
+  rc=0
+  out=$(python3 "$PIDGUARD" kill --pidfile "$file" --kind "$kind" \
+    --label "$label" --signal SIGKILL "${PIDGUARD_REQ[@]}" \
+    ${PIDGUARD_HOOKS[@]+"${PIDGUARD_HOOKS[@]}"} 2>&1) || rc=$?
+  reason=${out//$'\n'/ }
+  [ -z "$reason" ] || printf '%s\n' "$reason" >&2
+  case "$rc" in
+    0) rm -f "$file"; return 0 ;;
+    1)
+      log "WARNING: not killing $label: no authenticated process ($reason)"
+      rm -f "$file"
+      return 1
+      ;;
+    *)
+      log "WARNING: could not authenticate $label ($reason); not signalling"
+      return 1
+      ;;
+  esac
 }
 
 stop_seed_server() { stop_recorded "$SEED_PID" seed "cloud-init seed server" 25; }
@@ -558,7 +661,7 @@ start_seed_server() {
   command -v python3 >/dev/null || die "python3 is required to serve the cloud-init seed"
   mkdir -p "$VM_DIR"
   nohup python3 -m http.server "$SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" \
-    >"$VM_DIR/seed-http.log" 2>&1 &
+    >"$VM_DIR/seed-http.log" 2>&1 9>&- &
   local spid=$!
   pidfile_record "$SEED_PID" seed "$spid" \
     -m http.server "$SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" ||
@@ -617,8 +720,10 @@ boot() {
   rm -f "$QEMU_PID" "$CONSOLE"
   # The local AF_UNIX datagram socket may be left behind by a SIGKILLed QEMU
   # (scenario 5). No authenticated QEMU is running for this VM_DIR (above), so
-  # removing the stale path is safe and required before rebinding it.
-  rm -f -- "$LINK_LOCAL"
+  # removing the stale path is safe and required before rebinding it. The
+  # cleanup refuses to touch anything that is not a socket of ours in the
+  # validated 0700 link directory.
+  cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "stale local link endpoint"
   if [ ! -f "$OVERLAY" ]; then
     log "creating qcow2 overlay (${VM_DISK})"
     qemu-img create -q -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$OVERLAY" "$VM_DISK"
@@ -633,7 +738,7 @@ boot() {
     -device "virtio-net-pci,netdev=n0,mac=$MAC_MGMT" \
     -netdev "$LINK_SPEC" \
     -device "virtio-net-pci,netdev=n1,mac=$MAC_PRIV" \
-    -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${SEED_PORT}/"
+    -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${SEED_PORT}/" 9>&-
   qpid=$(cat "$QEMU_PID" 2>/dev/null) || qpid=
   [ -n "$qpid" ] || die "qemu did not write $QEMU_PID"
   pidfile_record "$QEMU_PID" qemu "$qpid" -pidfile "$QEMU_PID" "$LINK_SPEC" ||
@@ -657,7 +762,7 @@ boot() {
 # process is never signalled (while a correctly recorded one still is).
 # ---------------------------------------------------------------------------
 selftest() {
-  local fail=0 line decoy start
+  local fail=0 line decoy start replacement
   local save_vm_dir=$VM_DIR save_qpid=$QEMU_PID save_spid=$SEED_PID
   local save_seed=$SEED_DIR save_sport=$SEED_PORT
   local save_link_local=$LINK_LOCAL save_link_peer=$LINK_PEER save_link_spec=$LINK_SPEC
@@ -695,6 +800,17 @@ selftest() {
   }
   st_removed() { # st_removed <label>
     if [ -e "$QEMU_PID" ] || [ -e "$SEED_PID" ]; then st_bad "$1: stale pidfile was not removed"; else st_ok "$1: stale pidfile was removed"; fi
+  }
+  st_exists() { # st_exists <path> <label>
+    if [ -e "$1" ] || [ -L "$1" ]; then st_ok "$2"; else st_bad "$2 (missing)"; fi
+  }
+  st_absent() { # st_absent <path> <label>
+    if [ -e "$1" ] || [ -L "$1" ]; then st_bad "$2 (still present)"; else st_ok "$2"; fi
+  }
+  st_explains() { # st_explains <file> <label> <pattern>
+    if grep -q -- "$3" "$1"; then st_ok "$2"; else
+      st_bad "$2: expected '$3' in $(tr '\n' ' ' <"$1")"
+    fi
   }
 
   printf 'pidfile authentication selftest (no VM, no root)\n'
@@ -782,7 +898,83 @@ selftest() {
   st_dead "$decoy" "positive control"
   st_removed "positive control"
 
-  # 7. A stale seed-server pidfile is also not signalled.
+  # 7. PID-reuse race at the signal: the record validates, then the live start
+  # ticks change before TERM (simulated through the helper's test hook). The
+  # helper must re-check immediately before signalling and refuse.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the pid-reuse-race pidfile"
+  PIDGUARD_HOOKS=(--test-hook=start-delta-after-validate=1)
+  stop_recorded "$QEMU_PID" qemu "selftest pid-reuse decoy" 2 >"$tmp/stop.out" 2>&1
+  PIDGUARD_HOOKS=()
+  st_alive "$decoy" "pid-reuse race"
+  st_message "pid-reuse race" "changed identity before SIGTERM"
+  st_removed "pid-reuse race"
+
+  # 8. A naive implementation re-resolves the PID after validation and could
+  # signal the recycled PID. The hook makes the helper re-resolve to a second
+  # live decoy; the pidfd still holds the validated target, so only that one is
+  # stopped and the replacement is never signalled.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  python3 -c 'import time; time.sleep(300)' >/dev/null 2>&1 &
+  replacement=$!
+  SELFTEST_DECOYS+=("$replacement")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the pid-reuse replacement pidfile"
+  PIDGUARD_HOOKS=(--test-hook="reuse-after-validate=$replacement")
+  stop_recorded "$QEMU_PID" qemu "selftest pid-reuse replacement" 25 >"$tmp/stop.out" 2>&1
+  PIDGUARD_HOOKS=()
+  st_dead "$decoy" "pid-reuse replacement: authenticated target"
+  st_alive "$replacement" "pid-reuse replacement: recycled pid"
+  st_message "pid-reuse replacement" "signalling only through the pidfd"
+  st_removed "pid-reuse replacement"
+
+  # 9. Link endpoint safety: a regular file given as --link-local must never
+  # be unlinked (the old stop did `rm -f "$LINK_LOCAL"` unconditionally).
+  mkdir -p "$tmp/link"
+  chmod 700 "$tmp/link"
+  LINK_LOCAL=$tmp/link/host-a.sock
+  LINK_PEER=$tmp/link/host-b.sock
+  printf 'do not delete this file\n' >"$LINK_LOCAL"
+  cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "selftest regular file" >"$tmp/link.out" 2>&1
+  st_exists "$LINK_LOCAL" "regular file given as --link-local was NOT deleted"
+  st_explains "$tmp/link.out" "regular file: refusal explains the type" "not a unix socket"
+  rm -f "$LINK_LOCAL"
+
+  # 10. A socket owned by a QEMU that is still running is not unlinked.
+  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); s.bind(sys.argv[1]); time.sleep(300)' \
+    "$LINK_LOCAL" -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  for _ in $(seq 1 50); do [ -S "$LINK_LOCAL" ] && break; sleep 0.1; done
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the live-socket pidfile"
+  cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "selftest live socket" >"$tmp/link.out" 2>&1
+  st_alive "$decoy" "live qemu socket: decoy was NOT signalled"
+  st_exists "$LINK_LOCAL" "socket of a still-running QEMU was NOT unlinked"
+  st_explains "$tmp/link.out" "live qemu socket: refusal explains the owner" "still running"
+
+  # 11. Once the authenticated QEMU is stopped, the leftover socket IS removed.
+  stop_recorded "$QEMU_PID" qemu "selftest link owner" 25 >"$tmp/stop.out" 2>&1
+  st_dead "$decoy" "link owner"
+  cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "selftest stale socket" >"$tmp/link.out" 2>&1
+  st_absent "$LINK_LOCAL" "stale socket of a stopped QEMU was removed"
+
+  # 12. A symlink is not a socket and must not be unlinked.
+  printf 'symlink target\n' >"$tmp/link/target"
+  ln -s "$tmp/link/target" "$LINK_LOCAL"
+  cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "selftest symlink" >"$tmp/link.out" 2>&1
+  st_exists "$LINK_LOCAL" "symlink given as --link-local was NOT deleted"
+  st_exists "$tmp/link/target" "symlink target was NOT deleted"
+  rm -f "$LINK_LOCAL" "$tmp/link/target"
+
+  # 13. A stale seed-server pidfile is also not signalled.
   sleep 300 >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
@@ -835,11 +1027,20 @@ case "$CMD" in
   stop)
     stop_recorded "$QEMU_PID" qemu "VM $NAME" 50
     stop_seed_server
-    if [ -n "$LINK_LOCAL" ]; then rm -f -- "$LINK_LOCAL"; fi
+    # Only after the authenticated qemu pidfile says it is gone, and only for
+    # a socket of ours in the validated link directory.
+    cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "local link endpoint"
+    ;;
+  kill)
+    # Crash simulation for driver.ts: no TERM, just an authenticated SIGKILL
+    # through a pidfd. The link endpoint is left for the next boot/stop.
+    pidkill "$QEMU_PID" qemu "VM $NAME"
     ;;
   selftest) selftest ;;
   destroy)
-    "$0" --name "$NAME" --ssh-port "${SSH_PORT:-0}" stop
+    stop_recorded "$QEMU_PID" qemu "VM $NAME" 50
+    stop_seed_server
+    cleanup_link_endpoint_if_stopped "$LINK_LOCAL" "local link endpoint"
     log "removing overlay and console for $NAME"
     rm -f "$OVERLAY" "$CONSOLE" "$VM_DIR/qemu.cmdline"
     rm -rf "$SEED_DIR"

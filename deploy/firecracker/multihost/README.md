@@ -51,8 +51,8 @@ every run is bounded by `timeout(1)` and both QEMUs are stopped on exit.
 Prerequisites (all present on the reference host):
 
 - `/dev/kvm` readable/writable, nested virtualization enabled;
-- `qemu-system-x86_64`, `qemu-img`, `ssh`, `curl`, `python3`, `bun`, `tar`,
-  `timeout`, `flock`;
+- `qemu-system-x86_64`, `qemu-img`, `ssh`, `curl`, `python3` (>= 3.9 with Linux
+  pidfd support), `bun`, `tar`, `timeout`, `flock`;
 - the smoke artifacts already fetched by
   `deploy/firecracker/smoke/fetch-artifacts.sh` (`~/.cache/rctf-fc-smoke`):
   firecracker v1.17.0, jailer, `images/smoke/{vmlinux,rootfs.ext4}`, static jq.
@@ -89,7 +89,7 @@ interface or listener on `10.77.0.10/11`. Logs, `results.json`,
 checks passed.
 
 Typical runtime on the reference host: **8–20 minutes** (the final run took
-7m15s: 137 driver assertions, 24 link checks, 19 pidfile-selftest checks), dominated
+7m14s: 137 driver assertions, 24 link checks, 35 pidfile-selftest checks), dominated
 by the two cloud-init boots, `bun install` inside each VM and the injected
 faults. The host checkout needs its workspace dependencies installed once
 (`bun install --frozen-lockfile`), because `driver.ts` imports the real
@@ -174,9 +174,10 @@ and writes `results.json`. Groups:
 | Path                | Purpose                                                                                                                                                                 |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run.sh`            | host driver: unique ports/dirs, pidfile selftest, boots + provisions both VMs, asserts the private link, opens the ssh forward, runs `driver.ts`, always stops the VMs. |
-| `vm.sh`             | named QEMU VM helper (copy/extension of `vmtest/vm.sh`): per-VM overlay/seed/ssh port, the second unix-datagram link NIC, and authenticated pidfiles + `selftest`.      |
+| `vm.sh`             | named QEMU VM helper (copy/extension of `vmtest/vm.sh`): per-VM overlay/seed/ssh port, the second unix-datagram link NIC, authenticated pidfiles + pidfd signalling, per-VM lifecycle `flock`, and `selftest`. |
+| `pidguard.py` (shared) | `../vmtest/pidguard.py`: authenticate a v2 pidfile and TERM/KILL it through a pidfd; used by both `vm.sh` scripts.                                                              |
 | `provision-host.sh` | runs as root in each VM: packages, bun, checkout, host-setup.sh, images, shipped agent unit + jailer config, controller config on host-a.                               |
-| `hoststats.sh`      | read-only per-host observation (agent list, Firecracker/tap/state/nft counts) used by the driver.                                                                       |
+| `hoststats.sh`      | read-only per-host observation (agent list, Firecracker/tap/state/nft counts) used by the driver; every failed enumeration reports -1 + `observationErrors`, which the driver rejects. |
 | `faultproxy.ts`     | runs inside host-a: wraps `../e2e/proxy.ts` around host-b's agent for the ambiguous-create scenario (hold a request or swallow the response).                           |
 | `dbdump.ts`         | read-only controller SQLite snapshot (instances + hosts incl. `accepting` and clock state).                                                                             |
 | `driver.ts`         | real provider + scenarios/assertions + cleanup.                                                                                                                         |
@@ -187,22 +188,30 @@ and writes `results.json`. Groups:
 
 - Only `qemu-system-x86_64` runs unprivileged on the host. Both QEMU and the
   cloud-init seed server are stopped only through authenticated pidfiles that
-  record the boot id, process start ticks, executable and run-specific argv;
-  the identity is verified before `TERM` and again before `KILL`. A stale or
-  mismatched pidfile is removed with a warning and no process is signalled
-  (never `pkill`/name). `vm.sh --name selftest selftest` proves this with
-  unprivileged decoy processes and runs before every boot.
+  record the boot id, process start ticks, executable and run-specific argv.
+  All TERM/KILL signals go through `pidguard.py`, which opens a pidfd first,
+  validates the identity while holding it, re-reads the start ticks immediately
+  before the signal, and signals only through that fd (a reused PID is never
+  signalled). A stale or mismatched pidfile is removed with a warning and no
+  process is signalled (never `pkill`/name). `vm.sh --name selftest selftest`
+  proves this with unprivileged decoy processes (35 checks, including simulated
+  PID-reuse races) and runs before every boot.
 - Every run uses unique directories, ssh/seed/controller ports and two unique
-  unix-socket paths in a 0700 directory for the private link.
+  unix-socket paths in a 0700 directory for the private link. Link endpoints are
+  removed only after the authenticated pidfile says the VM is gone, and only an
+  AF_UNIX socket owned by this uid inside a validated 0700 directory is ever
+  unlinked (a regular file given as `--link-local` is left untouched).
+  `create`/`start`/`stop`/`destroy`/`kill` are serialised with a per-VM `flock`.
 - The private link cannot leave the host: it is two `AF_UNIX` datagram sockets,
   not multicast/UDP/TCP, and there is no host bridge or tap. Ports cannot
   collide across parallel workers because there is no shared port at all.
 - The fault proxy is an unprivileged `bun` process inside host-a listening on
   loopback; it only wraps host-b's agent URL in a per-scenario controller
   config.
-- Hosts are never signalled with host-wide tools: host loss is a `kill -9` of
-  the one authenticated QEMU pid recorded for host-b (the pid itself is
-  obtained through `vm.sh pid`, which re-verifies the pidfile).
+- Hosts are never signalled with host-wide tools: host loss is an authenticated
+  SIGKILL of the one QEMU recorded for host-b, sent through the pidfd by
+  `vm.sh kill` (`pidguard.py`); the driver never reads a PID and calls
+  `process.kill` itself.
 - No secrets are printed. The per-run tokens are generated into a 0600 file,
   copied into the VMs, and only used in HTTP headers (the driver logs source
   shas, guest IPs and status codes, never flags or tokens).
