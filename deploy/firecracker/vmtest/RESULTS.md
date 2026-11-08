@@ -1,4 +1,90 @@
-# vmtest results — 2026-11-08 (assertion-hardening rerun)
+# vmtest results — 2026-11-08 (capability/pidfile hardening rerun)
+
+Real execution as root inside a throwaway QEMU VM. **Nothing privileged was run
+on the developer machine.** The host only ran `qemu-system-x86_64` as the login
+user; every root operation happened inside the VM.
+
+- Host: Linux 7.2.14-arch1-1, AMD Ryzen 7 7840HS, nested KVM enabled, `/dev/kvm`
+  0666. This run used `VM_DIR=~/.cache/rctf-vmtest-t3-c39c36fd`,
+  `VM_SSH_PORT=2422`, `VM_SEED_PORT=8201`; the two QEMU VMs of the concurrent
+  multihost worker (ephemeral ssh ports 56599/47433) were not touched.
+- VM: Ubuntu 24.04.5 cloud image from the dated `noble/20261017/` directory
+  (cached image re-hashed against the pinned SHA256 before boot), systemd
+  `255.4-1ubuntu8.18`, nftables 1.0.9, conntrack-tools 1.4.8, nmap 7.94SVN.
+- Guest runtime: Firecracker/jailer v1.17.0, kernel 6.1.155, Bun 1.4.4
+  (verified against the release `SHASUMS256.txt` and the pinned digest).
+- Command: `deploy/firecracker/vmtest/run.sh` (fresh overlay for this run;
+  shipped unit with no drop-in, shipped `host-setup.sh`).
+- Transcript: `~/.cache/rctf-vmtest-t3-c39c36fd/logs/run-20261108-132322.log`.
+- VM stopped at the end: `vm.sh status` → `stopped`, ports 2422/8201 free, and
+  no qemu/seed process from this run remains. After the full run the same
+  cleanly stopped overlay was booted once more to check overlay reuse (SSH and
+  cloud-init came up), then stopped again.
+
+## Summary (this run)
+
+All checks pass: **211 assertions, 0 failed** (was 180 in the previous run).
+The pidfile self-test adds 16 passing checks before boot and is not part of the
+211 numbered check assertions.
+
+| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                  |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                                                                                                         |
+| `10-agent-systemd.sh` (b)           | 35 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent; `AmbientCapabilities=CAP_SETUID` only; measured `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`; `CAP_SETGID` still effective; preflight `accepting:true`.                            |
+| `20-jailer-instance.sh` (c)         | 43 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown, fencing; **live Firecracker pid 7948 has `CapPrm=CapEff=CapAmb=0` and `NoNewPrivs=1` after launch**. |
+| `30-restart-survival.sh` (d)        | 56 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` unchanged, `vm-identity.json` matches live `/proc`; **the zero-capability/`NoNewPrivs` assertion also passes after restart (pid 8244) and after `kill -9`, and the agent's `0x82c31eb`/`0x80`/NNP=1 set is re-checked each time**; CAP_SYS_PTRACE safe-failure outcome asserted. |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                                                                                                                       |
+| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                                                                                                       |
+| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed.                                                                                                                  |
+
+Total: **211 passed, 0 failed**.
+
+## What changed in this pass (2026-11-08, capability/pidfile hardening)
+
+1. **PID files are authenticated before any signal.** `vm.sh` now writes a
+   versioned pidfile (`version=2`) holding the kernel boot id, the process start
+   time (`/proc/<pid>/stat` field 22), the canonical executable and the
+   run-specific argv elements (this `VM_DIR`'s `-pidfile` path / seed directory
+   and port). `stop` authenticates all of them before `TERM`, and snapshots
+   boot id / start ticks / exe / cmdline digest before `KILL` only. A mismatch
+   (legacy bare PID, different boot, reused PID, wrong executable or command
+   line) prints a warning, removes the stale pidfile and signals nothing. This
+   covers qemu and the seed HTTP server.
+   A new `vm.sh selftest` (run unprivileged by `run.sh` before boot) proves this
+   with live decoy processes: bare-PID, command-line, boot-id and start-time
+   mismatches are **not** signalled, a correctly recorded process **is**
+   stopped, and a stale seed pidfile is not signalled. Result: 16 pass / 0 fail.
+2. **`AmbientCapabilities` narrowed to exactly `CAP_SETUID`.** The measured
+   deficit with `NoNewPrivileges=yes` + `RestrictAddressFamilies=` is exactly
+   `0x80 = CAP_SETUID` (`CapPrm=CapEff=0x82c316b` vs `CapBnd=0x82c31eb`);
+   `CAP_SETGID` (`0x40`) is already effective. The unit now sets
+   `AmbientCapabilities=CAP_SETUID` (keeping `CAP_SETGID` and the rest in
+   `CapabilityBoundingSet`) and the comment/README/tests say exactly that.
+   **Sufficiency was proven by this full run**: with only `CAP_SETUID` ambient,
+   jailer create/delete, `systemctl restart`, `kill -9`, conntrack, egress NAT
+   and public DNAT all pass and the agent measures
+   `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`.
+3. **The guest-facing process is proven unprivileged.** Checks 20 and 30 read
+   `/proc/<pid>/status` of the live Firecracker process (and, recursively, any
+   child it forks) and require `CapPrm == CapEff == CapAmb == 0` with
+   `NoNewPrivs=1` after launch, after `systemctl restart` re-adoption and after
+   `kill -9` re-adoption. The agent's own set is asserted to be exactly the
+   documented `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`
+   (also after each restart). This proves the ambient `CAP_SETUID` needed by the
+   jailer's `setuid(10000)` does not leak into Firecracker.
+
+## Aborted attempt (honest note)
+
+The first rerun reused the overlay left by an aborted harness invocation
+(a `vm.sh` edit raced a `vm.sh status` call, so the driver aborted right after
+the first boot). On that reused overlay SSH reset every connection before any
+check ran and `wait_ssh` timed out (240 s). The overlay was removed with
+`vm.sh destroy` and the run above used a fresh overlay. The cleanly stopped
+overlay from the reported run then booted normally on a second `vm.sh create`
+(SSH/cloud-init up), so reuse after a normal stop works; the failure was
+specific to the partially-prepared overlay, not to a check or the product.
+
+# Previous run (2026-11-08, assertion hardening; superseded by the run above)
 
 Real execution as root inside a throwaway QEMU VM. **Nothing privileged was run
 on the developer machine.** The host only ran `qemu-system-x86_64` as the login

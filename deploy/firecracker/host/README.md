@@ -194,13 +194,16 @@ under `/sys/fs/cgroup`.
 
 On systemd 255 (Ubuntu 24.04), `NoNewPrivileges=yes` combined with a seccomp
 filter (`RestrictAddressFamilies=` installs one) makes systemd start a root
-service with `CAP_SETUID` still in `CapBnd` but missing from
-`CapPrm`/`CapEff`; the jailer's `setuid(10000)` then fails with
+service with `CapPrm=CapEff=0x82c316b` while `CapBnd=0x82c31eb`: the two sets
+differ by exactly `0x80` = `CAP_SETUID`, which is therefore missing from
+`CapPrm`/`CapEff` (`CAP_SETGID`, `0x40`, stays effective). The jailer's
+`setuid(10000)` then fails with
 `Failed to exec into Firecracker: Operation not permitted (os error 1)`.
-The unit therefore also sets `AmbientCapabilities=CAP_SETUID CAP_SETGID`,
-which restores exactly the two bits the jailer needs (and keeps the socket
-filter). Verified on systemd `255.4-1ubuntu8.18` (Ubuntu 24.04, kernel 6.8)
-with Firecracker/jailer v1.17.0 on 2026-11-08; see `../vmtest/`.
+The unit therefore also sets `AmbientCapabilities=CAP_SETUID`, which restores
+exactly the one measured-missing bit (`CapAmb=0x80`,
+`CapEff=CapBnd=0x82c31eb`) and keeps the socket filter; `CAP_SETGID` stays in
+`CapabilityBoundingSet`. Verified on systemd `255.4-1ubuntu8.18` (Ubuntu 24.04,
+kernel 6.8) with Firecracker/jailer v1.17.0 on 2026-11-08; see `../vmtest/`.
 
 ## Install
 
@@ -348,8 +351,8 @@ unprivileged QEMU):
 - jailer mode: create/delete over the real agent API, uid/gid 10000, chroot, per-VM cgroup, real
   tap with the durable alias, MMDS flag delivery, no flag on host disk;
 - the **shipped** systemd unit (byte-identical, no drop-in) actually launching the jailer
-  (`CAP_SETUID`/`CAP_SETGID` via `AmbientCapabilities=`, see above), `KillMode=process` across
-  `systemctl restart` and `kill -9`, and agent re-adoption;
+  (`CAP_SETUID` via `AmbientCapabilities=`, `CAP_SETGID` already effective; see above),
+  `KillMode=process` across `systemctl restart` and `kill -9`, and agent re-adoption;
 - `egress: true` masquerade, `egress: false` denial, public DNAT from an outside network
   namespace, conntrack flushing on release, and reuse quarantine;
 - team isolation measured from inside the guests, with a rules-removed positive control.

@@ -99,15 +99,17 @@ describe('shipped example configs', () => {
       expect(bounding).toContain(cap)
     }
     // systemd 255 (Ubuntu 24.04) launches a root unit one bit short of
-    // CapBnd (CAP_SETUID) when NoNewPrivileges=yes is combined with a seccomp
-    // filter. AmbientCapabilities restores exactly the jailer's bits; removing
-    // either directive would silently reintroduce the launch failure.
+    // CapBnd -- measured CapPrm=CapEff=0x82c316b vs CapBnd=0x82c31eb, i.e.
+    // exactly CAP_SETUID (0x80) is missing; CAP_SETGID remains effective --
+    // when NoNewPrivileges=yes is combined with a seccomp filter.
+    // AmbientCapabilities restores exactly the missing bit; removing either
+    // directive would silently reintroduce the launch failure.
     expect(unit).toMatch(/^NoNewPrivileges=yes$/m)
     expect(directive('RestrictAddressFamilies')).toEqual(
       expect.arrayContaining(['AF_UNIX', 'AF_INET', 'AF_INET6', 'AF_NETLINK'])
     )
     const ambient = directive('AmbientCapabilities')
-    expect(ambient).toContain('CAP_SETUID')
-    expect(ambient).toContain('CAP_SETGID')
+    expect(ambient).toEqual(['CAP_SETUID'])
+    expect(bounding).toContain('CAP_SETGID')
   })
 })

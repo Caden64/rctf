@@ -79,6 +79,12 @@ command -v python3 >/dev/null || { say "python3 is required"; exit 2; }
 
 ensure_artifacts || { say "could not obtain Firecracker artifacts"; exit 2; }
 
+say "==> pidfile-authentication selftest (host, unprivileged)"
+if ! "$HERE/vm.sh" selftest 2>&1 | tee -a "$LOG"; then
+  say "pidfile-authentication selftest FAILED; refusing to boot"
+  exit 2
+fi
+
 say "==> creating/booting VM"
 "$HERE/vm.sh" create >>"$LOG" 2>&1 || { say "VM boot failed (see $LOG)"; exit 2; }
 "$HERE/vm.sh" status | tee -a "$LOG"

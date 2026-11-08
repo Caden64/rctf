@@ -106,6 +106,8 @@ fi
 expect_eq "$(lease_tap "$ID")" "$TAP" "tap was preserved across the restart"
 expect_eq "$(vm_pid "$ID")" "$PID" "agent-reported .vm.pid is the original PID after systemctl restart"
 assert_reidentity "after systemctl restart"
+assert_instance_no_caps "$PID" "after systemctl restart/re-adoption"
+assert_agent_caps "$AGENT2" "agent after systemctl restart"
 
 # --- 2. kill -9 of the agent ----------------------------------------------
 AGENT2=$(agent_main_pid)
@@ -128,14 +130,16 @@ if wait_state "$ID" running 60; then ok "agent re-adopted the VM after kill -9 (
 fi
 expect_eq "$(vm_pid "$ID")" "$PID" "agent-reported .vm.pid is the original PID after kill -9"
 assert_reidentity "after kill -9"
+assert_instance_no_caps "$PID" "after kill -9/re-adoption"
+assert_agent_caps "$NEW" "agent after kill -9 restart"
 
 # --- 3. is CAP_SYS_PTRACE really required? ---------------------------------
 PID_START=$(awk '{print $22}' "/proc/$PID/stat")
 mkdir -p "$(dirname "$DROPIN")"
 cat >"$DROPIN" <<'EOF'
 # TEST-ONLY: remove CAP_SYS_PTRACE (with a reset, because systemd merges
-# lists). The shipped unit's AmbientCapabilities=CAP_SETUID CAP_SETGID stays in
-# effect: both are still in this bounding set.
+# lists). The shipped unit's AmbientCapabilities=CAP_SETUID stays in effect:
+# CAP_SETUID is still in this bounding set.
 [Service]
 CapabilityBoundingSet=
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
@@ -188,6 +192,7 @@ rm -f "$DROPIN"
 systemctl daemon-reload
 systemctl restart rctf-firecracker-agent
 wait_agent_active || bad "agent did not restart after restoring CAP_SYS_PTRACE"
+assert_agent_caps "$(agent_main_pid)" "agent after restoring CAP_SYS_PTRACE"
 GONE=0
 for _ in $(seq 1 60); do
   if ! kill -0 "$PID" 2>/dev/null; then GONE=1; break; fi

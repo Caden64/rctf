@@ -107,6 +107,17 @@ else
   ARGS=
 fi
 
+# --- guest-facing process capabilities -------------------------------------
+# The agent gets CAP_SETUID as an ambient capability so the jailer can setuid()
+# before exec'ing Firecracker. Prove that this does not leak into Firecracker:
+# the live process (and any child it ever forks) must have zero
+# permitted/effective/ambient capabilities and must run with NoNewPrivs=1.
+if [ "$ALIVE" = 1 ]; then
+  assert_instance_no_caps "$PID" "after launch"
+else
+  bad "cannot assert the Firecracker capability set: pid $PID is not alive"
+fi
+
 # --- cgroup ----------------------------------------------------------------
 CGROUP=/sys/fs/cgroup/firecracker/$ID
 if [ -d "$CGROUP" ]; then ok "per-instance cgroup exists ($CGROUP)"; else
