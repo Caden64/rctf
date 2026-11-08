@@ -32,9 +32,13 @@ KillMode=process
 # and delete tap devices and add addresses (CAP_NET_ADMIN/CAP_NET_RAW), and run
 # the jailer, which chroots, mounts, setuid/setgids into a per-VM uid and writes
 # cgroups (CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SETUID/SETGID, CAP_CHOWN,
-# CAP_FOWNER, CAP_KILL, CAP_MKNOD). It also needs /dev/kvm.
+# CAP_FOWNER, CAP_KILL, CAP_MKNOD). CAP_SYS_PTRACE is required to read
+# /proc/<pid>/exe and /proc/<pid>/root of the jailed Firecracker processes, which
+# run as a different uid: the agent authenticates a VM process by executable
+# inode, uid and jail root before it adopts or signals it, and Linux gates those
+# /proc links behind ptrace access checks. It also needs /dev/kvm.
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
 NoNewPrivileges=yes
 
 # ---------------------------------------------------------------------------

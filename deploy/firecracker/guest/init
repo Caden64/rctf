@@ -223,6 +223,10 @@ write_env_file() {
 # they always win over challenge values of the same name.
 run_service() {
   (
+    # The executable init selected is captured in a positional parameter BEFORE
+    # challenge data is sourced: a legitimate challenge variable named SERVICE
+    # (or any other internal name) must not change which program runs.
+    set -- "$SERVICE"
     # Export the reserved values BEFORE sourcing challenge data. The filter in
     # write_env_file already drops RCTF_* keys; this also means a challenge
     # `FLAGS_DIR=/x` cannot change where RCTF_FLAGS_DIR points.
@@ -233,7 +237,7 @@ run_service() {
       # shellcheck disable=SC1090
       . "$ENV_FILE"
     fi
-    exec "$SERVICE"
+    exec "$1"
   )
 }
 

@@ -427,6 +427,49 @@ printf 'NORMAL=%s\\n' "$NORMAL"
   })
 })
 
+describe('guest init: SERVICE is a legitimate challenge variable', () => {
+  test('a challenge env key named SERVICE does not change the executable init selected', async () => {
+    // Reproduced by review: init sourced the challenge env and THEN executed
+    // $SERVICE, so a challenge variable named SERVICE replaced the real service.
+    const root = await tempRoot('rctf-guest-svc-')
+    const binDir = await fakeJqDir(root)
+    const runRoot = path.join(root, 'rctf')
+    await mkdir(path.join(runRoot, 'flags'), { recursive: true, mode: 0o700 })
+    const service = path.join(root, 'real-service.sh')
+    await writeFile(
+      service,
+      `#!/bin/sh\nprintf 'REAL-SERVICE SERVICE_ENV=%s\\n' "$SERVICE"\n`,
+      { mode: 0o755 }
+    )
+    const metadata = JSON.stringify({
+      rctf: {
+        version: 1,
+        instanceId: 'i',
+        hostname: 'h',
+        env: { SERVICE: '/bin/false' },
+        flags: [],
+      },
+    })
+    const result = await runSh(
+      sourceInit(`
+        instance_id=i
+        hostname=h
+        write_env_file "$METADATA"
+        SERVICE=${shQuote(service)}
+        run_service
+      `),
+      {
+        PATH: `${binDir}:/usr/bin:/bin`,
+        RCTF_RUN_ROOT: runRoot,
+        METADATA: metadata,
+      }
+    )
+    expect(result.code).toBe(0)
+    // The selected executable ran, and SERVICE is still delivered as plain env.
+    expect(result.stdout).toContain('REAL-SERVICE SERVICE_ENV=/bin/false')
+  })
+})
+
 describe('guest build-rootfs', () => {
   test('never writes through a source symlink into the host', async () => {
     const root = await tempRoot('rctf-guest-build-')
