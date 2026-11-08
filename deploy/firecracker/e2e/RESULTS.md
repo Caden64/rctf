@@ -1,25 +1,32 @@
-# E2E results — 2026-11-08
+# E2E results — 2026-11-08 (strengthened assertions)
 
 Run of `deploy/firecracker/e2e/run.sh` on the reference development host. This is the first time the
 controller was run against the **real** agent and the rCTF provider against the **real** controller,
 with real Firecracker microVMs under KVM.
 
+The original run in this file passed 122 assertions. After the assertion-hardening review described
+under “Assertion hardening” below, the harness has **128 assertions**, and four consecutive full runs
+passed **128/128 with exit code 0** (run dirs `/run/user/1000/fce-ONipfv`, `fce-0j34YV`,
+`fce-z3hIB6`, `fce-vzFKJX`; ~120.8 s, ~121.1 s, ~120.7 s and ~120.9 s wall time).
+
 ## Environment
 
-|             |                                                                                                    |
-| ----------- | -------------------------------------------------------------------------------------------------- |
-| Date        | 2026-11-08 (America/Denver)                                                                        |
-| Kernel      | `7.2.14-arch1-1`                                                                                   |
-| Bun         | `1.4.4` (`/home/caden64/.local/bin/bun`)                                                           |
-| Artifacts   | `$HOME/.cache/rctf-fc-smoke` (read-only): Firecracker v1.17.0, kernel 6.1.155, smoke `rootfs.ext4` |
-| Namespace   | `unshare -Urn` (private user + network namespace), no root, no sudo                                |
-| Run dir     | `/run/user/1000/fce-LV2Syk` (`mktemp` under `$XDG_RUNTIME_DIR`)                                    |
-| cgroup root | (original run) the user's delegated cgroup2 subtree. **Re-run after fix d5c17f1c with the default `/sys/fs/cgroup` and no workaround: 122/122 passed.** |
-| Wall time   | 11:30:42 → 11:32:35 ≈ **113 s**                                                                    |
-| Exit code   | **0**                                                                                              |
+|             |                                                                                                           |
+| ----------- | --------------------------------------------------------------------------------------------------------- |
+| Date        | 2026-11-08 (America/Denver)                                                                               |
+| Kernel      | `7.2.14-arch1-1`                                                                                          |
+| Bun         | `1.4.4` (`/home/caden64/.local/bin/bun`)                                                                  |
+| Artifacts   | `$HOME/.cache/rctf-fc-smoke` (read-only): Firecracker v1.17.0, kernel 6.1.155, smoke `rootfs.ext4`        |
+| Namespace   | `unshare -Urn` (private user + network namespace), no root, no sudo                                       |
+| Run dirs    | `/run/user/1000/fce-ONipfv`, `fce-0j34YV`, `fce-z3hIB6`, `fce-vzFKJX` (`mktemp` under `$XDG_RUNTIME_DIR`) |
+| cgroup root | default `/sys/fs/cgroup` (the F1 workaround is gone; re-verified after fix d5c17f1c)                      |
+| Wall time   | ~120.8 s, ~121.1 s, ~120.7 s and ~120.9 s for the four consecutive runs                                   |
+| Exit code   | **0** for all four runs                                                                                   |
 
-A second, post-formatting verification run (`oxfmt` whitespace only) also passed **122/122** with exit
-0 (run dir `/run/user/1000/fce-y6kH6e`). The excerpts below are from the first run.
+The earlier post-formatting verification run (122/122) and the first run in this file were against the
+same product revision. Sections 1, 3 and Leftovers below are from the final strengthened run; the
+remaining excerpts are from the original 122-assertion run (their assertions are unchanged except
+where noted). The strengthened runs use the same flags and artifacts.
 
 Command:
 
@@ -29,7 +36,7 @@ export SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke
 deploy/firecracker/e2e/run.sh
 ```
 
-Header from the run:
+Header from the original run (the explicit cgroup-root line predates the F1 fix):
 
 ```
 e2e run dir: /run/user/1000/fce-LV2Syk
@@ -44,18 +51,20 @@ harness; only its length and SHA-256 appear in logs.
 
 ## Summary
 
+Latest strengthened run (four consecutive runs were identical):
+
 ```
-RESULT: 122 passed, 0 failed, 122 assertions
+RESULT: 128 passed, 0 failed, 128 assertions
 driver exit code: 0
 ```
 
 | Group                                   | Assertions | Failed |
 | --------------------------------------- | ---------: | -----: |
 | 10 auth                                 |         10 |      0 |
-| 1 lifecycle + flag                      |         18 |      0 |
+| 1 lifecycle + flag                      |         20 |      0 |
 | 2 idempotency / spec conflict           |          8 |      0 |
 | 6 capacity + concurrent creates         |         10 |      0 |
-| 3 expiry + extend race                  |          5 |      0 |
+| 3 expiry + extend race                  |          8 |      0 |
 | 4 controller restart (incl. mid-flight) |          8 |      0 |
 | 5 agent kill -9                         |          6 |      0 |
 | 8 orphan                                |          5 |      0 |
@@ -63,8 +72,13 @@ driver exit code: 0
 | 11 20 create/delete cycles              |         20 |      0 |
 | 12 host removal (extra)                 |          7 |      0 |
 | 7 ambiguous create (proxy)              |         13 |      0 |
-| L leftovers                             |          5 |      0 |
-| **total**                               |    **122** |  **0** |
+| L leftovers                             |          6 |      0 |
+| **total**                               |    **128** |  **0** |
+
+The original run had 122 assertions; the extra six are the new live probe calibration (`1.2a`),
+the run-wide Firecracker-process check (`1.13a`), the split extend/expiry race
+(`3.4a`, `3.4b`, `3.5a`) and the explicit pre-shutdown cleanup assertion (`L.6`). Existing
+assertions were also made stricter without changing their IDs (see “Assertion hardening”).
 
 ## Excerpts (verbatim from the run)
 
@@ -73,13 +87,15 @@ driver exit code: 0
 ```
 PASS [1.1] provider create returns instancerInstanceDetails -- {"kind":"instancerInstanceDetails","status":"starting","timeLeftMilliseconds":59917,"endpoints":[{"kind":"tcp","host":"10.200.0.1","port":20000,"title":"web"}]}
 PASS [1.2] get reports running with a positive time left -- {"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":58889,"endpoints":[{"kind":"tcp","host":"10.200.0.1","port":20000,"title":"web"}]}
+PASS [1.2a] probe calibration: the running lease has a visible tap and nft references its tap and guest IP -- taps=1 tap=fctap0 guestIp=10.200.0.2
 PASS [1.5] the flag reaches the guest byte-for-byte via MMDS -- len=33 sha256=67b2dd00dabad6eeda55c29ee45ca683f0de11b274896a532f2a87cd0b279289
-PASS [1.6] the flag appears nowhere in controller sqlite, agent state, logs or the guest disk image -- {"agent state":0,"agent traefik dir":0,"per-instance disk/run dir":0,"controller sqlite":0,"logs":0,"whole run tree (configs, driver output, everything)":0}
-PASS [1.7] the flag is absent from the firecracker process command line
+PASS [1.6] the flag appears nowhere in controller sqlite, agent state, logs or the guest disk image (and every scanned file was readable) -- {"agent state":0,"agent traefik dir":0,"per-instance disk/run dir":0,"per-instance rootfs.ext4 (explicit)":0,"per-instance vm-identity.json":0,"controller sqlite":0,"logs":0,"whole run tree (configs, driver output, everything)":0,"scannedFiles":26,"rootfs":"readable","identity":"readable","unreadable":[]}
+PASS [1.7] the flag is absent from the firecracker process command line -- pid=34117
 PASS [1.8] the agent persists only the flag provider name, never the value -- ["main"]
 PASS [1.9] extend succeeds and reports a deadline about ten minutes out -- {"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":599998,...}
 PASS [1.12] delete reports stopped through the provider -- {"kind":"instancerInstanceDetails","status":"stopped","timeLeftMilliseconds":0,"endpoints":null}
 PASS [1.13] firecracker process gone
+PASS [1.13a] no firecracker process for this run remains -- pids=none
 PASS [1.14] tap device removed
 PASS [1.15] per-instance run dir and agent state record removed
 PASS [1.17] no nft rule references the lease
@@ -87,7 +103,12 @@ PASS [1.18] the controller row is gone after a confirmed delete
 ```
 
 The `1.6` scan reads the **whole run tree** (controller SQLite + WAL, agent state and tombstones,
-Traefik dir, per-instance `rootfs.ext4`, all logs, generated configs, driver output) as raw bytes.
+Traefik dir, per-instance `rootfs.ext4` and `vm-identity.json`, all logs, generated configs, driver
+output) as raw bytes. It also stats and opens the per-instance `rootfs.ext4` and
+`vm-identity.json` explicitly and fails if either is missing or unreadable;
+`scanFilesContaining` reports unreadable files instead of skipping them. `1.2a` is the live
+calibration: the tap/nft probes are only trusted after seeing this lease's tap, tap name and guest
+IP while the VM is running.
 
 ### 2. Idempotency and a real spec conflict
 
@@ -108,9 +129,17 @@ there (`2.6`). Both were verified with real VMs and no duplicate process/tap.
 ```
 PASS [3.2] the reaper destroyed the real VM and released the row on time -- {"process":true,"stateFile":true,"runDir":true,"tap":true,"nft":true,"agent":true,"all":true}
 PASS [3.3] provider get reports stopped after expiry -- {"kind":"instancerInstanceDetails","status":"stopped","timeLeftMilliseconds":0,"endpoints":null}
-PASS [3.4] race 1: extend won and the VM survived the original deadline -- extend={"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":599997,...} get={"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":595494,...}
+PASS [3.4a] race 1: the extend is issued early, with margin before the original deadline -- issuedAt=1794164521739 originDeadline=1794164527738 marginMs=5999
+PASS [3.4b] race 1: the early extend is accepted and reports running -- {"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":599999,...}
+PASS [3.4] race 1: the early extend kept the VM alive past the original deadline -- extend={"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":599999,...} get={"kind":"instancerInstanceDetails","status":"running","timeLeftMilliseconds":591499,...} now=1794164530244 originDeadline=1794164527738
+PASS [3.5a] race 2: the extend is genuinely issued after the lease deadline -- issuedAt=1794164537609 deadline=1794164536107
 PASS [3.5] race 2: an extend after the deadline is rejected and the real VM is gone -- extend={"kind":"instancerError","message":"instance is no longer extendable"} gone={"process":true,"stateFile":true,"runDir":true,"tap":true,"nft":true,"agent":true,"all":true} get={"kind":"instancerInstanceDetails","status":"stopped",...}
 ```
+
+Race 1 is no longer an “either outcome” test: the extend is issued six seconds before the original
+deadline and **must** be accepted; the VM, process, tap and guest must then survive two and a half
+seconds past that deadline. Race 2 is separate and waits until the lease deadline has actually
+passed before extending.
 
 ### 4. Controller restart, including `SIGKILL` mid-create
 
@@ -258,11 +287,15 @@ run dirs: none
 agent state files: none
 nft per-lease rules: none
 PASS [L.1] no harness process was left behind
-PASS [L.2] no tap device was left behind
+PASS [L.2] no tap device was left behind (probe must not fail)
 PASS [L.3] no per-instance run dir was left behind
 PASS [L.4] no per-instance agent state record was left behind
-PASS [L.5] no per-lease nftables rule was left behind
+PASS [L.5] no per-lease nftables rule was left behind (probe must not fail)
+PASS [L.6] pre-shutdown instance cleanup completed without swallowed errors -- cleanupFailures=0
 ```
+
+`L.2` and `L.5` now fail if the probe itself fails, not just if a tap/rule is present; `L.6`
+makes any swallowed `cleanupAllInstances` error visible and fails the run.
 
 Final controller SQLite after the run (read with `sqlite3`):
 
@@ -283,6 +316,59 @@ table arp rctf_fc_arp
 ```
 
 (The two empty tables are the agent's base chains; no per-lease rules remain.)
+
+## Assertion hardening (2026-11-08)
+
+The original harness had several assertions that could pass when the observation itself failed.
+After the review, the following changes were made and re-verified with four consecutive full runs
+(128/128, exit 0):
+
+1. **Strict absence probes.** `probes.ts` replaces the old `tapsInNetns`/`nftText`. `tapsInNetns`
+   throws on a non-zero `ip` exit. `nftText` throws on a non-zero `nft` exit **and** when either
+   base table (`inet rctf_fc`, `arp rctf_fc_arp`) is missing. `pidsMatching` distinguishes
+   “pgrep found nothing” (exit 1) from “pgrep failed” (other non-zero) and throws on the latter.
+   Every run also calibrates live: `1.2a` requires the running lease's tap to be listed and the
+   nft text to reference both its tap name and guest IP; each of the 20 cycles calibrates again
+   before deleting and then asserts absence. The orphan case (`8.2`, `8.5`) does the same.
+2. **Identity is mandatory.** `requireIdentity` throws if an agent record has no `vm.pid`, no
+   `lease.tapName` or no `lease.guestIp` after `running`. `probeTeardown` no longer accepts
+   `undefined`, and all `pid === undefined ? true` branches are gone. `1.13a` additionally
+   asserts that no Firecracker process for the run remains.
+3. **The extend/expiry race is no longer “either outcome”.** `3.4a`/`3.4b` require the extend
+   issued six seconds before the deadline to be accepted; `3.4` then requires the process, guest
+   and provider state to survive 2.5 s past the original deadline. The separate `3.5a`/`3.5`
+   waits until the deadline has actually passed, then requires rejection and full teardown.
+   Four consecutive runs passed with ~6 s of margin each time.
+4. **Agent-down is a failure.** `agentList` now throws on any non-200 (or a non-array body)
+   instead of returning `[]`. `9.7` requires zero agent instances, controller rows, Firecracker
+   processes, taps and run dirs, with the agent demonstrably up.
+5. **The flag scan is not allowed to skip files.** `scanFilesContaining` returns `hits`,
+   `unreadable` and `scanned`; `1.6` fails if anything is unreadable. It explicitly stats and
+   opens the per-instance `rootfs.ext4` and `vm-identity.json` (and still scans the whole run
+   tree, which covers any MMDS/vsock/config sidecar the agent writes there).
+6. **Safe cleanup.** `inner.sh` no longer does `pgrep -f "$RUN"` + `kill -9` on everything that
+   matches. It records the PIDs the driver started under `$RUN/pids/`, reads Firecracker PIDs from
+   agent state, and only kills a PID when it is same-uid, its `argv[0]` is one of the known
+   binaries (`bun`/`bun.exe`/`firecracker`) and its argv contains this run's unique directory.
+   Unmatched PIDs are left alone.
+7. **Soft failures are visible.** `cleanupAllInstances` logs and counts every failed DELETE or
+   thrown cleanup (`L.6` fails the run); `Report.group` prints the full exception/stack and records
+   a failure, so an aborted scenario exits non-zero and cannot silently reduce the assertion count.
+
+Mutation sanity: `deploy/firecracker/e2e/selftest.sh` runs `selftest.ts` in a tap-free
+`unshare -Urn`. It verifies the tap probe throws on a failing `ip`, the nft probe throws on a
+failing `nft` and on missing tables, calibration fails with zero taps, the real `ip` probe sees a
+tap-free netns, and calibration passes for a visible lease. All checks pass:
+
+```
+PASS selftest: tap probe rejects a non-zero ip exit
+PASS selftest: nft probe rejects a non-zero nft exit
+PASS selftest: nft probe rejects missing base tables
+PASS selftest: calibration fails with zero taps
+PASS selftest: real ip probe succeeds in the tap-free selftest netns (0 taps)
+PASS selftest: calibration passes when the lease tap and IP are visible
+selftest: all mutation checks passed
+```
 
 ## Product finding
 

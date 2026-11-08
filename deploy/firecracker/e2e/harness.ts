@@ -5,8 +5,10 @@
  */
 import { Database } from 'bun:sqlite'
 import {
+  accessSync,
   appendFileSync,
   closeSync,
+  constants,
   existsSync,
   openSync,
   readFileSync,
@@ -94,6 +96,16 @@ export class Report {
     try {
       await fn()
     } catch (error) {
+      // A group must never disappear into a log line: print the full exception
+      // and record a failure so the driver's exit code is non-zero. Otherwise a
+      // crashing scenario would silently reduce the assertion count.
+      this.line(
+        `\n!! group ${id} aborted: ${
+          error instanceof Error
+            ? (error.stack ?? error.message)
+            : String(error)
+        }`
+      )
       this.fail(id, `${title} (group aborted)`, errorMessage(error))
     }
   }
@@ -263,21 +275,68 @@ export const walkFiles = (root: string): string[] => {
   return files
 }
 
-/** Files under `root` whose bytes contain `needle`. */
-export const filesContaining = (root: string, needle: string): string[] => {
-  if (!existsSync(root)) return []
+export interface FileScan {
+  /** Files whose bytes contain the needle. */
+  hits: string[]
+  /** Files that could not be read (a vacuous "no hits" is not acceptable). */
+  unreadable: string[]
+  /** Number of files actually read. */
+  scanned: number
+}
+
+/**
+ * Scan one or more files/directories for `needle`, reporting unreadable files
+ * instead of silently skipping them. Callers must treat `unreadable` as a
+ * failure: otherwise a permission error makes "the flag is absent" vacuous.
+ */
+export const scanFilesContaining = (
+  roots: readonly string[],
+  needle: string
+): FileScan => {
   const bytes = Buffer.from(needle, 'utf8')
+  const files: string[] = []
+  for (const root of roots) {
+    try {
+      const stat = statSync(root)
+      if (stat.isFile()) {
+        files.push(root)
+      } else if (stat.isDirectory()) {
+        files.push(...walkFiles(root))
+      }
+    } catch {
+      // A missing root is reported by the caller's own existence assertions;
+      // it is not an unreadable file.
+    }
+  }
   const hits: string[] = []
-  for (const file of walkFiles(root)) {
+  const unreadable: string[] = []
+  let scanned = 0
+  for (const file of files) {
     let content: Buffer
     try {
       content = readFileSync(file)
+      scanned += 1
     } catch {
+      unreadable.push(file)
       continue
     }
     if (content.indexOf(bytes) !== -1) hits.push(file)
   }
-  return hits
+  return { hits, unreadable, scanned }
+}
+
+/** True when `file` is a regular file this process can actually read. */
+export const readableFile = (
+  file: string
+): { ok: boolean; reason?: string } => {
+  try {
+    const stat = statSync(file)
+    if (!stat.isFile()) return { ok: false, reason: 'not a regular file' }
+    accessSync(file, constants.R_OK)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, reason: errorMessage(error) }
+  }
 }
 
 export const readProcCmdline = (pid: number): string => {
@@ -409,7 +468,14 @@ export const shell = (argv: string[], timeoutMs = 15_000): ShellResult => {
 /** PIDs whose full argv contains `needle` (our unique run dir). */
 export const pidsMatching = (needle: string): number[] => {
   const result = shell(['pgrep', '-f', '--', needle])
-  if (result.code !== 0) return []
+  // pgrep: 0 = matched, 1 = no match, anything else = the probe itself failed.
+  // Returning [] for a failed probe would make every absence assertion vacuous.
+  if (result.code === 1) return []
+  if (result.code !== 0) {
+    throw new Error(
+      `pgrep -f failed (${result.code}): ${result.stderr.trim() || 'no output'}`
+    )
+  }
   return result.stdout
     .split('\n')
     .map(line => Number(line.trim()))
