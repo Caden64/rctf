@@ -667,6 +667,19 @@ class NetworkManagerImpl implements NetworkManager {
       // Freed resources enter the reuse quarantine (conntrack just flushed).
       this.ipam.release(state.index, expiresAt)
       this.ports?.release(Object.values(lease.publicPorts), expiresAt)
+      // The fence only matters while the lease is being torn down. Now that the
+      // tap is gone and conntrack is flushed, re-render WITHOUT the retired
+      // lease so its blocking rules do not accumulate in the ruleset forever
+      // (found by the real smoke run). Best effort: the lease is already fully
+      // released, and the next render of any lease rebuilds the whole table.
+      try {
+        await this.renderAndApply()
+      } catch (error) {
+        this.logger?.warn(
+          { err: error, instanceId },
+          'could not drop the retired lease from the ruleset; the next render will'
+        )
+      }
     })
   }
 

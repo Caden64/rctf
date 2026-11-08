@@ -538,13 +538,12 @@ describe('publish / unpublish / release', () => {
     await manager.release(lease.instanceId)
 
     expect(host.links.size).toBe(0)
-    // The applied ruleset keeps the retiring lease fenced (explicit drops),
-    // but no public ingress and no accept for it survive.
-    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
-    expect(host.nftText).toContain(`ip saddr ${lease.guestIp} drop`)
-    expect(host.nftText).not.toContain(
-      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
-    )
+    // Once release has completed the retired lease must be gone from the ruleset
+    // entirely: its fence is only needed while it is being torn down (the order
+    // test above proves the fence IS applied first). Leaving it would leak
+    // blocking rules for every released lease (seen in the real smoke run).
+    expect(host.nftText).not.toContain(lease.tapName)
+    expect(host.nftText).not.toContain(lease.guestIp)
     expect(host.nftText).not.toContain('dnat')
     expect(await listDir(config.traefikDynamicDir)).toEqual([])
     const commands = commandsOf(host)
@@ -715,7 +714,8 @@ describe('publish / unpublish / release', () => {
       host.failDeleteTap = undefined
       await manager.release(lease.instanceId)
       expect(host.links.has(lease.tapName)).toBe(false)
-      expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+      // The completed release drops the retired lease from the ruleset.
+      expect(host.nftText).not.toContain(lease.tapName)
     }
   })
 
@@ -806,10 +806,8 @@ describe('publish / unpublish / release', () => {
 
     host.conntrackFlushError = undefined
     await manager.release(lease.instanceId)
-    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
-    expect(host.nftText).not.toContain(
-      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
-    )
+    expect(host.nftText).not.toContain(lease.tapName)
+    expect(host.nftText).not.toContain(lease.guestIp)
   })
 
   test('"no conntrack entries" is a successful flush', async () => {

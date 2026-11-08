@@ -31,6 +31,7 @@ network:
   externalInterface: dummy0
   traefikDynamicDir: $RUN/traefik
   requireConntrack: false      # conntrack-tools usually isn't installed unprivileged
+  quarantineFile: $RUN/net-quarantine.json
 YAML
 echo "run dir: $RUN"
 exec timeout 290 unshare -Urn bash "$HERE/inner.sh"
