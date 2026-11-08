@@ -256,7 +256,11 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
       return mismatch
     }
 
-    return instanceDetailsSchema.parse(parsed.data)
+    const details = instanceDetailsSchema.safeParse(parsed.data)
+    if (!details.success) {
+      return this.error(INVALID_RESPONSE_MESSAGE)
+    }
+    return details.data
   }
 
   createInstance = async (

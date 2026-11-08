@@ -4,9 +4,9 @@ import { createHash, timingSafeEqual } from 'node:crypto'
  * Constant-time bearer token helpers for the Firecracker controller.
  *
  * Both sides are hashed with SHA-256 first so `timingSafeEqual` always compares
- * fixed-length buffers (it throws on different lengths). Hashing a
- * variable-length input also keeps the comparison time independent of the
- * length of the presented token.
+ * fixed-length buffers (it throws on different lengths), so the comparison
+ * itself does not depend on where the tokens differ. Hashing time still scales
+ * with the length of the presented token, which does not reveal the secret.
  */
 
 export const hashToken = (token: string): Buffer =>
