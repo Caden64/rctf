@@ -1,0 +1,152 @@
+#!/bin/sh
+# Build a Firecracker rootfs.ext4 without root (uses mkfs.ext4 -d).
+#
+# Usage:
+#   build-rootfs.sh --image <docker-or-oci-ref> [options]
+#   build-rootfs.sh --dir <existing-rootfs-dir> [options]
+#
+# Options:
+#   --out <file>    output image (default: rootfs.ext4)
+#   --size <size>   image size passed to truncate (default: 512M)
+#   --init <file>   init to install as /sbin/init (default: ./init next to this script)
+#   --jq <file>     copy this jq binary to /usr/bin/jq in the image
+#   --no-init       do not install an init
+#
+# Requirements (all unprivileged): a container engine for --image (docker or
+# podman), tar, truncate and e2fsprogs >= 1.47 (mkfs.ext4 -d). No loop mount,
+# no chroot, no root.
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+source_image=
+source_dir=
+out=rootfs.ext4
+size=512M
+init_file=$script_dir/init
+jq_file=
+install_init=1
+
+usage() {
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+  printf 'build-rootfs: %s\n' "$*" >&2
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --image)
+      [ $# -ge 2 ] || die "--image needs a value"
+      source_image=$2
+      shift 2
+      ;;
+    --dir)
+      [ $# -ge 2 ] || die "--dir needs a value"
+      source_dir=$2
+      shift 2
+      ;;
+    --out)
+      [ $# -ge 2 ] || die "--out needs a value"
+      out=$2
+      shift 2
+      ;;
+    --size)
+      [ $# -ge 2 ] || die "--size needs a value"
+      size=$2
+      shift 2
+      ;;
+    --init)
+      [ $# -ge 2 ] || die "--init needs a value"
+      init_file=$2
+      shift 2
+      ;;
+    --jq)
+      [ $# -ge 2 ] || die "--jq needs a value"
+      jq_file=$2
+      shift 2
+      ;;
+    --no-init)
+      install_init=0
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1 (try --help)"
+      ;;
+  esac
+done
+
+if [ -n "$source_image" ] && [ -n "$source_dir" ]; then
+  die "use either --image or --dir, not both"
+fi
+if [ -z "$source_image" ] && [ -z "$source_dir" ]; then
+  die "one of --image or --dir is required (try --help)"
+fi
+
+command -v mkfs.ext4 >/dev/null 2>&1 ||
+  die "mkfs.ext4 not found (install e2fsprogs)"
+command -v truncate >/dev/null 2>&1 || die "truncate not found (coreutils)"
+mkfs.ext4 -h 2>&1 | grep -q -- '-d' ||
+  die "this mkfs.ext4 lacks -d; e2fsprogs >= 1.47 is required"
+
+root=$(mktemp -d "${TMPDIR:-/tmp}/rctf-rootfs.XXXXXX")
+container=
+
+cleanup() {
+  if [ -n "$container" ]; then
+    "$runtime" rm -f "$container" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$root"
+}
+trap cleanup EXIT INT TERM
+
+if [ -n "$source_image" ]; then
+  runtime=
+  if command -v docker >/dev/null 2>&1; then
+    runtime=docker
+  elif command -v podman >/dev/null 2>&1; then
+    runtime=podman
+  else
+    die "--image requires docker or podman"
+  fi
+  container=$("$runtime" create "$source_image" /bin/true) ||
+    die "could not create a container from $source_image"
+  # `export` reads the container filesystem without mounting it and needs no
+  # root when the user can talk to the container engine.
+  "$runtime" export "$container" | tar -x -C "$root" -f - ||
+    die "could not export $source_image"
+else
+  [ -d "$source_dir" ] || die "--dir is not a directory: $source_dir"
+  # -a keeps modes/symlinks; we own the copied files.
+  cp -a "$source_dir/." "$root/" || die "could not copy $source_dir"
+fi
+
+mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/run" "$root/tmp" \
+  "$root/etc" "$root/sbin"
+
+if [ "$install_init" = 1 ]; then
+  [ -f "$init_file" ] || die "init not found: $init_file"
+  install -m 0755 "$init_file" "$root/sbin/init" ||
+    die "could not install init"
+fi
+
+if [ -n "$jq_file" ]; then
+  [ -f "$jq_file" ] || die "jq binary not found: $jq_file"
+  mkdir -p "$root/usr/bin"
+  install -m 0755 "$jq_file" "$root/usr/bin/jq" ||
+    die "could not install jq"
+fi
+
+# Old image files would make mkfs.ext4 refuse to overwrite.
+rm -f "$out"
+truncate -s "$size" "$out" || die "could not create $out"
+mkfs.ext4 -F -L rctf-rootfs -d "$root" "$out" ||
+  die "mkfs.ext4 failed"
+
+printf 'build-rootfs: wrote %s (%s) from %s\n' \
+  "$out" "$size" "${source_image:-$source_dir}"
