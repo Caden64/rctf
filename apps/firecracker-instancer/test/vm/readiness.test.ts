@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { createServer, type AddressInfo, type Server } from 'node:net'
+import {
+  createServer,
+  type AddressInfo,
+  type Server,
+  type Socket,
+} from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import type { VmHandle } from '../../src/interfaces'
@@ -49,6 +54,23 @@ const listenTcp = async (): Promise<number> => {
   cleanup.push(
     () =>
       new Promise<void>(resolve => {
+        server.close(() => resolve())
+      })
+  )
+  return (server.address() as AddressInfo).port
+}
+
+const listenSilent = async (): Promise<number> => {
+  const sockets = new Set<Socket>()
+  const server: Server = createServer(socket => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  cleanup.push(
+    () =>
+      new Promise<void>(resolve => {
+        for (const socket of sockets) socket.destroy()
         server.close(() => resolve())
       })
   )
@@ -208,5 +230,75 @@ describe('waitReady', () => {
         timeoutMs: 0,
       })
     ).rejects.toThrow(/not running/)
+  })
+
+  test('rejects when the VM dies immediately after a successful probe', async () => {
+    const { root, driver } = await makeDriver()
+    const live = await withLive(root)
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: async () => {
+        live.kill()
+        await Bun.sleep(100)
+        return new Response(null, { status: 200 })
+      },
+    })
+    cleanup.push(() => server.stop(true))
+    await expect(
+      driver.waitReady(live.handle, {
+        readiness: { kind: 'http', port: server.port ?? 1, path: '/' },
+        guestIp: '127.0.0.1',
+        timeoutMs: 5000,
+      })
+    ).rejects.toThrow(/exited before readiness/)
+  })
+
+  test('rejects when the caller aborts immediately after a successful probe', async () => {
+    const { root, driver } = await makeDriver()
+    const live = await withLive(root)
+    const controller = new AbortController()
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch: async () => {
+        controller.abort()
+        await Bun.sleep(20)
+        return new Response(null, { status: 200 })
+      },
+    })
+    cleanup.push(() => server.stop(true))
+    await expect(
+      driver.waitReady(
+        live.handle,
+        {
+          readiness: { kind: 'http', port: server.port ?? 1, path: '/' },
+          guestIp: '127.0.0.1',
+          timeoutMs: 5000,
+        },
+        controller.signal
+      )
+    ).rejects.toHaveProperty('name', 'AbortError')
+  })
+
+  test('cancels an in-flight HTTP probe promptly', async () => {
+    const { root, driver } = await makeDriver()
+    const live = await withLive(root)
+    const port = await listenSilent()
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const started = Date.now()
+    await expect(
+      driver.waitReady(
+        live.handle,
+        {
+          readiness: { kind: 'http', port, path: '/', expectStatus: 200 },
+          guestIp: '127.0.0.1',
+          timeoutMs: 5000,
+        },
+        controller.signal
+      )
+    ).rejects.toHaveProperty('name', 'AbortError')
+    expect(Date.now() - started).toBeLessThan(1000)
   })
 })

@@ -8,13 +8,18 @@
 # Options:
 #   --out <file>    output image (default: rootfs.ext4)
 #   --size <size>   image size passed to truncate (default: 512M)
-#   --init <file>   init to install as /sbin/init (default: ./init next to this script)
-#   --jq <file>     copy this jq binary to /usr/bin/jq in the image
+#   --init <file>   init to install as /rctf/init (default: ./init next to this script)
+#   --jq <file>     copy this jq binary to /rctf/jq in the image
 #   --no-init       do not install an init
 #
 # Requirements (all unprivileged): a container engine for --image (docker or
-# podman), tar, truncate and e2fsprogs >= 1.47 (mkfs.ext4 -d). No loop mount,
-# no chroot, no root.
+# podman), tar, truncate, realpath and e2fsprogs >= 1.47 (mkfs.ext4 -d). No loop
+# mount, no chroot, no root.
+#
+# SECURITY: only run this builder as root on sources you fully trust. It
+# extracts/copies a source tree and only ever writes the fixed set of staging
+# paths below, but a root-run build gives a malicious source tar every chance
+# to attack the host through the tools it invokes.
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -27,7 +32,7 @@ jq_file=
 install_init=1
 
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^# Requirements:/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -91,11 +96,13 @@ fi
 command -v mkfs.ext4 >/dev/null 2>&1 ||
   die "mkfs.ext4 not found (install e2fsprogs)"
 command -v truncate >/dev/null 2>&1 || die "truncate not found (coreutils)"
+command -v realpath >/dev/null 2>&1 || die "realpath not found (coreutils)"
 mkfs.ext4 -h 2>&1 | grep -q -- '-d' ||
   die "this mkfs.ext4 lacks -d; e2fsprogs >= 1.47 is required"
 
 root=$(mktemp -d "${TMPDIR:-/tmp}/rctf-rootfs.XXXXXX")
 container=
+real_root=
 
 cleanup() {
   if [ -n "$container" ]; then
@@ -126,20 +133,67 @@ else
   cp -a "$source_dir/." "$root/" || die "could not copy $source_dir"
 fi
 
+real_root=$(realpath "$root") || die "could not resolve staging root"
+[ -d "$real_root" ] || die "staging root is not a directory: $real_root"
+
 mkdir -p "$root/proc" "$root/sys" "$root/dev" "$root/run" "$root/tmp" \
-  "$root/etc" "$root/sbin"
+  "$root/etc"
+
+# Install files only under a freshly created real /rctf directory. The source
+# tree may contain /rctf or /sbin as symlinks to the host; remove a link
+# without ever following it, then recreate the directory ourselves.
+prepare_rctf_dir() {
+  if [ -L "$root/rctf" ]; then
+    rm -f "$root/rctf" || die "could not remove symlinked /rctf"
+  elif [ -e "$root/rctf" ]; then
+    rm -rf "$root/rctf" || die "could not remove source /rctf"
+  fi
+  mkdir -p "$root/rctf" || die "could not create /rctf"
+  [ -d "$root/rctf" ] && [ ! -L "$root/rctf" ] ||
+    die "/rctf is not a real directory"
+  rctf_real=$(realpath "$root/rctf") || die "could not resolve /rctf"
+  case "$rctf_real" in
+    "$real_root"/*) ;;
+    *) die "/rctf resolves outside the staging root: $rctf_real" ;;
+  esac
+}
+
+# install_into_staging <source> <destination> <mode>
+# Every write is checked against the staging root and refuses symlink targets.
+install_into_staging() {
+  src=$1
+  dest=$2
+  mode=$3
+  [ -f "$src" ] || die "file not found: $src"
+  dest_dir=$(dirname "$dest")
+  [ -d "$dest_dir" ] && [ ! -L "$dest_dir" ] ||
+    die "destination directory is missing or a symlink: $dest_dir"
+  dest_real=$(realpath "$dest_dir") || die "could not resolve $dest_dir"
+  case "$dest_real" in
+    "$real_root"/*) ;;
+    *) die "destination escapes the staging root: $dest_real" ;;
+  esac
+  if [ -L "$dest" ]; then
+    die "refusing to write through a symlink: $dest"
+  fi
+  install -m "$mode" "$src" "$dest" || die "could not install $dest"
+  written_real=$(realpath "$dest") || die "could not resolve $dest"
+  case "$written_real" in
+    "$real_root"/*) ;;
+    *) die "written file escapes the staging root: $written_real" ;;
+  esac
+}
+
+if [ "$install_init" = 1 ] || [ -n "$jq_file" ]; then
+  prepare_rctf_dir
+fi
 
 if [ "$install_init" = 1 ]; then
-  [ -f "$init_file" ] || die "init not found: $init_file"
-  install -m 0755 "$init_file" "$root/sbin/init" ||
-    die "could not install init"
+  install_into_staging "$init_file" "$root/rctf/init" 0755
 fi
 
 if [ -n "$jq_file" ]; then
-  [ -f "$jq_file" ] || die "jq binary not found: $jq_file"
-  mkdir -p "$root/usr/bin"
-  install -m 0755 "$jq_file" "$root/usr/bin/jq" ||
-    die "could not install jq"
+  install_into_staging "$jq_file" "$root/rctf/jq" 0755
 fi
 
 # Old image files would make mkfs.ext4 refuse to overwrite.

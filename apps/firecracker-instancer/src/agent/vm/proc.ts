@@ -1,4 +1,5 @@
-import { readdir, readFile } from 'node:fs/promises'
+import { readFile, readdir, readlink } from 'node:fs/promises'
+import path from 'node:path'
 import { INSTANCE_ID_REGEX } from '@rctf/firecracker-protocol'
 
 export const PROC_ROOT = '/proc'
@@ -40,41 +41,103 @@ export const readCmdline = async (
   }
 }
 
-/** True when the process still exists and is the one we captured (pid-reuse safe). */
-export const processMatches = async (
-  pid: number,
-  startTicks: number
-): Promise<boolean> => (await readStartTicks(pid)) === startTicks
+/**
+ * `/proc/<pid>/exe` target, or undefined. A chrooted process (jailer) can show
+ * a path relative to its own root; a process whose binary was replaced shows a
+ * trailing ` (deleted)`. Both are handled by `exeBasenameMatches`.
+ */
+export const readExe = async (pid: number): Promise<string | undefined> => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined
+  try {
+    return await readlink(`${PROC_ROOT}/${pid}/exe`)
+  } catch {
+    return undefined
+  }
+}
 
-export const pidExists = async (pid: number): Promise<boolean> =>
-  (await readStartTicks(pid)) !== undefined
+const stripDeletedSuffix = (target: string): string =>
+  target.endsWith(' (deleted)') ? target.slice(0, -' (deleted)'.length) : target
 
-/** True when two cmdlines describe Firecracker (or its jailer) for `instanceId`. */
-export const cmdlineMatchesInstance = (
+/**
+ * True when the executable really is the canonical binary we launched.
+ *
+ * The jailer copies/execs the resolved `--exec-file` inside the chroot, so the
+ * name we compare is always the realpath basename (not the possibly-symlinked
+ * configured path). Accepting only the basename is deliberate: the host-visible
+ * `/proc/<pid>/exe` may be the chroot-relative `/firecracker-x.y.z`.
+ */
+export const exeBasenameMatches = (
+  exe: string,
+  basenames: ReadonlySet<string>
+): boolean => basenames.has(path.basename(stripDeletedSuffix(exe)))
+
+/** True when `argv` contains the structured pair `--id`, `<instanceId>` (adjacent). */
+export const hasInstanceIdArg = (
   argv: readonly string[],
   instanceId: string
 ): boolean => {
-  if (argv.length === 0) return false
-  const joined = argv.join(' ').toLowerCase()
-  if (!joined.includes('firecracker')) return false
-  // Firecracker itself is started as `--id <id>`; the jailer forwards
-  // `--id=<id>`.
-  return argv.includes(instanceId) || argv.includes(`--id=${instanceId}`)
+  for (let i = 0; i + 1 < argv.length; i += 1) {
+    if (argv[i] === '--id' && argv[i + 1] === instanceId) return true
+  }
+  return false
 }
 
-/** The jailer wrapper (as opposed to the Firecracker process it execs). */
-export const isJailerCmdline = (argv: readonly string[]): boolean =>
-  argv.includes('--exec-file')
+export interface ProcessIdentity {
+  pid: number
+  startTicks: number
+  exe: string
+  argv: string[]
+}
+
+/**
+ * One verified scan of a process: start ticks, executable and argv are read
+ * together and the ticks are re-read afterwards so a recycled pid cannot slip
+ * through. Undefined unless the executable basename is canonical AND the
+ * structured `--id <instanceId>` pair is present.
+ */
+export const inspectProcess = async (
+  pid: number,
+  exeBasenames: ReadonlySet<string>,
+  instanceId: string
+): Promise<ProcessIdentity | undefined> => {
+  const startTicks = await readStartTicks(pid)
+  if (startTicks === undefined) return undefined
+  const exe = await readExe(pid)
+  if (exe === undefined || !exeBasenameMatches(exe, exeBasenames)) {
+    return undefined
+  }
+  const argv = await readCmdline(pid)
+  if (argv === undefined || !hasInstanceIdArg(argv, instanceId)) {
+    return undefined
+  }
+  if ((await readStartTicks(pid)) !== startTicks) return undefined
+  return { pid, startTicks, exe, argv }
+}
+
+/** True when the live process is still exactly the one identified by pid+ticks. */
+export const processMatchesIdentity = async (
+  pid: number,
+  startTicks: number,
+  exeBasenames: ReadonlySet<string>,
+  instanceId: string
+): Promise<boolean> => {
+  const found = await inspectProcess(pid, exeBasenames, instanceId)
+  return found !== undefined && found.startTicks === startTicks
+}
 
 export interface FoundProcess {
   pid: number
   startTicks: number
-  jailer: boolean
 }
 
-/** All live processes whose cmdline is Firecracker (or its jailer) for `instanceId`. */
+/**
+ * All live processes that pass the strict identity check for `instanceId`.
+ * A process merely mentioning "firecracker" and the id (e.g.
+ * `python3 /opt/firecracker-maintenance.py <id>`) never matches.
+ */
 export const findInstanceProcesses = async (
-  instanceId: string
+  instanceId: string,
+  exeBasenames: ReadonlySet<string>
 ): Promise<FoundProcess[]> => {
   let entries: string[]
   try {
@@ -85,21 +148,25 @@ export const findInstanceProcesses = async (
   const found: FoundProcess[] = []
   for (const entry of entries) {
     if (!/^[1-9][0-9]*$/.test(entry)) continue
-    const pid = Number(entry)
-    const argv = await readCmdline(pid)
-    if (!argv || !cmdlineMatchesInstance(argv, instanceId)) continue
-    const startTicks = await readStartTicks(pid)
-    if (startTicks === undefined) continue
-    found.push({ pid, startTicks, jailer: isJailerCmdline(argv) })
+    const identity = await inspectProcess(
+      Number(entry),
+      exeBasenames,
+      instanceId
+    )
+    if (identity === undefined) continue
+    found.push({ pid: identity.pid, startTicks: identity.startTicks })
   }
   return found
 }
 
 /**
- * Instance ids parsed from running Firecracker processes (`--id <id>`), for
- * orphan cleanup. Unknown ids are included; malformed ones are ignored.
+ * Instance ids parsed from running processes that pass the strict executable
+ * check and carry `--id <id>` as adjacent argv elements. Unknown ids are
+ * included; malformed ones are ignored.
  */
-export const listProcessInstanceIds = async (): Promise<string[]> => {
+export const listProcessInstanceIds = async (
+  exeBasenames: ReadonlySet<string>
+): Promise<string[]> => {
   let entries: string[]
   try {
     entries = await readdir(PROC_ROOT)
@@ -109,19 +176,14 @@ export const listProcessInstanceIds = async (): Promise<string[]> => {
   const ids = new Set<string>()
   for (const entry of entries) {
     if (!/^[1-9][0-9]*$/.test(entry)) continue
-    const argv = await readCmdline(Number(entry))
-    if (!argv) continue
-    const joined = argv.join(' ').toLowerCase()
-    if (!joined.includes('firecracker')) continue
-    for (let i = 0; i < argv.length; i++) {
-      const arg = argv[i]
-      if (arg === undefined) continue
-      const candidate =
-        arg === '--id'
-          ? argv[i + 1]
-          : arg.startsWith('--id=')
-            ? arg.slice('--id='.length)
-            : undefined
+    const pid = Number(entry)
+    const exe = await readExe(pid)
+    if (exe === undefined || !exeBasenameMatches(exe, exeBasenames)) continue
+    const argv = await readCmdline(pid)
+    if (argv === undefined) continue
+    for (let i = 0; i + 1 < argv.length; i += 1) {
+      if (argv[i] !== '--id') continue
+      const candidate = argv[i + 1]
       if (candidate !== undefined && INSTANCE_ID_REGEX.test(candidate)) {
         ids.add(candidate)
       }

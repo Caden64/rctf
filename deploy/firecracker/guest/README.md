@@ -21,11 +21,14 @@ The host-side driver lives in `apps/firecracker-instancer/src/agent/vm`.
     initrd         # optional initramfs
 ```
 
-`imagesDir` and every image directory must not be world-writable. Image names
-must match `^[a-z0-9][a-z0-9._-]{0,62}$`, all files are resolved with
-`realpath`, and both the directory and each file must stay below
-`realpath(imagesDir)`; symlink escapes are rejected. The base image is read
-only: each instance gets a reflink/copy at `<runDir>/<instanceId>/rootfs.ext4`
+`imagesDir`, every image directory and their non-sticky ancestors must not be
+group/world-writable, and must be owned by root or the agent uid. `vmlinux` and
+`rootfs.ext4` must be regular files and must not be group/other-writable
+(preflight check `imagesTrusted`; `allowUntrustedImages` is a development-only
+escape hatch). Image names must match `^[a-z0-9][a-z0-9._-]{0,62}$`, all files
+are resolved with `realpath`, and both the directory and each file must stay
+below `realpath(imagesDir)`; symlink escapes are rejected. The base image is
+read only: each instance gets a reflink/copy at `<runDir>/<instanceId>/rootfs.ext4`
 (mode 0600) and Firecracker opens only that copy read-write.
 
 ## Boot contract
@@ -33,8 +36,12 @@ only: each instance gets a reflink/copy at `<runDir>/<instanceId>/rootfs.ext4`
 The kernel command line is exactly:
 
 ```text
-console=ttyS0 reboot=k panic=1 pci=off ip=<guestIp>::<hostIp>:255.255.255.252::eth0:off [extra kernelArgs]
+console=ttyS0 reboot=k panic=1 pci=off ip=<guestIp>::<hostIp>:255.255.255.252::eth0:off init=/rctf/init [extra kernelArgs]
 ```
+
+`init=/rctf/init` is emitted by the driver from `defaultInit` (configurable)
+**before** the challenge's `kernelArgs`, so a later `init=` in `kernelArgs`
+wins.
 
 - `<guestIp>` is the guest side of a dedicated /30 (`<hostIp>` is the host side,
   e.g. `10.200.0.2` and `10.200.0.1`).
@@ -43,8 +50,8 @@ console=ttyS0 reboot=k panic=1 pci=off ip=<guestIp>::<hostIp>:255.255.255.252::e
 - There is no vsock and no virtio-fs: the guest talks to Firecracker's MMDS
   endpoint only.
 
-After boot, `/sbin/init` (the kernel default; `init=` is not set) fetches the
-MMDS metadata document. The document is **V2**-only:
+After boot, `/rctf/init` (selected by `init=`) fetches the MMDS metadata
+document. The document is **V2**-only:
 
 1. `PUT /latest/api/token` with `X-metadata-token-ttl-seconds: 21600`
    (answered with the token in the body).
@@ -72,8 +79,15 @@ reachable through the host network stack.
 - `env` is non-secret and is exported to the service.
 - `flags` are secrets. `init` writes each one to
   `/run/rctf/flags/<sanitised provider>` with mode 0400 on a tmpfs, and never
-  to the ext4 rootfs. The service reads the file/directory from
-  `$RCTF_FLAGS_DIR`.
+  to the ext4 rootfs. Provider names are sanitised (`[^A-Za-z0-9._-]` → `_`);
+  on collision the index is appended (`name.<index>`) so two providers can
+  never overwrite each other, and a name that sanitises to empty is rejected
+  (the service is not started). Each value is written with `jq -j` by index, so
+  backslashes, tabs, newlines, quotes and unicode survive byte-for-byte. The
+  service reads the file/directory from `$RCTF_FLAGS_DIR`.
+- Before writing any flag, `init` checks `/proc/mounts` that `/run` really is a
+  tmpfs. If it is not, no flags are written and the service is **not** started
+  (`init` exits non-zero) instead of leaking flags onto the rootfs.
 - The document is delivered over the Firecracker API (`PUT /mmds`) only. The
   driver never logs it, never writes it to disk, and never puts it on the
   kernel command line or a drive.
@@ -96,7 +110,8 @@ Then it `exec`s the first of:
 
 `init` requires `jq` in the image (see the builder's `--jq` option). Without
 it, the service still starts but flags cannot be parsed. `nc` is used for MMDS
-unless `curl` is present.
+unless `curl` is present; the `nc` path builds a strict HTTP/1.1 request with
+real CRLF header terminators and only accepts a `200` status line.
 
 ## Kernel requirements
 
@@ -113,8 +128,9 @@ Build the kernel without modules (or ship the modules inside the initramfs):
 - an `init` in the rootfs (or `CONFIG_DEFAULT_INIT`).
 
 `panic=1` reboots the VM one second after a kernel panic; `reboot=k` makes a
-guest reboot syscall restart the VM instead of powering off. The driver never
-sets `init=`, so a missing `/sbin/init` yields a kernel panic loop.
+guest reboot syscall restart the VM instead of powering off. The driver emits
+`init=/rctf/init` before the challenge's extra kernel args; a later `init=`
+there overrides it, so a missing `/rctf/init` yields a kernel panic loop.
 
 ## Building rootfs.ext4 without root
 
@@ -134,10 +150,21 @@ never to run it:
 ./build-rootfs.sh --dir ./my-rootfs --size 1G --out ./rootfs.ext4
 ```
 
-The script installs `init` as `/sbin/init` and creates `/proc`, `/sys`,
+The script installs `init` as `/rctf/init` and creates `/proc`, `/sys`,
 `/dev`, `/run`, `/tmp` and `/etc`. It needs e2fsprogs >= 1.47 for `mkfs.ext4
--d`, plus `truncate` and `tar`. No `sudo`, `losetup`, `mount` or chroot is
-used.
+-d`, plus `truncate`, `realpath` and `tar`. No `sudo`, `losetup`, `mount` or
+chroot is used.
+
+Installs go **only** to `/rctf/init` and `/rctf/jq` (never through
+source-controlled paths like `/sbin/init`). Any `/rctf` entry in the copied
+source tree is removed first — a symlink is unlinked, never followed — and the
+script re-creates `/rctf` as a real directory. Before every write it verifies
+with `realpath`/`[ -L ]` that the target is inside the staging root.
+
+> **Security:** never run the builder as root on an untrusted source image or
+> directory. A malicious source can still attack through the extraction tools;
+> the staging-path checks only prevent this script from writing host files
+> through symlinks.
 
 Build the kernel separately (e.g. with `make ARCH=x86_64` and the config
 above); Firecracker does not build kernels for you.
@@ -195,12 +222,24 @@ written, so the port opens with the flag already available.
 Covered by the automated tests in
 `apps/firecracker-instancer/test/vm` (fake Firecracker over a unix socket):
 
-- image/path validation and symlink-escape rejection,
+- image/path validation and symlink-escape rejection, image trust
+  (`imagesTrusted`, group/world-writable and ownership checks),
 - API call order and payloads, rate limiters, MMDS payload,
-- no flag on argv/logs/files under `runDir`,
-- rollback after failures at every launch step,
-- pid-reuse-safe liveness, adopt/list, idempotent stop/destroy,
-- readiness (TCP/HTTP, timeout, abort, VM death).
+- no flag on argv/logs/files under `runDir` (including a `/mmds` 400 that
+  echoes the request body and a fetch exception containing the flag),
+- rollback after failures at every launch step (including a jailer that forks
+  Firecracker but never writes its pid file),
+- strict pid identity (`/proc/<pid>/exe` basename + adjacent `--id <id>`,
+  start ticks) for liveness, adopt, stop/destroy and rollback; unrelated
+  processes that merely mention firecracker are never signalled,
+- stale run/jail/cgroup state and jail-only/cgroup-only orphans,
+- idempotent stop/destroy, canonical (realpath) binary/jail layout,
+- readiness (TCP/HTTP, timeout, abort, VM death, probe-succeeded-then-died),
+  and API socket readiness as a successful connect rather than file existence,
+- guest init: strict CRLF HTTP fallback and 200-only bodies, tmpfs check
+  before flags, byte-exact flag files and collision naming,
+- `build-rootfs.sh`: no writes through source-controlled symlinks and only
+  `/rctf/init` + `/rctf/jq`.
 
 **Not verified here:** a real KVM boot of this `init`/builder combination,
 jailer's exact chroot/cgroup layout on a target host, kernel config selection,

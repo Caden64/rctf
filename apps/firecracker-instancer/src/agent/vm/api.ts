@@ -16,6 +16,24 @@ export interface FirecrackerApiOptions {
   fetch?: typeof fetch
 }
 
+/** Requests whose body carries secrets (guest metadata / flags). */
+const SENSITIVE_PATHS: ReadonlySet<string> = new Set(['/mmds'])
+const MAX_DETAIL = 512
+
+/** Remove anything that looks like a flag before it reaches an error or log. */
+export const scrubSecrets = (text: string): string =>
+  text.replace(/(?:flag|rctf)\{[^}]*\}/gi, match => {
+    const brace = match.indexOf('{')
+    return `${match.slice(0, brace + 1)}<redacted>}`
+  })
+
+const detail = (text: string): string => {
+  const scrubbed = scrubSecrets(text).trim()
+  return scrubbed.length > MAX_DETAIL
+    ? `${scrubbed.slice(0, MAX_DETAIL)}…`
+    : scrubbed
+}
+
 export class FirecrackerApi {
   readonly #socket: string
   readonly #timeoutMs: number
@@ -29,9 +47,12 @@ export class FirecrackerApi {
 
   /**
    * PUT a JSON document. The request body is never logged or put in an error
-   * message: `/mmds` carries the guest metadata (flags).
+   * message: `/mmds` carries the guest metadata (flags). For that request the
+   * error is a fixed string (no fetch exception, no response body). Other
+   * requests contribute at most a truncated, secret-scrubbed response body.
    */
   async put(apiPath: string, body: unknown): Promise<void> {
+    const sensitive = SENSITIVE_PATHS.has(apiPath)
     let response: Response
     try {
       response = await this.#fetch(`http://localhost${apiPath}`, {
@@ -41,21 +62,24 @@ export class FirecrackerApi {
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(this.#timeoutMs),
       })
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err)
-      throw new VmApiError('PUT', apiPath, `request failed (${reason})`)
+    } catch {
+      throw new VmApiError('PUT', apiPath, 'request failed')
     }
     if (!response.ok) {
-      let detail = ''
+      let text = ''
       try {
-        detail = (await response.text()).slice(0, 512)
+        text = await response.text()
       } catch {
         // ignore unreadable error bodies
       }
+      if (sensitive) {
+        throw new VmApiError('PUT', apiPath, `HTTP ${response.status}`)
+      }
+      const explanation = detail(text)
       throw new VmApiError(
         'PUT',
         apiPath,
-        `HTTP ${response.status}${detail ? `: ${detail}` : ''}`
+        `HTTP ${response.status}${explanation ? `: ${explanation}` : ''}`
       )
     }
     // Drain the body so the connection can be reused.
