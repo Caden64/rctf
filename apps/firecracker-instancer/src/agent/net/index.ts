@@ -253,7 +253,8 @@ class NetworkManagerImpl implements NetworkManager {
   /**
    * Persist the current quarantine plus (optionally) resources about to be
    * freed, pruning expired entries. Callers decide whether a write failure is
-   * fatal (release logs it and keeps the in-memory quarantine).
+   * fatal: `release` treats it as failure (the lease stays reserved and the
+   * teardown is retried), orphan cleanup may log it.
    */
   private async persistQuarantine(
     extra: Partial<QuarantineData> = {}
@@ -643,23 +644,18 @@ class NetworkManagerImpl implements NetworkManager {
       // (d) Flush conntrack in all four directions.
       await this.flushLeaseConntrack(lease)
       // (e) Persist the reuse quarantine BEFORE freeing in-memory state so a
-      //     restart cannot forget it. Persistence failure is loud but not a
-      //     reason to keep a torn-down lease reserved forever (the in-memory
-      //     quarantine still applies); the production path is writable.
-      try {
-        await this.persistQuarantine({
-          indexes: [{ id: state.index, expiresAtMs: expiresAt }],
-          ports: Object.values(lease.publicPorts).map(port => ({
-            id: port,
-            expiresAtMs: expiresAt,
-          })),
-        })
-      } catch (error) {
-        this.logger?.error(
-          { err: error, path: this.config.quarantineFile, instanceId },
-          'could not persist network quarantine; reuse safety is not durable across restarts'
-        )
-      }
+      //     restart cannot forget it. A persistence failure MUST fail the
+      //     release: the lease stays reserved and fenced, and a retry runs the
+      //     whole sequence again. Acknowledging a release whose quarantine did
+      //     not reach disk would let a restart hand the same guest IP/port out
+      //     while the old tenant's conntrack state is still there.
+      await this.persistQuarantine({
+        indexes: [{ id: state.index, expiresAtMs: expiresAt }],
+        ports: Object.values(lease.publicPorts).map(port => ({
+          id: port,
+          expiresAtMs: expiresAt,
+        })),
+      })
       this.releasing.delete(instanceId)
       this.egressFlushPending.delete(instanceId)
       this.states.delete(instanceId)
@@ -756,7 +752,10 @@ class NetworkManagerImpl implements NetworkManager {
     }
   }
 
-  async restore(leases: NetLease[]): Promise<{
+  async restore(
+    leases: NetLease[],
+    opts?: { retiring?: NetLease[] }
+  ): Promise<{
     removedOrphans: string[]
     keptOrphans: string[]
     skippedLeases: string[]
@@ -767,32 +766,57 @@ class NetworkManagerImpl implements NetworkManager {
       const keptOrphans: string[] = []
       const errors: unknown[] = []
       const range = this.config.tcpPortRange
+      const retiring = opts?.retiring ?? []
+      const retiringIds = new Set(retiring.map(lease => lease.instanceId))
 
       // Phase 1: validate shapes and range constraints without mutating the
       // allocators, so one bad lease cannot corrupt a restore.
+      const stageLease = (
+        candidate: NetLease
+      ): {
+        lease: NetLease
+        index: number
+      } => {
+        assertLeaseShape(candidate)
+        const index = this.poolIndexFor(candidate)
+        if (candidate.tapName !== tapNameForIndex(index)) {
+          throw new Error(
+            `lease ${candidate.instanceId} tap does not match its address index`
+          )
+        }
+        for (const port of Object.values(candidate.publicPorts)) {
+          if (!isValidPort(port) || port < range.from || port > range.to) {
+            throw new Error(
+              `lease ${candidate.instanceId} has public port ${port} outside tcpPortRange`
+            )
+          }
+        }
+        return { lease: cloneLease(candidate), index }
+      }
       const staged: { lease: NetLease; index: number }[] = []
       for (const candidate of leases) {
         try {
-          assertLeaseShape(candidate)
-          const index = this.poolIndexFor(candidate)
-          if (candidate.tapName !== tapNameForIndex(index)) {
-            throw new Error(
-              `lease ${candidate.instanceId} tap does not match its address index`
-            )
-          }
-          for (const port of Object.values(candidate.publicPorts)) {
-            if (!isValidPort(port) || port < range.from || port > range.to) {
-              throw new Error(
-                `lease ${candidate.instanceId} has public port ${port} outside tcpPortRange`
-              )
-            }
-          }
-          staged.push({ lease: cloneLease(candidate), index })
+          staged.push(stageLease(candidate))
         } catch (error) {
           skippedLeases.push(candidate?.instanceId ?? 'unknown')
           this.logger?.warn(
             { err: error, instanceId: candidate?.instanceId },
             'skipping invalid/incomplete lease on restore'
+          )
+        }
+      }
+      // A retiring lease may not be skipped: the agent still holds its
+      // persisted lease and will call `release(id)`, so its /30, ports and
+      // hostnames MUST be reserved (fenced, never re-created). An invalid one
+      // means we cannot know what to tear down, so fail recovery closed.
+      for (const candidate of retiring) {
+        try {
+          staged.push(stageLease(candidate))
+        } catch (error) {
+          throw new Error(
+            `cannot restore retiring lease ${candidate?.instanceId ?? 'unknown'}: ${
+              error instanceof Error ? error.message : String(error)
+            }`
           )
         }
       }
@@ -850,10 +874,6 @@ class NetworkManagerImpl implements NetworkManager {
       // reuse quarantine is NOT reset: persisted deadlines from the previous
       // process (and any added since) are carried into the new allocators.
       const installed = await readInstalledRuleset(this.runner)
-      const previousEgress = new Map<string, boolean>()
-      for (const state of this.states.values()) {
-        previousEgress.set(state.lease.instanceId, state.lease.egress)
-      }
       const previousIndexes = this.ipam.quarantineEntries()
       const previousPorts = this.ports?.quarantineEntries() ?? []
 
@@ -869,6 +889,12 @@ class NetworkManagerImpl implements NetworkManager {
         }
       }
       this.transitionFenced.clear()
+      // Retiring leases are adopted as ALREADY fenced+releasing: a following
+      // `release(id)` must run the real fence -> routes -> tap -> flush ->
+      // quarantine sequence instead of being mistaken for "unknown/no-op".
+      for (const id of retiringIds) {
+        this.releasing.add(id)
+      }
 
       this.states.clear()
       this.usedMacs.clear()
@@ -912,18 +938,21 @@ class NetworkManagerImpl implements NetworkManager {
       // Egress is immutable per lease. If the installed rules show a different
       // policy than the restored lease (e.g. a corrupted/edited record, or a
       // transition that was interrupted), fence + flush before re-rendering so
-      // established flows cannot cross the policy change.
+      // established flows cannot cross the policy change. When the installed
+      // policy CANNOT be established (no table, ambiguous rules, or the blocking
+      // rules of an interrupted transition), flush as well: a previous
+      // process's `egressFlushPending` was memory-only and may have been lost,
+      // so ambiguity must never install a new policy over stale conntrack state.
       const egressTransitions: NetLease[] = []
       for (const { lease } of staged) {
         if (this.releasing.has(lease.instanceId)) {
           continue
         }
-        const detected =
-          detectInstalledEgress(installed, lease, this.config) ??
-          previousEgress.get(lease.instanceId)
+        const detected = detectInstalledEgress(installed, lease, this.config)
         if (
           this.egressFlushPending.has(lease.instanceId) ||
-          (detected !== undefined && detected !== lease.egress)
+          detected === undefined ||
+          detected !== lease.egress
         ) {
           egressTransitions.push(lease)
           this.egressFlushPending.add(lease.instanceId)
@@ -1114,6 +1143,9 @@ class NetworkManagerImpl implements NetworkManager {
     })
     await check('traefikDirWritable', () =>
       isDirWritable(this.config.traefikDynamicDir)
+    )
+    await check('quarantineWritable', () =>
+      this.quarantineStore.checkWritable()
     )
     checks.tcpPortRange = this.portRangeValid
     checks.subnetPool = this.pool.capacity > 0

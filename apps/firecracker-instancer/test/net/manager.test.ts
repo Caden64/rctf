@@ -1117,6 +1117,112 @@ describe('restore', () => {
     ).toBe(true)
   })
 
+  test('adopts retiring leases fenced and reserved without touching their tap; release then completes the flush and quarantine', async () => {
+    const config = await makeTempConfig()
+    const host = new FakeHost()
+    const clock = (): number => 1_000_000
+    const managerA = createNetworkManager(config, { runner: host, clock })
+    const expose = [
+      tcpExpose(8080),
+      { kind: 'http' as const, hostPrefix: 'web', port: 3000 },
+    ]
+    const lease = await managerA.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose,
+    })
+    await managerA.publish(lease, expose)
+    // Crash-window state: fence + routes gone + tap deleted, flush failed.
+    host.conntrackFlushError = 'Operation not permitted'
+    await expect(managerA.release(lease.instanceId)).rejects.toThrow(
+      'could not flush conntrack'
+    )
+    host.conntrackFlushError = undefined
+    expect(host.links.has(lease.tapName)).toBe(false)
+
+    // Fresh manager over the SAME host: retiring leases must be known and
+    // fenced without re-creating the tap or routes.
+    const start = host.calls.length
+    const managerB = createNetworkManager(config, { runner: host, clock })
+    await managerB.restore([], { retiring: [lease] })
+    const calls = host.calls.slice(start)
+    expect(calls.some(call => call.argv[1] === 'tuntap')).toBe(false)
+    expect(host.links.has(lease.tapName)).toBe(false)
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).toContain(`ip saddr ${lease.guestIp} drop`)
+    expect(host.nftText).not.toContain('dnat')
+    expect(await listDir(config.traefikDynamicDir)).toEqual([])
+
+    // Still reserved: allocate(id) returns the retiring lease, and a later
+    // release runs the real fence -> routes -> tap -> flush -> quarantine.
+    expect(
+      (
+        await managerB.allocate({
+          instanceId: lease.instanceId,
+          egress: false,
+          expose,
+        })
+      ).guestIp
+    ).toBe(lease.guestIp)
+    await managerB.release(lease.instanceId)
+    expect(host.nftText).not.toContain(lease.tapName)
+    const document = JSON.parse(
+      await readFile(config.quarantineFile, 'utf8')
+    ) as { indexes: { id: number }[] }
+    expect(document.indexes.map(entry => entry.id)).toContain(0)
+  })
+
+  test('an ambiguous installed egress policy always flushes before installing the restored policy, even after a restart', async () => {
+    const config = await makeTempConfig()
+    const host = new FakeHost()
+    const clock = (): number => 1_000_000
+    const managerA = createNetworkManager(config, { runner: host, clock })
+    const lease = await managerA.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    })
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" ct state new drop`
+    )
+
+    // Interrupted egress transition: the fence is installed, then the flush
+    // fails. `egressFlushPending` is memory-only and a restart loses it.
+    host.conntrackFlushError = 'Operation not permitted'
+    const managerB = createNetworkManager(config, { runner: host, clock })
+    await expect(
+      managerB.restore([{ ...lease, egress: true }])
+    ).rejects.toThrow('could not flush conntrack')
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).not.toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} accept`
+    )
+
+    // A fresh process cannot establish the installed policy (only the fence is
+    // there), so it must flush again and keep the lease fenced on failure.
+    const start = host.calls.length
+    const managerC = createNetworkManager(config, { runner: host, clock })
+    await expect(
+      managerC.restore([{ ...lease, egress: true }])
+    ).rejects.toThrow('could not flush conntrack')
+    const calls = host.calls.slice(start)
+    expect(
+      calls.some(call => call.argv[0] === 'conntrack' && call.argv[1] === '-D')
+    ).toBe(true)
+    expect(host.nftText).not.toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} accept`
+    )
+
+    host.conntrackFlushError = undefined
+    await managerC.restore([{ ...lease, egress: true }])
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} accept`
+    )
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} masquerade`
+    )
+  })
+
   test('removes an abandoned in-pool tap and quarantines its index', async () => {
     const { host, manager } = await setup()
     host.seedTapAsAgent('fctap0', [], false)
@@ -1151,7 +1257,19 @@ describe('preflight', () => {
     expect(checks.conntrackBin).toBe(true)
     expect(typeof checks.ipForward).toBe('boolean')
     expect(checks.traefikDirWritable).toBe(true)
+    expect(checks.quarantineWritable).toBe(true)
     expect(checks.tcpPortRange).toBe(true)
+  })
+
+  test('reports an unwritable quarantine path as false', async () => {
+    const config = await makeTempConfig()
+    // The parent is a regular file, so the quarantine can never be written.
+    const blocker = join(config.traefikDynamicDir, '..', 'blocked')
+    await writeFile(blocker, 'not a directory')
+    config.quarantineFile = join(blocker, 'net-quarantine.json')
+    const host = new FakeHost()
+    const manager = createNetworkManager(config, { runner: host })
+    expect((await manager.preflight()).quarantineWritable).toBe(false)
   })
 
   test('reports broken tools, config and missing dirs as false, never throwing', async () => {
@@ -1287,7 +1405,7 @@ describe('quarantine persistence', () => {
     expect(lease.publicPorts[0]).toBe(20000)
   })
 
-  test('a quarantine write failure does not block release; in-memory quarantine still applies', async () => {
+  test('a quarantine write failure fails release (lease stays reserved); a retry after fixing the path completes and persists', async () => {
     const { clock } = mutableClock()
     const config = await makeTempConfig()
     // The parent does not exist at construction (load -> missing), then becomes
@@ -1296,20 +1414,48 @@ describe('quarantine persistence', () => {
     config.quarantineFile = join(quarantineDir, 'net-quarantine.json')
     const host = new FakeHost()
     const manager = createNetworkManager(config, { runner: host, clock })
-    const lease = await manager.allocate({
+    const req = {
       instanceId: instanceId(1),
       egress: false,
-      expose: [],
-    })
+      expose: [tcpExpose(80)],
+    }
+    const lease = await manager.allocate(req)
+    const port = lease.publicPorts[0] as number
     await writeFile(quarantineDir, 'not a directory')
+
+    // Never acknowledge a release whose durable quarantine did not land: the
+    // lease stays reserved (and fenced) so a retry can finish the teardown.
+    await expect(manager.release(lease.instanceId)).rejects.toThrow()
+    expect(host.links.has(lease.tapName)).toBe(false)
+    expect((await manager.allocate(req)).guestIp).toBe(lease.guestIp)
+
+    // Fix the path: the retry flushes again, persists the quarantine, frees
+    // the resources and drops the fence.
+    await rm(quarantineDir)
     await manager.release(lease.instanceId)
     expect(host.links.has(lease.tapName)).toBe(false)
-    const next = await manager.allocate({
+    const document = JSON.parse(
+      await readFile(config.quarantineFile, 'utf8')
+    ) as {
+      indexes: { id: number }[]
+      ports: { id: number }[]
+    }
+    expect(document.indexes.map(entry => entry.id)).toContain(0)
+    expect(document.ports.map(entry => entry.id)).toContain(port)
+
+    // And a fresh process over the same file does not hand the resources out.
+    const second = await setup(
+      { quarantineFile: config.quarantineFile },
+      { clock }
+    )
+    await second.manager.restore([])
+    const next = await second.manager.allocate({
       instanceId: instanceId(2),
       egress: false,
-      expose: [],
+      expose: [tcpExpose(80)],
     })
     expect(next.guestIp).not.toBe(lease.guestIp)
+    expect(next.publicPorts[0]).not.toBe(port)
   })
 
   test('writes only resource ids + expiry to a 0600 file', async () => {

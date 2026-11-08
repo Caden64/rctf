@@ -186,7 +186,6 @@ describe('recovered readiness requires a guest IP', () => {
     vm2.handles.set(spec.id, handle)
     vm2.alive.add(spec.id)
     const net2 = new FakeNetworkManager()
-    net2.leases.set(spec.id, lease)
 
     const mgr = harness.spawn({ vm: vm2, net: net2 })
     await mgr.start()

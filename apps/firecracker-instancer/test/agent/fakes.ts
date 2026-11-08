@@ -158,6 +158,7 @@ export class FakeNetworkManager implements NetworkManager {
   readonly leases = new Map<string, NetLease>()
   readonly published = new Set<string>()
   lastRestored: NetLease[] = []
+  lastRetiring: NetLease[] = []
   allocateCalls = 0
   publishCalls = 0
   unpublishCalls = 0
@@ -174,6 +175,7 @@ export class FakeNetworkManager implements NetworkManager {
   releaseError?: Error
   restoreError?: Error
   allocateGate?: Promise<void>
+  allocateGateFor?: (instanceId: string) => Promise<void> | undefined
   publishGate?: Promise<void>
   publishStartGate?: Promise<void>
   restoreGate?: Promise<void>
@@ -191,6 +193,8 @@ export class FakeNetworkManager implements NetworkManager {
     expose: NetExposeRequest[]
   }): Promise<NetLease> {
     this.allocateCalls += 1
+    const perIdGate = this.allocateGateFor?.(req.instanceId)
+    if (perIdGate) await perIdGate
     if (this.allocateGate) await this.allocateGate
     if (this.allocateError) throw this.allocateError
     if (this.failAllocate) throw new Error('allocate failed')
@@ -245,13 +249,23 @@ export class FakeNetworkManager implements NetworkManager {
     })
   }
 
-  async restore(leases: NetLease[]): Promise<{ removedOrphans: string[] }> {
+  async restore(
+    leases: NetLease[],
+    opts?: { retiring?: NetLease[] }
+  ): Promise<{ removedOrphans: string[] }> {
     this.restoreCalls += 1
     if (this.restoreGate) await this.restoreGate
     if (this.restoreError) throw this.restoreError
     if (this.failRestore) throw new Error('restore failed')
     this.lastRestored = leases
-    const keep = new Set(leases.map(lease => lease.instanceId))
+    const retiring = opts?.retiring ?? []
+    this.lastRetiring = retiring
+    // A real manager adopts retiring leases (reserved, never published) so a
+    // following release() finds them. Production replacement managers start
+    // with an EMPTY map: tests must not pre-seed this one to mask that.
+    const keep = new Set(
+      [...leases, ...retiring].map(lease => lease.instanceId)
+    )
     const removedOrphans: string[] = []
     for (const id of this.leases.keys()) {
       if (!keep.has(id)) {
@@ -260,7 +274,14 @@ export class FakeNetworkManager implements NetworkManager {
         removedOrphans.push(id)
       }
     }
-    for (const lease of leases) this.leases.set(lease.instanceId, lease)
+    for (const lease of leases) {
+      this.leases.set(lease.instanceId, lease)
+      this.published.add(lease.instanceId)
+    }
+    for (const lease of retiring) {
+      this.leases.set(lease.instanceId, lease)
+      this.published.delete(lease.instanceId)
+    }
     return { removedOrphans }
   }
 

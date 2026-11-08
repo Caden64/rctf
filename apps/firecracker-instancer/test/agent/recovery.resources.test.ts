@@ -68,8 +68,6 @@ describe('errored-record recovery retains ownership until release is confirmed',
     vm2.alive.add(spec.id)
     vm2.failDestroy = true
     const net2 = new FakeNetworkManager()
-    net2.leases.set(spec.id, lease)
-    net2.published.add(spec.id)
 
     const mgr = harness.spawn({ vm: vm2, net: net2, sweepIntervalMs: 2 })
     await mgr.start()

@@ -33,6 +33,28 @@ export interface QuarantineLoadResult {
 
 const FORMAT_VERSION = 1
 
+/**
+ * Directory fsync is the only step some filesystems do not implement. Those
+ * errors are safe to ignore (the rename itself is still atomic); a real I/O
+ * error means the quarantine may not be durable and must reach the caller.
+ */
+const UNSUPPORTED_DIR_FSYNC = new Set([
+  'EINVAL',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'ENOSYS',
+])
+
+const errorCode = (error: unknown): string | undefined =>
+  typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined
+
+const isUnsupportedDirFsync = (error: unknown): boolean => {
+  const code = errorCode(error)
+  return code !== undefined && UNSUPPORTED_DIR_FSYNC.has(code)
+}
+
 const empty = (): QuarantineData => ({ indexes: [], ports: [] })
 
 const parseEntries = (value: unknown): QuarantineEntry[] | undefined => {
@@ -142,8 +164,10 @@ export class QuarantineStore {
       await rm(tmp, { force: true }).catch(() => undefined)
       throw error
     }
-    // Best effort: make the rename itself durable. Some filesystems reject
-    // fsync on a directory; the file contents are already fsynced.
+    // Make the rename itself durable. Some filesystems reject fsync on a
+    // directory; the file contents are already fsynced, so only those specific
+    // "unsupported" errors are ignored. A real I/O error means the quarantine
+    // is not confirmed durable and must reach the caller (release retries).
     try {
       const dir = await open(dirname(this.path), 'r')
       try {
@@ -151,8 +175,38 @@ export class QuarantineStore {
       } finally {
         await dir.close()
       }
+    } catch (error) {
+      if (!isUnsupportedDirFsync(error)) {
+        throw error
+      }
+    }
+  }
+
+  /**
+   * Preflight: prove the quarantine file's directory can actually be written
+   * (and a probe file removed) before the host takes any instances. Without
+   * this, a misconfigured path only shows up on the first teardown, where a
+   * failed quarantine now keeps the lease reserved on every retry.
+   */
+  async checkWritable(): Promise<boolean> {
+    try {
+      const dir = dirname(this.path)
+      await mkdir(dir, { recursive: true, mode: 0o700 })
+      const probe = `${this.path}.${process.pid}.${crypto.randomUUID()}.probe`
+      try {
+        const file = await open(probe, 'w', 0o600)
+        try {
+          await file.writeFile('probe\n', 'utf8')
+          await file.sync()
+        } finally {
+          await file.close()
+        }
+      } finally {
+        await rm(probe, { force: true })
+      }
+      return true
     } catch {
-      // ignore
+      return false
     }
   }
 

@@ -118,9 +118,12 @@ no addresses, hostnames, flags or other secrets. It is written on release and
 orphan cleanup and loaded at startup, so a restart (including `restore([])`)
 cannot make a just-released /30 or port immediately reusable. A corrupt or
 unreadable file fails closed: every unowned index/port stays quarantined for
-one full period and an error is logged. If the file cannot be written on a
-development host, release proceeds with the in-memory quarantine and logs an
-error (durability across restarts is lost).
+one full period and an error is logged. If the file cannot be written, the
+release fails (the lease stays reserved and fenced) and is retried; it is never
+acknowledged without a durable quarantine. The agent's `/v1/info` preflight
+reports `quarantineWritable` (it writes and removes a probe file next to the
+quarantine file), so a misconfigured path takes the host out of rotation up
+front instead of wedging every teardown later.
 
 Allocation refuses to proceed when `conntrack` is unavailable, unless
 `network.requireConntrack` is explicitly set to `false` (dev only).
@@ -142,7 +145,9 @@ untouched, and its index is skipped just like the existing name-conflict path.
 A restored live lease whose interface exists without the marker is reported
 and fails that lease loudly (it is not silently adopted or modified). Keep
 `ownerMarker` stable across restarts: changing it makes previously created
-taps look foreign.
+taps look foreign. Taps created by an agent without the ownership alias are
+never adopted; drain a host and delete its instances before upgrading across
+that boundary.
 
 ### DNS and certificates
 

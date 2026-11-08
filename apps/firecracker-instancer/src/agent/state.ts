@@ -335,6 +335,36 @@ const ensureDir = async (dir: string, faults?: StoreFaults): Promise<void> => {
   await fsyncDirectory(path.dirname(dir), faults)
 }
 
+/**
+ * Preserve the bytes of a malformed file under a `.corrupt` name. Used where a
+ * rename would move the freshly-written replacement fence (same directory and
+ * filename): the fence stays in place and only a copy of the bad bytes is kept.
+ */
+const quarantineContent = async (
+  logger: Logger,
+  dir: string,
+  fileName: string,
+  body: string,
+  faults?: StoreFaults
+): Promise<void> => {
+  const quarantine = `${fileName}.${Date.now()}.corrupt`
+  try {
+    await writeAtomic(dir, quarantine, body, faults)
+    logger.warn(
+      { file: fileName, quarantine },
+      'quarantined malformed file content'
+    )
+  } catch (err) {
+    logger.error(
+      {
+        file: fileName,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      'failed to preserve malformed file content (durable fence remains)'
+    )
+  }
+}
+
 const quarantineFile = async (
   logger: Logger,
   file: string,
@@ -462,24 +492,32 @@ export class StateStore {
         continue
       }
       if (text === undefined) continue
-      const fence = async (reason: string): Promise<void> => {
-        await quarantineFile(this.logger, file, reason)
+      // Do NOT quarantine (rename) yet: the file is the only evidence that the
+      // id must stay fenced. The manager durably writes the conservative
+      // tombstone first and calls `quarantineCorrupt(id)` only after that
+      // succeeded; a failed fence write keeps the original in place so the next
+      // load detects it again and recovery stays closed.
+      const fence = (reason: string): void => {
+        this.logger.warn(
+          { file: entry.name },
+          `malformed state file: ${reason}`
+        )
         if (instanceIdSchema.safeParse(id).success) fences.add(id)
       }
       let raw: unknown
       try {
         raw = JSON.parse(text)
       } catch {
-        await fence('unreadable')
+        fence('unreadable')
         continue
       }
       const parsed = storedInstanceSchema.safeParse(raw)
       if (!parsed.success) {
-        await fence('invalid record')
+        fence('invalid record')
         continue
       }
       if (parsed.data.id !== id) {
-        await fence('id/filename mismatch')
+        fence('id/filename mismatch')
         continue
       }
       records.push({
@@ -490,6 +528,20 @@ export class StateStore {
       })
     }
     return { records, fences: [...fences], readErrors }
+  }
+
+  /**
+   * Rename a malformed record out of the way AFTER its conservative tombstone
+   * was confirmed durable. Rename failure is not fatal: the fence is already
+   * durable and the file will be re-detected (and re-fenced idempotently) on
+   * the next load.
+   */
+  async quarantineCorrupt(id: string): Promise<void> {
+    await quarantineFile(
+      this.logger,
+      path.join(this.dir, `${id}.json`),
+      'malformed instance record'
+    )
   }
 
   async save(record: StoredInstance): Promise<void> {
@@ -570,8 +622,6 @@ export class TombstoneStore {
 
   async load(): Promise<StoredTombstone[]> {
     await this.init()
-    this.records.clear()
-    this.pending.clear()
     let entries: Dirent[]
     try {
       const injected = this.faults?.readdir?.(this.dir)
@@ -579,8 +629,10 @@ export class TombstoneStore {
       entries = await fs.readdir(this.dir, { withFileTypes: true })
     } catch (err) {
       if (errorCode(err) === 'ENOENT') {
+        // Never clear `records`/`pending`: a fence this process already knows
+        // must keep fencing the id even if the directory disappeared.
         this.loaded = true
-        return []
+        return [...this.records.values()]
       }
       this.logger.error(
         { errorType: err instanceof Error ? err.name : typeof err },
@@ -588,6 +640,11 @@ export class TombstoneStore {
       )
       throw err
     }
+    // Build into locals and only replace `records` on success, so a read or
+    // fence-write failure never discards what this process already knows.
+    // `pending` is NEVER cleared by a reload: an unpersisted fence must keep
+    // fencing the id until its write succeeds.
+    const loadedRecords = new Map<string, StoredTombstone>()
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue
       const file = path.join(this.dir, entry.name)
@@ -617,14 +674,43 @@ export class TombstoneStore {
       }
       const parsed = malformed ? undefined : tombstoneSchema.safeParse(raw)
       if (!parsed || !parsed.success || parsed.data.id !== id) {
-        await quarantineFile(this.logger, file, 'invalid tombstone')
-        // Never silently allow reuse of an id we cannot read a fence for.
-        if (instanceIdSchema.safeParse(id).success) {
-          await this.withId(id, () => this.writeFence(id, this.now()))
+        const validId = instanceIdSchema.safeParse(id).success
+        if (validId) {
+          // Install the conservative fence FIRST. The malformed file is the
+          // only other evidence that this id must stay fenced; renaming it
+          // before the replacement is durable would lose that evidence if the
+          // write failed (the next load ignores `.corrupt` files).
+          try {
+            await this.withId(id, () => this.writeFence(id, this.now()))
+          } catch (err) {
+            this.logger.error(
+              {
+                file: entry.name,
+                errorType: err instanceof Error ? err.name : typeof err,
+              },
+              'could not replace a malformed tombstone with a durable fence; keeping the original file'
+            )
+            throw new StateReadError(entry.name)
+          }
         }
+        // Only now preserve the malformed bytes. They cannot be renamed: the
+        // canonical path now holds the replacement fence, and moving it would
+        // lose the fence. A copy failure is safe (fence is durable).
+        await quarantineContent(
+          this.logger,
+          this.dir,
+          entry.name,
+          text,
+          this.faults
+        )
         continue
       }
-      this.records.set(id, parsed.data)
+      loadedRecords.set(id, parsed.data)
+    }
+    // Merge instead of replacing: a reload must never drop a fence (including
+    // one written above for a malformed file, or a pending unpersisted fence).
+    for (const [id, record] of loadedRecords) {
+      this.records.set(id, record)
     }
     this.loaded = true
     return [...this.records.values()]
