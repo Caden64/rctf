@@ -70,6 +70,26 @@ confirms (200/404) is the row removed and the key freed. Absence is never inferr
 stale relative to concurrent creates, so every "missing on agent" conclusion is re-confirmed with a fresh per-id `get` and applied
 with a version CAS on the row snapshot taken **before** the listing.
 
+### Agent crash safety (normative)
+
+- **Ownership before side effects.** The agent persists `netMayHold`/`vmMayHold` on the instance record BEFORE `net.allocate`, `vm.launch` and `net.publish`.
+  Teardown always runs the idempotent `net.release(id)`/`vm.destroy(id)` even when a call timed out and its outcome is unknown. Every unsettled call is tracked
+  once; DELETE answers `409 in_progress` (the controller keeps ownership and retries) until it has settled and release/destroy succeeded. A call that never
+  settles cannot be cancelled through the interfaces: after `pendingOperationAbandonSeconds` the host reports `accepting:false` (check `stalledOperations`)
+  while ownership and capacity stay accounted. Sweeps never wait on an unsettled call, so one stuck instance cannot delay another's dead-man expiry.
+- **Recovery gate.** Until every record is loaded, restored into the network manager (`restore(live, { retiring })`) and orphan discovery has succeeded, the agent
+  answers PUT/PATCH/DELETE with `503 host_unavailable`, GET/list with the same until the records are loaded, and `/v1/info` reports `recovered:false,
+accepting:false`. Recovery is retried by the sweep. A read error on any state/tombstone file fails recovery closed; a MALFORMED file is replaced by a
+  durable conservative tombstone first and only then quarantined.
+- **Interrupted teardown resumes.** Leases of `stopping` records are passed to `net.restore` as `retiring`: adopted already fenced and reserved, so the following
+  `release` performs the real fence -> routes -> tap -> conntrack flush -> durable quarantine. An empty in-memory network state is never taken as a completed release.
+- **Network release order.** fence (blocking rules only) -> remove routes -> delete tap -> flush conntrack -> persist the reuse quarantine -> free resources ->
+  re-render the table without the lease. Any failure leaves the lease reserved and fenced and release retryable. Taps carry an ownership alias; only interfaces
+  with the alias AND link type tun/tap are ever adopted or deleted.
+- **VM identity.** A process is signalled/adopted only after its executable device+inode, uid and jail root match the trusted anchor (per-instance identity
+  file, jail executable, configured binary); command-line text never authorises a signal. `destroy` refuses to report success while an unauthenticatable
+  firecracker/jailer process for the id exists.
+
 ### Host removal and clocks (normative)
 
 `removeHost` is only allowed for an `unhealthy` host (409 otherwise): it writes the host's rows off as `lost` tombstones (cleanup
