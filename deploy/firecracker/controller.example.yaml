@@ -12,7 +12,7 @@ databasePath: /var/lib/rctf-firecracker/controller.sqlite
 
 hosts:
   - id: fc1
-    url: https://fc1.internal.example.com:7001 # the agent's listen address
+    url: http://10.0.0.11:7001 # the agent's listen address (plain HTTP: keep it on a private network, or front it with a TLS proxy and use https + caCertificate)
     # caCertificate: |            # PEM to trust when the agent uses a private CA
     #   -----BEGIN CERTIFICATE-----
     capacity: # must not exceed what the host can really run

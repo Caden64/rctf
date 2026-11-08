@@ -13,6 +13,7 @@ import {
 import FirecrackerInstancerProvider, {
   firecrackerConfigInputJsonSchema,
 } from '../../../../apps/api/src/providers/instancer/firecracker-instancer'
+import { formatEndpoint } from '../../../../apps/web/src/lib/utils/instancer'
 import { instancerProviders } from '../../../../apps/api/src/providers/instancer/index'
 import type {
   CreateInstanceOptions,
@@ -506,6 +507,76 @@ describe('FirecrackerInstancerProvider create', () => {
     expect(result.kind).toBe('instancerInstanceDetails')
     if (result.kind === 'instancerInstanceDetails') {
       expect(result.status).toBe('starting')
+    }
+  })
+
+  test('admin-save validation rejects expose configs that can never launch', () => {
+    const provider = new FirecrackerInstancerProvider({
+      apiUrl: 'http://controller.example.com',
+      authToken: 't',
+    })
+    const entry = (overrides: Record<string, unknown> = {}) => ({
+      kind: ExposeKind.TCP,
+      hostPrefix: 'chal',
+      containerName: 'app',
+      containerPort: 1337,
+      ...overrides,
+    })
+    const validate = (expose: unknown[]) =>
+      provider.validateInstancerConfig({
+        config: { image: 'example' },
+        expose: expose as never,
+      })
+    expect(validate([entry()])).toBeUndefined()
+    expect(validate([entry({ containerName: 'web' })])).toContain('app')
+    expect(validate([entry({ hostPrefix: 'x'.repeat(33) })])).toBeDefined()
+    expect(validate([entry(), entry({ hostPrefix: 'other' })])).toContain(
+      'Duplicate'
+    )
+    expect(
+      validate(
+        Array.from({ length: 17 }, (_, i) => entry({ containerPort: 2000 + i }))
+      )
+    ).toContain('at most 16')
+    expect(validate([])).toBeDefined()
+  })
+
+  test('raw endpoints carry text so the web UI can render and copy them', async () => {
+    // The web formatter renders `raw` exclusively from `text`; without it the
+    // player sees (and copies) an empty string.
+    const { server, fake } = startController()
+    fake.handlers.create = async () =>
+      details([{ kind: 'raw', host: 'fc1.example.com', port: 20001 }])
+    const provider = providerFor(server.url)
+    const result = await provider.createInstance(
+      createOptions({
+        expose: [
+          {
+            kind: ExposeKind.RAW,
+            hostPrefix: 'chal',
+            containerName: 'app',
+            containerPort: 9000,
+            shouldDisplay: true,
+          },
+        ],
+      })
+    )
+    expect(result.kind).toBe('instancerInstanceDetails')
+    if (result.kind === 'instancerInstanceDetails') {
+      const endpoint = result.endpoints?.[0]
+      expect(endpoint?.text).toBe('fc1.example.com:20001')
+      expect(
+        formatEndpoint(
+          {
+            kind: ExposeKind.RAW,
+            host: endpoint!.host,
+            port: endpoint!.port,
+            ...(endpoint?.text === undefined ? {} : { text: endpoint.text }),
+          } as never,
+          0,
+          1
+        ).value
+      ).toBe('fc1.example.com:20001')
     }
   })
 

@@ -12,10 +12,18 @@ Type=simple
 # Bun program (package @rctf/firecracker-instancer).
 EnvironmentFile=-/etc/rctf-firecracker/agent.env
 WorkingDirectory=/opt/rctf-firecracker
-ExecStart=/usr/local/bin/bun /opt/rctf-firecracker/apps/firecracker-instancer/src/agent/index.ts
+ExecStart=/usr/local/bin/bun /opt/rctf-firecracker/apps/firecracker-instancer/src/agent/index.ts /etc/rctf-firecracker/agent.yaml
 Restart=on-failure
 RestartSec=2
-KillMode=mixed
+# VMs must survive an agent restart (the agent re-adopts them), so only the agent
+# process itself is signalled. With the default `mixed`/`control-group` modes
+# systemd would SIGKILL every remaining process in the unit's cgroup (all VMs)
+# when the agent stops or restarts, because VMs are children of this service's
+# cgroup unless vm.cgroupLimits makes the jailer create a per-VM cgroup.
+# Consequence: `systemctl stop` leaves running VMs behind on purpose; drain the
+# host first (POST /v1/hosts/<id>/drain) and delete instances to remove them.
+# NOT yet verified under a real systemd + jailer: test restart before an event.
+KillMode=process
 
 # ---------------------------------------------------------------------------
 # Why root?

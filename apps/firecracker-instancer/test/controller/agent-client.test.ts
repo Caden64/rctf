@@ -70,6 +70,28 @@ const json = (body: unknown, status = 200): Response =>
   })
 
 describe('HttpAgentClient', () => {
+  test('never follows a redirect with the flag-bearing create body', async () => {
+    let leaked = false
+    const sink = startServer(async request => {
+      leaked = true
+      await request.text()
+      return json(agentInstance)
+    })
+    const redirector = startServer(
+      () =>
+        new Response(null, {
+          status: 307,
+          headers: { Location: `${sink.url}/v1/instances/${'a'.repeat(24)}` },
+        })
+    )
+    // The sink records anything that reaches it; only the redirector may be hit.
+    await expect(
+      redirector.client().create(makeAgentSpec('a'.repeat(24)))
+    ).rejects.toBeInstanceOf(AgentUnreachableError)
+    expect(leaked).toBe(false)
+    expect(sink.seen.methods).toEqual([])
+  })
+
   test('sends the bearer token and parses the info response', async () => {
     const { client, seen } = startServer(() => json(agentInfo))
     const info = await client().info()

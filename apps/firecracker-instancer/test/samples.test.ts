@@ -32,4 +32,40 @@ describe('shipped example configs', () => {
     ).toBe(true)
     expect(challenge.instancerConfig.expose[0]?.containerName).toBe('app')
   })
+
+  test('the sample challenge actually shows its endpoint to players', () => {
+    // The API drops endpoints unless expose[].shouldDisplay is truthy, so an
+    // example without it deploys fine and then shows the player nothing.
+    const challenge = load('sample-challenge.yaml') as {
+      instancerConfig: { expose: { shouldDisplay?: boolean }[] }
+    }
+    for (const entry of challenge.instancerConfig.expose) {
+      expect(entry.shouldDisplay).toBe(true)
+    }
+  })
+
+  test('the controller example speaks the same scheme the agent serves (plain HTTP)', () => {
+    // The agent has no TLS listener; an https:// URL here fails every heartbeat.
+    const controller = load('controller.example.yaml') as {
+      hosts: { url: string }[]
+    }
+    for (const host of controller.hosts) {
+      expect(host.url.startsWith('http://')).toBe(true)
+    }
+  })
+
+  test('the agent systemd unit passes the config path the agent requires', () => {
+    const unit = readFileSync(
+      new URL('host/rctf-firecracker-agent.service', root),
+      'utf8'
+    )
+    const execStart = unit
+      .split('\n')
+      .find(line => line.startsWith('ExecStart='))
+    expect(execStart).toContain(
+      'agent/index.ts /etc/rctf-firecracker/agent.yaml'
+    )
+    // VMs must outlive an agent restart: the default mixed kill mode would SIGKILL them.
+    expect(unit).toMatch(/^KillMode=process$/m)
+  })
 })

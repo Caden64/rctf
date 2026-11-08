@@ -26,4 +26,5 @@ instancerConfig:
       hostPrefix: fc-web-demo
       containerName: app # must be 'app' for the Firecracker instancer
       containerPort: 8080
+      shouldDisplay: true # required: endpoints are hidden from players unless this is true
       title: Challenge

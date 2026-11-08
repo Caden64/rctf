@@ -255,11 +255,23 @@ real temp directories):
   files), skips and reports incomplete leases, and orphan cleanup with tap
   ownership evidence.
 
-**Not verified anywhere yet (needs a real KVM host):**
+**Verified against the real thing** (unprivileged, `../smoke/`: real nftables + real tap devices in a
+user+network namespace, two real Firecracker v1.17.0 microVMs, direct mode):
 
-- `nft -c` acceptance and actual packet behaviour of the rendered ruleset;
-- Traefik actually loading the generated dynamic files and proxying;
-- `ip tuntap` with `user`/`group` under the jailer uid;
-- Firecracker booting with the documented cmdline and MMDS reachability;
-- the systemd unit's hardening options against this specific Firecracker/jailer
-  version (capability/namespace requirements can change between releases).
+- the rendered `inet` and `arp` rulesets are accepted by the real `nft` (this found and fixed an invalid ARP
+  rule), allocate/publish/release work against real taps, and a tap is removed on delete;
+- team isolation measured from inside the guests: neither guest can reach the other or a host-side listener,
+  and removing the rules makes the same probe succeed (so the result is not a false negative);
+- the guest reaches `169.254.169.254` (MMDS) through the documented `ip=` cmdline and route.
+
+**Not verified (needs a real root KVM host):**
+
+- jailer mode (the smoke test uses `mode: direct`), including `ip tuntap` with `user`/`group` under the jailer uid;
+- `egress: true` masquerade, public DNAT from outside the host, and conntrack flushing/reuse safety (the smoke
+  test runs with `requireConntrack: false`);
+- Traefik actually loading the generated dynamic files and proxying, and TLS;
+- the systemd unit under a real systemd, in particular that `KillMode=process` really leaves VMs running across
+  `systemctl restart` (VMs live in the unit's cgroup unless `vm.cgroupLimits` gives each its own), and the
+  hardening options against your specific Firecracker/jailer version (capability and namespace requirements can
+  change between releases);
+- more than one host.

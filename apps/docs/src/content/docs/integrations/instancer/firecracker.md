@@ -31,9 +31,9 @@ Key properties:
 
 - **Ownership is pinned.** An instance stays on the host that created it. Get, extend, and delete always go to that host.
 - **No oversubscription.** Placement and reservation happen in a single SQLite transaction, and the agent enforces its own limits again. A full fleet returns a clear `no capacity` message.
-- **Idempotent and race-safe.** A team can never have two live instances of the same challenge, even with duplicate or concurrent create requests. Extend and expiry race on one row, so exactly one wins.
-- **Survives restarts.** The controller resumes from SQLite. The agent re-adopts running VMs from its state files, cleans orphans, and never kills VMs when it restarts or shuts down.
-- **Flags are never persisted.** Flags travel in request memory to Firecracker's MMDS and appear only on the guest's tmpfs. They are never written to the kernel command line, a disk, SQLite, or logs.
+- **Idempotent and race-safe.** A team can never have two live instances of the same challenge, even with duplicate or concurrent create requests (the one exception is a partitioned host, see [Host health, draining, and removal](#host-health-draining-and-removal)). Extend and expiry race on one row, so exactly one wins.
+- **Survives restarts.** The controller resumes from SQLite. The agent re-adopts running VMs from its state files, cleans orphans, and does not kill VMs when it restarts or shuts down. The shipped systemd unit uses `KillMode=process` for this reason, so `systemctl stop` also leaves VMs running: drain the host and delete its instances first if you want them gone. This unit behaviour has not been tested under a real systemd.
+- **The instancer never persists flags.** Flags travel in request memory to Firecracker's MMDS and appear only on the guest's tmpfs. The controller and agent never write them to the kernel command line, a disk, SQLite, or logs. This covers the instancer's own state only: your guest service can still store a flag it receives, and host-level swap or core dumps are outside its control.
 
 ## Requirements
 
@@ -106,7 +106,7 @@ Copy `agent.example.yaml` to `/etc/rctf-firecracker/agent.yaml{:file}`, set `hos
 $ <red>FIRECRACKER_AGENT_TOKEN</red>=<green><host-token></green> <red>bun</red> apps/firecracker-instancer/src/agent/index.ts /etc/rctf-firecracker/agent.yaml
 ```
 
-Use `host/rctf-firecracker-agent.service{:file}` to run it under systemd. The agent API controls root-level operations. Bind it to a private address and firewall it to the controller only.
+Use `host/rctf-firecracker-agent.service{:file}` to run it under systemd. The agent API controls root-level operations and serves plain HTTP. Bind it to a private address and firewall it to the controller only, or put a TLS reverse proxy in front of it and give the controller an `https` URL plus `caCertificate`.
 
 ### 4. Configure and start the controller
 
@@ -164,6 +164,7 @@ instancerConfig:
       hostPrefix: fc-web-demo
       containerName: app
       containerPort: 8080
+      shouldDisplay: true
       title: Challenge
 ```
 
@@ -221,7 +222,7 @@ The controller owns the deadline. Extending sets the deadline to now plus `timeo
 
 ## Security model
 
-- The guest is untrusted. In `jailer` mode Firecracker runs with a dedicated uid and gid, a chroot, cgroup v2, a new PID namespace, resource limits, and Firecracker's default seccomp filter. Disk and network have rate limiters. `direct` mode skips the jailer, is for development only, and logs a warning.
+- The guest is untrusted. In `jailer` mode Firecracker runs with a dedicated uid and gid, a chroot, a new PID namespace, resource limits, and Firecracker's default seccomp filter. The jailer only creates a per-VM cgroup when `vm.cgroupLimits` is set (for example `['pids.max=512']`), and the default is empty, so set it if you want cgroup isolation. Keep `network.tapUser` and `network.tapGroup` equal to `vm.jailUid` and `vm.jailGid`, otherwise the unprivileged Firecracker process cannot open its tap. Disk and network have rate limiters. `direct` mode skips the jailer, is for development only, and logs a warning.
 - The agent is privileged. It authenticates the controller with a constant-time bearer check, validates every id, path, image name, and hostname against strict allow lists, never uses a shell, and keeps images read-only. Bind the agent to a private address.
 - Hostnames contain a random instance id, never a team id. Hosts only see an HMAC of the team id.
 - Challenge images are trusted to the extent that you build them. A guest can still use CPU and bandwidth up to its limits, so size `capacity` accordingly.

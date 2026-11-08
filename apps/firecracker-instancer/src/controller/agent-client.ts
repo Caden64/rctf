@@ -114,6 +114,9 @@ export class HttpAgentClient implements AgentClient {
     const init: RequestInit & { tls?: { ca?: string } } = {
       method,
       headers,
+      // A create body carries flags: never replay it (or the bearer token's
+      // authority) to wherever a redirect points.
+      redirect: 'error',
       signal: AbortSignal.timeout(timeoutMs),
     }
     if (body !== undefined) {

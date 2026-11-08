@@ -9,6 +9,7 @@ import {
   instanceKeySchema,
   type ControllerInstanceDetails,
 } from '@rctf/firecracker-protocol'
+import type { InstancerConfig } from '@rctf/db'
 import * as z from 'zod/mini'
 import {
   instanceDetailsSchema,
@@ -31,6 +32,9 @@ interface FirecrackerInstancerProviderOptions {
 // Must exceed the controller's agent create timeout (30s) so a slow-but-healthy
 // launch (e.g. rootfs copy without reflink) is not reported as a failure.
 const DEFAULT_TIMEOUT_MILLISECONDS = 45_000
+
+/** Mirrors the controller/agent limit on expose entries per instance. */
+const MAX_EXPOSE_ENTRIES = 16
 
 const REQUEST_FAILED_MESSAGE =
   'Something went wrong while talking to the Firecracker controller'
@@ -114,6 +118,32 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
    */
   getDefaults = (): ProviderConfig =>
     this.configSchema.parse({ image: 'example' })
+
+  /**
+   * Admin-save validation: the generic expose schema allows things Firecracker
+   * rejects only at launch (containerName other than `app`, host prefixes over
+   * 32 characters, duplicate guest ports, more than 16 entries).
+   */
+  override validateInstancerConfig = (
+    instancerConfig: Pick<InstancerConfig, 'config' | 'expose'>
+  ): string | undefined => {
+    const expose = instancerConfig.expose ?? []
+    const checked = this.validateExpose(expose)
+    if (!checked.ok) {
+      return checked.message
+    }
+    if (checked.expose.length > MAX_EXPOSE_ENTRIES) {
+      return `The Firecracker instancer supports at most ${MAX_EXPOSE_ENTRIES} expose entries`
+    }
+    const ports = new Set<number>()
+    for (const entry of checked.expose) {
+      if (ports.has(entry.containerPort)) {
+        return `Duplicate exposed guest port ${entry.containerPort}: each expose entry needs a distinct containerPort`
+      }
+      ports.add(entry.containerPort)
+    }
+    return undefined
+  }
 
   private error(message: string): instanceDetailsOrError {
     return instancerErrorSchema.parse({ kind: 'instancerError', message })
@@ -256,7 +286,16 @@ export default class FirecrackerInstancerProvider extends InstancerProvider {
       return mismatch
     }
 
-    const details = instanceDetailsSchema.safeParse(parsed.data)
+    // The web UI renders `raw` endpoints exclusively from `text`.
+    const details = instanceDetailsSchema.safeParse({
+      ...parsed.data,
+      endpoints:
+        parsed.data.endpoints?.map(endpoint =>
+          endpoint.kind === 'raw'
+            ? { ...endpoint, text: `${endpoint.host}:${endpoint.port}` }
+            : endpoint
+        ) ?? null,
+    })
     if (!details.success) {
       return this.error(INVALID_RESPONSE_MESSAGE)
     }
