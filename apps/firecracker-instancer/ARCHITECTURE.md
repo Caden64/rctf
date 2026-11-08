@@ -90,13 +90,20 @@ without a reply ⇒ `unhealthy` (no new placements; existing rows read as `error
 ## Guest network model (supported assumptions)
 
 - One tap per VM, a dedicated **/30** per VM carved from `subnetPool` (host = .1, guest = .2). No bridge ⇒ VMs share no L2 segment.
-- nftables table `inet rctf_fc` (owned entirely by the agent; flushed/rebuilt from state): forward drop between any two `fctap*`,
-  anti-spoof (`iifname tap` must have `saddr == guestIp`, `ether saddr == guestMac`), input from taps to the host dropped (except
-  nothing — MMDS is handled by Firecracker, not the host stack), egress dropped unless `egress: true` (then masquerade via
-  `externalInterface`, and still never to RFC1918/link-local/the host).
+- nftables tables `inet rctf_fc` and `arp rctf_fc_arp` (owned entirely by the agent; rendered as a pure function of the live leases and
+  applied atomically in one `nft -f -`). The forward chain is `policy accept` with rules scoped to `fctap*` only, so unrelated host
+  forwarding (Docker, VPN) is untouched. Per allocated lease, always (even when unpublished): forward drop between taps, anti-spoof
+  (`iifname tap` ⇒ `saddr == guestIp`, `ether saddr == guestMac`), ARP sender/target filtering, IPv6 drop, input from taps to the host
+  dropped except established replies scoped to that lease's own tap/IP pair, egress dropped unless `egress: true` (then masquerade via
+  `externalInterface`, and still never to RFC1918/link-local/CGNAT/loopback/the host or the VM pool). DNAT matches `fib daddr type local`.
+- **Reuse safety:** releasing or unpublishing a lease flushes its conntrack entries in all four directions (`conntrack-tools` required;
+  `requireConntrack: false` only for dev) and a freed /30 index or public port is quarantined for `reuseQuarantineSeconds` (default 120)
+  before it can be handed out again, so a new tenant can never inherit a previous tenant's flows. Release is retryable: if a tap or flush
+  fails the lease stays reserved. Taps are only deleted when this agent created them; a foreign interface named `fctapN` blocks that
+  index and is never removed. All routes are rebuilt from `NetLease.expose` + `publicPorts/publicHostnames` (there is no sidecar state).
 - Public **TCP/raw**: DNAT `publicHost:<port from tcpPortRange> → guestIp:port`, one port per exposed entry, allocated and released with the lease.
 - Public **HTTP/HTTPS/TCP-SSL**: per-instance Traefik file-provider config in `traefikDynamicDir`
-  (`Host(<hostPrefix>-<shortId>.<httpDomain>)` → `http://guestIp:port`; TLS terminated by the operator's Traefik with a wildcard cert
+  (`Host(<hostPrefix>-<first 20 chars of instance id>.<httpDomain>)` → `http://guestIp:port`; TLS terminated by the operator's Traefik with a wildcard cert
   for `*.<httpDomain>`). With several hosts each host has its own `httpDomain` (e.g. `fc1.ctf.example.com`), so DNS wildcard
   `*.fc1.ctf.example.com → host 1` pins routing without a shared front door.
 - IPv4 only. The host must have `net.ipv4.ip_forward=1`.
