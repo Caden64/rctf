@@ -243,6 +243,9 @@ interface StorageLayout {
   initrdApiPath?: string
 }
 
+/** sockaddr_un.sun_path is 108 bytes including the trailing NUL. */
+const MAX_UNIX_SOCKET_PATH = 107
+
 export const createVmDriver = (
   config: VmConfig,
   deps: VmDeps = {}
@@ -1264,6 +1267,14 @@ export const createVmDriver = (
           ? await canAccess(chrootBaseAbs, fsConstants.W_OK | fsConstants.X_OK)
           : true,
       reflink: await probeReflink(),
+      // A unix socket path must fit in sockaddr_un.sun_path (108 bytes incl.
+      // NUL). Firecracker exits immediately ("path must be shorter than
+      // SUN_LEN") for a deeper runDir/chrootBase, and the agent can only report
+      // "exited before creating its API socket", so catch it up front using
+      // the longest possible instance id.
+      apiSocketPath:
+        Buffer.byteLength(expectedApiSocket('x'.repeat(32))) <=
+        MAX_UNIX_SOCKET_PATH,
     }
 
     let images: string[] = []

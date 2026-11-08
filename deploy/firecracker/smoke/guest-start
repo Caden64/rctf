@@ -1,0 +1,16 @@
+#!/bin/sh
+# Sample challenge + isolation probe. Serves the flag on :8080 and, every 2s, records whether this
+# guest can reach (a) its peer VM and (b) a listener on the host side of its own tap.
+mkdir -p /www
+cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
+echo "ok" > /www/index.html
+(
+  while :; do
+    p=blocked; h=blocked
+    [ -n "${PROBE_PEER:-}" ] && wget -T 2 -qO- "http://$PROBE_PEER:8080/index.html" >/dev/null 2>&1 && p=REACHED
+    [ -n "${PROBE_HOST:-}" ] && wget -T 2 -qO- "http://$PROBE_HOST:9999/" >/dev/null 2>&1 && h=REACHED
+    echo "peer=$p host=$h" > /www/probe.tmp && mv /www/probe.tmp /www/probe.txt
+    sleep 1
+  done
+) &
+exec httpd -f -p 8080 -h /www

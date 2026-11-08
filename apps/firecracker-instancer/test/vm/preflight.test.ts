@@ -41,6 +41,7 @@ describe('preflight', () => {
 
     const result = await driver.preflight()
     expect(Object.keys(result.checks).sort()).toEqual([
+      'apiSocketPath',
       'chrootBase',
       'firecrackerBin',
       'imagesDir',
@@ -55,6 +56,7 @@ describe('preflight', () => {
     expect(result.checks.imagesDir).toBe(true)
     expect(result.checks.imagesTrusted).toBe(true)
     expect(result.checks.runDir).toBe(true)
+    expect(result.checks.apiSocketPath).toBe(true)
     expect(typeof result.checks.kvm).toBe('boolean')
     expect(typeof result.checks.reflink).toBe('boolean')
     expect(result.images).toEqual(['web-demo'])
@@ -110,5 +112,25 @@ describe('preflight', () => {
     await chmod(config.imagesDir, 0o700)
     await chmod(path.join(config.imagesDir, 'web-demo', 'rootfs.ext4'), 0o660)
     expect((await driver.preflight()).checks.imagesTrusted).toBe(false)
+  })
+})
+
+describe('preflight: API socket path length', () => {
+  test('flags a runDir so deep that <runDir>/<id>/api.sock exceeds SUN_LEN', async () => {
+    // Found by a real run: Firecracker exits with "path must be shorter than
+    // SUN_LEN" and the only symptom was a cryptic launch failure.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-sun-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const deep = path.join(dirs.runDir, 'd'.repeat(90))
+    await mkdir(deep, { recursive: true, mode: 0o700 })
+    const firecrackerBin = await bin(root, 'firecracker')
+    const jailerBin = await bin(root, 'jailer')
+    const config = await makeVmConfig({
+      dirs: { ...dirs, runDir: deep },
+      overrides: { firecrackerBin, jailerBin, mode: 'direct' },
+    })
+    const driver = createVmDriver(config, { logger: makeLogger().logger })
+    expect((await driver.preflight()).checks.apiSocketPath).toBe(false)
   })
 })

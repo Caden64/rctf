@@ -23,6 +23,12 @@
 # Keep this file POSIX sh (no bashisms).
 set -u
 
+# build-rootfs.sh installs the bundled jq at /rctf/jq; the kernel starts init
+# with a minimal (often empty) PATH. Put /rctf first so that jq is found, then
+# keep the usual locations as a fallback.
+PATH="/rctf:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export PATH
+
 MMDS_HOST=${RCTF_MMDS_HOST:-169.254.169.254}
 MMDS_PORT=${RCTF_MMDS_PORT:-80}
 RUN_ROOT=${RCTF_RUN_ROOT:-/run/rctf}
@@ -119,10 +125,14 @@ http_body() {
 fetch_token() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsS -m 3 -X PUT \
+      -H 'Content-Length: 0' \
       -H "X-metadata-token-ttl-seconds: $TOKEN_TTL" \
       "http://$MMDS_HOST/latest/api/token" 2>/dev/null
   else
+    # Firecracker's MMDS does not answer a PUT that lacks Content-Length
+    # (verified against a real Firecracker 1.17 guest).
     raw_http PUT /latest/api/token \
+      "Content-Length: 0" \
       "X-metadata-token-ttl-seconds: $TOKEN_TTL" | http_body
   fi
 }

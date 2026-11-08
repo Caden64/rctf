@@ -9,7 +9,7 @@ The Firecracker instancer boots a prebuilt kernel and root filesystem in a [Fire
 For the participant controls, common `<red>instancerConfig</red>` fields, and endpoint types, see [Instancer](/integrations/instancer).
 
 :::warning[Hardware and verification status]
-This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. The code is covered by automated tests that fake the privileged edges (Firecracker API, `ip`, `nft`, `conntrack`, Traefik files). Nothing in this repository has been validated against a real Firecracker, jailer, nftables, or Traefik yet. Run the smoke test in [Verify a host](#verify-a-host) on your hardware before trusting it with a live event.
+This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. Most of the automated tests fake the privileged edges. In addition, an unprivileged smoke test (`deploy/firecracker/smoke/{:dir}`) boots real Firecracker v1.17.0 microVMs under real KVM with the real agent, tap devices and nftables, and checks flag delivery, agent-crash recovery, and team isolation from inside the guests. It does not cover jailer mode, Traefik, TLS, egress NAT, conntrack, or systemd, and nothing has been run across several hosts. Run the checks in [Verify a host](#verify-a-host) as root on your own hardware before trusting this with a live event.
 :::
 
 ## Architecture
@@ -54,6 +54,7 @@ The controller needs Bun, a writable state directory, and network access to ever
 - **One tap and one dedicated /30 per VM**, carved from `subnetPool`. There is no bridge, so VMs share no layer-2 segment.
 - **Isolation:** forwarding between taps is dropped, each tap may only send its own IP and MAC, ARP is filtered, IPv6 is dropped, and traffic from guests to the host is dropped except replies to host-initiated connections.
 - **Egress is off by default.** With `egress: true` a guest can reach the internet through NAT, but never loopback, RFC1918, link-local, or other guests.
+- **Reuse safety:** when an instance is released the agent flushes its conntrack entries, and the freed /30 and public port are not handed to another team for `reuseQuarantineSeconds` (default 120). Allocation refuses to run without conntrack-tools unless you set `network.requireConntrack: false` (development only).
 - **`tcp` and `raw` endpoints** get a public port from `tcpPortRange` through DNAT, reported as `publicHost:port`.
 - **`http`, `https`, and `tcp-ssl` endpoints** are routed by Traefik at `<hostPrefix>-<instance id>.<httpDomain>`. Traefik terminates TLS, and the guest serves plain HTTP or TCP. Give each host its own `httpDomain` (for example `fc1.ctf.example.com`), so wildcard DNS selects the host without a shared front door.
 - **UDP is not supported.**
@@ -227,7 +228,14 @@ The controller owns the deadline. Extending sets the deadline to now plus `timeo
 
 ## Verify a host
 
-On a KVM host with the tooling installed, run the privileged tests that are skipped by default, then boot one instance end to end:
+First, the unprivileged smoke test boots real microVMs inside a throwaway user and network namespace, so it is safe to run on any machine with KVM access:
+
+```ansi
+$ <red>deploy/firecracker/smoke/fetch-artifacts.sh</red>
+$ <red>deploy/firecracker/smoke/run.sh</red>
+```
+
+It covers 24 checks, listed with its limits in `deploy/firecracker/smoke/README.md{:file}`. Then, on the real host as root, cover what it cannot: jailer mode, Traefik and TLS, egress, conntrack, and systemd.
 
 ```ansi
 $ <red>FC_REAL</red>=1 <red>sudo</red> bun test apps/firecracker-instancer/test/net
@@ -235,9 +243,9 @@ $ <red>FC_REAL</red>=1 <red>sudo</red> bun test apps/firecracker-instancer/test/
 
 Start the agent and controller, create a challenge from `sample-challenge.yaml{:file}`, and confirm that:
 
-- the instance reaches `running` and its endpoint answers,
+- the instance reaches `running` and its endpoint answers through Traefik,
 - two teams cannot reach each other's guest addresses,
-- `egress: false` guests cannot reach the internet,
+- `egress: false` guests cannot reach the internet, and `egress: true` guests can reach it but not RFC1918 space,
 - deleting the instance removes the tap, the nftables rules, the Traefik file, and the run directory,
 - restarting the agent keeps the VM, and `kill -9` on the agent during create leaves no orphans after the restart.
 

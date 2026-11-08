@@ -93,6 +93,18 @@ const fakeJqDir = async (root: string): Promise<string> => {
   return binDir
 }
 
+describe('guest init: PATH', () => {
+  test('puts /rctf first so the bundled /rctf/jq is found', async () => {
+    // Found by booting a real guest: the builder installs jq at /rctf/jq but
+    // init called plain `jq`, so init decided jq was missing and wrote no flags.
+    const result = await runSh(sourceInit('printf %s "$PATH"'), {
+      PATH: '/bin',
+    })
+    expect(result.code).toBe(0)
+    expect(result.stdout.startsWith('/rctf:')).toBe(true)
+  })
+})
+
 describe('guest init: nc HTTP fallback', () => {
   test('writes CRLF headers and never literal backslash escapes', async () => {
     const root = await tempRoot('rctf-guest-nc-')
@@ -119,6 +131,26 @@ describe('guest init: nc HTTP fallback', () => {
         '\r\n'
     )
     expect(request).not.toContain('\\r\\n')
+  })
+
+  test('the token PUT carries Content-Length: 0 (real MMDS ignores a bodyless PUT without it)', async () => {
+    // Found by booting a real Firecracker 1.17 guest: without this header the
+    // MMDS never answered, init started the service without flags.
+    const root = await tempRoot('rctf-guest-nc-')
+    const { binDir, capture } = await fakeNc(
+      root,
+      'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\ntoken'
+    )
+    const result = await runSh(sourceInit('fetch_token'), {
+      PATH: binDir,
+      RCTF_MMDS_HOST: '127.0.0.1',
+      RCTF_MMDS_PORT: '8080',
+    })
+    expect(result.code).toBe(0)
+    expect(result.stdout.trim()).toBe('token')
+    const request = await readFile(capture, 'utf8')
+    expect(request).toContain('\r\nContent-Length: 0\r\n')
+    expect(request.startsWith('PUT /latest/api/token HTTP/1.1\r\n')).toBe(true)
   })
 
   test('combines token and Accept headers as separate CRLF lines', async () => {

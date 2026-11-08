@@ -241,8 +241,12 @@ Covered by the automated tests in
 - `build-rootfs.sh`: no writes through source-controlled symlinks and only
   `/rctf/init` + `/rctf/jq`.
 
-**Not verified here:** a real KVM boot of this `init`/builder combination,
-jailer's exact chroot/cgroup layout on a target host, kernel config selection,
-and `mkfs.ext4 -d`/container export on your distribution. Treat the guest
-examples as a documented reference: boot one image on a real KVM host and
-check `/var/log`/serial output before relying on it in production.
+**Verified against the real thing** (unprivileged, `../smoke/`, Firecracker v1.17.0, kernel 6.1.155,
+busybox 1.35.0, static jq): a real KVM boot of this `init` and of an image produced by
+`build-rootfs.sh --dir`, including the MMDS v2 token and document fetch through the busybox `nc` fallback,
+byte-exact flag delivery to a tmpfs, and teardown. That run found and fixed two real bugs in this directory:
+the token `PUT` needs `Content-Length: 0`, and `/rctf` must be on `PATH` so the bundled `/rctf/jq` is found.
+
+**Not verified:** the `curl` path of `init` (the test image has no curl), `build-rootfs.sh --image`
+(container export), `mkfs.ext4 -d` on your distribution, other kernel configs, and jailer mode. Treat the
+guest examples as a documented reference and boot one of your own images on a real host before an event.
