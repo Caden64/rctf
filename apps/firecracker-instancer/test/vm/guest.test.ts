@@ -359,6 +359,74 @@ describe('guest init: flag storage', () => {
   })
 })
 
+describe('guest init: challenge environment', () => {
+  test('cannot overwrite init internals or the reserved RCTF_* exports', async () => {
+    const root = await tempRoot('rctf-guest-env-')
+    const binDir = await fakeJqDir(root)
+    const runRoot = path.join(root, 'rctf')
+    const flagsDir = path.join(runRoot, 'flags')
+    await mkdir(flagsDir, { recursive: true, mode: 0o700 })
+    const service = path.join(root, 'service.sh')
+    await writeFile(
+      service,
+      `#!/bin/sh
+printf 'RCTF_FLAGS_DIR=%s\\n' "$RCTF_FLAGS_DIR"
+printf 'RCTF_INSTANCE_ID=%s\\n' "$RCTF_INSTANCE_ID"
+printf 'RCTF_HOSTNAME=%s\\n' "$RCTF_HOSTNAME"
+printf 'NORMAL=%s\\n' "$NORMAL"
+`,
+      { mode: 0o755 }
+    )
+    const metadata = JSON.stringify({
+      rctf: {
+        version: 1,
+        instanceId: 'real-instance',
+        hostname: 'real-host',
+        env: {
+          FLAGS_DIR: '/challenge/flags',
+          RCTF_FLAGS_DIR: '/challenge/reserved',
+          RCTF_INSTANCE_ID: 'evil-instance',
+          RCTF_HOSTNAME: 'evil-host',
+          NORMAL: 'kept',
+        },
+        flags: [{ provider: 'main', flag: 'flag{env-test}' }],
+      },
+    })
+    const result = await runSh(
+      sourceInit(`
+        instance_id=real-instance
+        hostname=real-host
+        write_env_file "$METADATA"
+        printf 'INIT_FLAGS_DIR=%s\\n' "$FLAGS_DIR"
+        write_flags "$METADATA"
+        SERVICE=${shQuote(service)}
+        run_service
+      `),
+      {
+        PATH: `${binDir}:/usr/bin:/bin`,
+        RCTF_RUN_ROOT: runRoot,
+        METADATA: metadata,
+      }
+    )
+    expect(result.code).toBe(0)
+    const lines = result.stdout.trim().split('\n')
+    expect(lines).toContain(`INIT_FLAGS_DIR=${flagsDir}`)
+    expect(lines).toContain(`RCTF_FLAGS_DIR=${flagsDir}`)
+    expect(lines).toContain('RCTF_INSTANCE_ID=real-instance')
+    expect(lines).toContain('RCTF_HOSTNAME=real-host')
+    expect(lines).toContain('NORMAL=kept')
+    // Reserved keys are omitted from the service environment and logged.
+    expect(result.stdout).not.toContain('/challenge/reserved')
+    expect(result.stdout).not.toContain('evil-instance')
+    expect(result.stderr).toContain('RCTF_ prefix is reserved')
+    // Flags still land in init's own tmpfs directory, not the challenge path.
+    expect(await readFile(path.join(flagsDir, 'main'), 'utf8')).toBe(
+      'flag{env-test}'
+    )
+    await expect(readFile('/challenge/flags/main')).rejects.toThrow()
+  })
+})
+
 describe('guest build-rootfs', () => {
   test('never writes through a source symlink into the host', async () => {
     const root = await tempRoot('rctf-guest-build-')

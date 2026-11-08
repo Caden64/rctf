@@ -73,14 +73,62 @@ const trustDir = (
   return undefined
 }
 
+/**
+ * An image file (kernel/rootfs/initrd) must be owned by root or the agent uid
+ * and must not be writable by group/other. Mode alone is not enough: a file
+ * owned by another local user could be replaced between validation and use.
+ */
 const trustFile = (
   target: string,
   what: string,
   st: StatLike
-): string | undefined =>
-  (st.mode & 0o022) !== 0
+): string | undefined => {
+  const uid = currentUid()
+  if (st.uid !== 0 && st.uid !== uid) {
+    return `${what} is owned by uid ${st.uid}, expected root or ${uid}: ${target}`
+  }
+  return (st.mode & 0o022) !== 0
     ? `${what} is group/other-writable: ${target}`
     : undefined
+}
+
+/**
+ * Containment (`realpath` below imagesDir) is not enough: a symlink may point
+ * at a file whose resolved intermediate directories are writable by another
+ * user. Check every ancestor of the RESOLVED target from imagesDir down
+ * (imagesDir itself is covered by `checkRootTrust`); no sticky allowance here.
+ */
+const checkResolvedAncestors = async (
+  root: string,
+  target: string
+): Promise<string | undefined> => {
+  const chain: string[] = []
+  let current = path.dirname(target)
+  for (;;) {
+    if (current === root) break
+    if (!isPathInside(root, current)) {
+      return `resolved path escapes imagesDir: ${target}`
+    }
+    chain.unshift(current)
+    const parent = path.dirname(current)
+    if (parent === current) return `resolved path escapes imagesDir: ${target}`
+    current = parent
+  }
+  for (const dir of chain) {
+    let st
+    try {
+      st = await stat(dir)
+    } catch (err) {
+      return `cannot stat ${dir}: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    }
+    if (!st.isDirectory()) return `not a directory: ${dir}`
+    const failure = trustDir(dir, 'image path directory', false, st)
+    if (failure !== undefined) return failure
+  }
+  return undefined
+}
 
 /** Every path component from `/` down to `target`, in order. */
 const parentChain = (target: string): string[] => {
@@ -143,17 +191,24 @@ export const checkImagesTrusted = async (
       if (trustDir(dir, `image ${name}`, false, dirStat) !== undefined) {
         return false
       }
-      for (const file of ['vmlinux', 'rootfs.ext4']) {
+      for (const file of ['vmlinux', 'rootfs.ext4', 'initrd']) {
+        const candidate = path.join(dir, file)
+        if (file === 'initrd' && !(await fileExists(candidate))) continue
         try {
           const resolved = await realFileInside(
             root,
-            path.join(dir, file),
+            candidate,
             `image ${name} ${file}`
           )
           const st = await stat(resolved.path)
           if (!st.isFile()) return false
           if (
             trustFile(resolved.path, `image ${name} ${file}`, st) !== undefined
+          ) {
+            return false
+          }
+          if (
+            (await checkResolvedAncestors(root, resolved.path)) !== undefined
           ) {
             return false
           }
@@ -173,7 +228,8 @@ const assertImageTrusted = async (
   root: string,
   dir: string,
   vmlinux: string,
-  rootfs: string
+  rootfs: string,
+  initrd?: string
 ): Promise<void> => {
   if (config.allowUntrustedImages) return
   const rootFailure = await checkRootTrust(config, root)
@@ -189,10 +245,12 @@ const assertImageTrusted = async (
       `image is not trusted, refusing to launch: ${dirFailure}`
     )
   }
-  for (const [target, what] of [
+  const files: [string, string][] = [
     [vmlinux, 'vmlinux'],
     [rootfs, 'rootfs.ext4'],
-  ] as const) {
+  ]
+  if (initrd !== undefined) files.push([initrd, 'initrd'])
+  for (const [target, what] of files) {
     const st = await stat(target)
     if (!st.isFile()) {
       throw new VmValidationError(
@@ -203,6 +261,12 @@ const assertImageTrusted = async (
     if (failure !== undefined) {
       throw new VmValidationError(
         `image is not trusted, refusing to launch: ${failure}`
+      )
+    }
+    const ancestorFailure = await checkResolvedAncestors(root, target)
+    if (ancestorFailure !== undefined) {
+      throw new VmValidationError(
+        `image is not trusted, refusing to launch: ${ancestorFailure}`
       )
     }
   }
@@ -248,7 +312,13 @@ export const resolveImage = async (
     `image ${image} rootfs.ext4`
   )
 
-  await assertImageTrusted(config, root, dir, vmlinux.path, rootfs.path)
+  const initrdCandidate = path.join(dir, 'initrd')
+  const initrd = (await fileExists(initrdCandidate))
+    ? (await realFileInside(root, initrdCandidate, `image ${image} initrd`))
+        .path
+    : undefined
+
+  await assertImageTrusted(config, root, dir, vmlinux.path, rootfs.path, initrd)
 
   const maxBytes = diskMiB * MIB
   if (rootfs.size > maxBytes) {
@@ -257,12 +327,6 @@ export const resolveImage = async (
         `reserved ${diskMiB} MiB (${maxBytes} bytes)`
     )
   }
-
-  const initrdCandidate = path.join(dir, 'initrd')
-  const initrd = (await fileExists(initrdCandidate))
-    ? (await realFileInside(root, initrdCandidate, `image ${image} initrd`))
-        .path
-    : undefined
 
   return {
     name: image,

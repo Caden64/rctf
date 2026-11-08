@@ -42,6 +42,7 @@ describe('preflight', () => {
     const result = await driver.preflight()
     expect(Object.keys(result.checks).sort()).toEqual([
       'apiSocketPath',
+      'cgroupRoot',
       'chrootBase',
       'firecrackerBin',
       'imagesDir',
@@ -57,6 +58,8 @@ describe('preflight', () => {
     expect(result.checks.imagesTrusted).toBe(true)
     expect(result.checks.runDir).toBe(true)
     expect(result.checks.apiSocketPath).toBe(true)
+    // The temp cgroup dir is not a cgroup2 mount.
+    expect(result.checks.cgroupRoot).toBe(false)
     expect(typeof result.checks.kvm).toBe('boolean')
     expect(typeof result.checks.reflink).toBe('boolean')
     expect(result.images).toEqual(['web-demo'])

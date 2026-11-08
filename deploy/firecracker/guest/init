@@ -194,6 +194,49 @@ write_flags() {
   return 0
 }
 
+# Write the challenge environment for the SERVICE ONLY. Keys beginning with
+# `RCTF_` are reserved for init and are skipped (and logged); the file is
+# sourced in a subshell, so a challenge key such as `FLAGS_DIR` can never
+# overwrite init's own variables.
+write_env_file() {
+  metadata=$1
+  : >"$ENV_FILE" || return 1
+  chmod 0600 "$ENV_FILE" 2>/dev/null || true
+  command -v jq >/dev/null 2>&1 || return 0
+  skipped=$(printf '%s' "$metadata" |
+    jq -r '.rctf.env // {} | keys[] | select(startswith("RCTF_"))') ||
+    skipped=
+  if [ -n "$skipped" ]; then
+    printf '%s\n' "$skipped" | while IFS= read -r key; do
+      if [ -n "$key" ]; then
+        log "refusing challenge env key $key (RCTF_ prefix is reserved)"
+      fi
+    done
+  fi
+  printf '%s' "$metadata" |
+    jq -r '.rctf.env // {} | to_entries[] | select(.key | startswith("RCTF_") | not) | "export \(.key)=\(.value | @sh)"' \
+      >>"$ENV_FILE"
+}
+
+# Run the service in a subshell: the challenge environment is sourced there,
+# never into init's own shell, and the three RCTF_* values are exported last so
+# they always win over challenge values of the same name.
+run_service() {
+  (
+    # Export the reserved values BEFORE sourcing challenge data. The filter in
+    # write_env_file already drops RCTF_* keys; this also means a challenge
+    # `FLAGS_DIR=/x` cannot change where RCTF_FLAGS_DIR points.
+    export RCTF_FLAGS_DIR="$FLAGS_DIR"
+    export RCTF_INSTANCE_ID="$instance_id"
+    export RCTF_HOSTNAME="$hostname"
+    if [ -f "$ENV_FILE" ]; then
+      # shellcheck disable=SC1090
+      . "$ENV_FILE"
+    fi
+    exec "$SERVICE"
+  )
+}
+
 main() {
   # --- basic filesystems ---------------------------------------------------
   mkdir -p /proc /sys /dev /run /tmp /etc 2>/dev/null || true
@@ -255,26 +298,18 @@ main() {
     fi
   fi
 
-  # --- environment ---------------------------------------------------------
-  : >"$ENV_FILE"
-  chmod 0600 "$ENV_FILE"
+  # --- environment (service-only) -----------------------------------------
   if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$metadata" |
-      jq -r '.rctf.env // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' \
-        >>"$ENV_FILE"
     instance_id=$(printf '%s' "$metadata" | jq -r '.rctf.instanceId // ""')
     hostname=$(printf '%s' "$metadata" | jq -r '.rctf.hostname // ""')
   else
     instance_id=
     hostname=
   fi
+  if ! write_env_file "$metadata"; then
+    log "could not write the challenge environment; starting without it"
+  fi
 
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-
-  export RCTF_FLAGS_DIR="$FLAGS_DIR"
-  export RCTF_INSTANCE_ID="$instance_id"
-  export RCTF_HOSTNAME="$hostname"
   if [ -n "$hostname" ]; then
     printf '%s\n' "$hostname" >/etc/hostname 2>/dev/null || true
     hostname "$hostname" 2>/dev/null || true
@@ -297,7 +332,7 @@ main() {
   fi
 
   log "starting $SERVICE"
-  exec "$SERVICE"
+  run_service
 }
 
 # Tests source this file to exercise the pure functions. Running as PID 1 (the

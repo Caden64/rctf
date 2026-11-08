@@ -1,5 +1,7 @@
 import { afterAll, afterEach, describe, expect, test } from 'bun:test'
 import {
+  chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -17,8 +19,10 @@ import { findInstanceProcesses, readStartTicks } from '../../src/agent/vm/proc'
 import {
   clearFakeEnv,
   canonicalFirecrackerBasename,
+  compiledFakeFirecracker,
+  directProcessExpectation,
   ensureFakeFirecracker,
-  exeNamesFor,
+  findDirectInstances,
   makeDirs,
   makeImage,
   makeLogger,
@@ -193,10 +197,7 @@ describe('handle liveness', () => {
     liveProcesses.push(firecracker.pid)
 
     try {
-      const found = await findInstanceProcesses(
-        id,
-        await exeNamesFor(config.firecrackerBin)
-      )
+      const found = await findDirectInstances(config, id)
       expect(found.map(proc => proc.pid)).toEqual([firecracker.pid])
       expect(await driver.adopt(id)).toBeDefined()
       expect((await driver.adopt(id))?.pid).toBe(firecracker.pid)
@@ -210,6 +211,79 @@ describe('handle liveness', () => {
       await firecracker.exited
     }
     expect(config.runDir).toBeDefined()
+  })
+
+  test('rejects an impostor that copies the firecracker basename (different inode)', async () => {
+    const { root, config, driver } = await setup()
+    const id = newInstanceId()
+    const binBase = await canonicalFirecrackerBasename(config.firecrackerBin)
+    const dir = path.join(root, 'impostor')
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    const impostor = path.join(dir, binBase)
+    await copyFile(await compiledFakeFirecracker(), impostor)
+    await chmod(impostor, 0o755)
+    const apiSocket = path.join(dir, 'api.sock')
+    const proc = Bun.spawn([impostor, '--id', id, '--api-sock', apiSocket], {
+      detached: true,
+      stdin: 'ignore',
+      stdout: 'ignore',
+      stderr: 'ignore',
+    })
+    liveProcesses.push(proc.pid)
+    try {
+      const ticks = await waitFor(proc.pid)
+      const trusted = await directProcessExpectation(config, id)
+      expect(await findInstanceProcesses(trusted)).toEqual([])
+      // A new-style handle carrying the trusted executable identity must not
+      // authenticate the impostor.
+      expect(
+        await driver.isAlive({
+          instanceId: id,
+          pid: proc.pid,
+          pidStartTicks: ticks,
+          apiSocket,
+          dir,
+          exeDev: trusted.exe.dev,
+          exeIno: trusted.exe.ino,
+          exePath: '/trusted/firecracker',
+          uid: trusted.uid,
+        } as VmHandle)
+      ).toBe(false)
+      expect(await driver.adopt(id)).toBeUndefined()
+      // destroy must not kill a process it cannot authenticate.
+      await driver.destroy(id)
+      expect(await readStartTicks(proc.pid)).toBeDefined()
+    } finally {
+      try {
+        process.kill(proc.pid, 'SIGKILL')
+      } catch {
+        // gone
+      }
+    }
+  })
+
+  test('rejects a process whose uid or proc root does not match the expectation', async () => {
+    const { root, config, driver } = await setup()
+    const id = newInstanceId()
+    const live = await startLiveFake(root, id)
+    liveProcesses.push(live.pid)
+    try {
+      const trusted = await directProcessExpectation(config, id)
+      expect(await findInstanceProcesses(trusted)).toHaveLength(1)
+      expect(
+        await findInstanceProcesses({ ...trusted, uid: trusted.uid + 1 })
+      ).toEqual([])
+      expect(
+        await findInstanceProcesses({
+          ...trusted,
+          jailRoot: path.join(root, 'wrong-jail'),
+        })
+      ).toEqual([])
+      expect(await driver.isAlive(live.handle)).toBe(true)
+    } finally {
+      live.kill()
+      await waitGone(live.pid)
+    }
   })
 })
 
@@ -273,6 +347,15 @@ const writeJailer = async (root: string, body: string): Promise<string> => {
   return bin
 }
 
+const copyFakeBinary = async (root: string, name: string): Promise<string> => {
+  const dir = path.join(root, 'bin')
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  const target = path.join(dir, name)
+  await copyFile(await compiledFakeFirecracker(), target)
+  await chmod(target, 0o755)
+  return target
+}
+
 const jailerPrelude = `
 id=
 exec_file=
@@ -287,6 +370,9 @@ while [ $# -gt 0 ]; do
 done
 b=$(basename "$exec_file")
 dir=$base/$b/$id/root
+mkdir -p "$dir"
+cp "$exec_file" "$dir/$b"
+chmod 0755 "$dir/$b"
 `
 
 describe('stale state, rollback and orphans', () => {
@@ -360,7 +446,7 @@ describe('stale state, rollback and orphans', () => {
     const jailerBin = await writeJailer(
       root,
       `${jailerPrelude}
-"$exec_file" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
+"$dir/$b" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
 sleep 0.3
 `
     )
@@ -384,12 +470,7 @@ sleep 0.3
       await expect(driver.launch(makeRequest(id, 'web-demo'))).rejects.toThrow(
         /pid file|exited/
       )
-      expect(
-        await findInstanceProcesses(
-          id,
-          await exeNamesFor(config.firecrackerBin)
-        )
-      ).toEqual([])
+      expect(await findDirectInstances(config, id)).toEqual([])
       expect(await pathExists(path.join(config.runDir, id))).toBe(false)
       const fcBase = await canonicalFirecrackerBasename(config.firecrackerBin)
       expect(await pathExists(path.join(config.chrootBase, fcBase, id))).toBe(
@@ -445,6 +526,55 @@ printf '%s\\n' "$child" > ${shQuote(pidPath)}
           // gone
         }
       }
+      await driver.destroy(id).catch(() => undefined)
+    }
+  })
+
+  test('rollback catches a jail child that execs only after the first scan', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-life-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const jailerBin = await writeJailer(
+      root,
+      `${jailerPrelude}
+( sleep 0.03; : > "$base/late-child-$id"; exec "$dir/$b" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 ) &
+exit 0
+`
+    )
+    const config = await makeVmConfig({
+      dirs,
+      overrides: {
+        mode: 'jailer',
+        jailerBin,
+        apiStartTimeoutMs: 300,
+        killWaitMs: 3000,
+      },
+    })
+    const driver = createVmDriver(config, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: spawnWithEnv,
+    })
+    const id = newInstanceId()
+    await makeImage(config.imagesDir, 'web-demo')
+    const jail = path.join(
+      config.chrootBase,
+      await canonicalFirecrackerBasename(config.firecrackerBin),
+      id
+    )
+    try {
+      await expect(driver.launch(makeRequest(id, 'web-demo'))).rejects.toThrow(
+        /pid file|exited/
+      )
+      // The child got as far as exec (marker written just before exec) and was
+      // still found and killed by the post-jailer rescan.
+      expect(
+        await pathExists(path.join(config.chrootBase, `late-child-${id}`))
+      ).toBe(true)
+      expect(await pathExists(jail)).toBe(false)
+      expect(await pathExists(path.join(config.runDir, id))).toBe(false)
+      expect(await driver.listInstanceIds()).not.toContain(id)
+    } finally {
       await driver.destroy(id).catch(() => undefined)
     }
   })
@@ -514,6 +644,135 @@ printf '%s\\n' "$child" > ${shQuote(pidPath)}
   })
 })
 
+describe('configured binary changes after a restart', () => {
+  test('direct mode: adopt, isAlive, listInstanceIds and destroy use persisted identity', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-switch-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const binA = await copyFakeBinary(root, 'firecracker-a')
+    const binB = await copyFakeBinary(root, 'firecracker-b')
+    const configA = await makeVmConfig({
+      dirs,
+      overrides: { mode: 'direct', firecrackerBin: binA },
+    })
+    const configB = await makeVmConfig({
+      dirs,
+      overrides: { mode: 'direct', firecrackerBin: binB },
+    })
+    const driverA = createVmDriver(configA, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: spawnWithEnv,
+    })
+    const driverB = createVmDriver(configB, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: spawnWithEnv,
+    })
+    const id = newInstanceId()
+    await makeImage(configA.imagesDir, 'web-demo')
+    const handle = await driverA.launch(makeRequest(id, 'web-demo'))
+    liveProcesses.push(handle.pid)
+    try {
+      expect((handle as VmHandle & { exeIno?: number }).exeIno).toBeGreaterThan(
+        0
+      )
+      expect(await driverB.isAlive(handle)).toBe(true)
+      const reloaded: VmHandle = {
+        instanceId: id,
+        pid: handle.pid,
+        pidStartTicks: handle.pidStartTicks,
+        apiSocket: handle.apiSocket,
+        dir: handle.dir,
+      }
+      // A manager reload strips unknown handle fields; the sidecar marker is
+      // the fallback trust anchor.
+      expect(await driverB.isAlive(reloaded)).toBe(true)
+      const adopted = await driverB.adopt(id)
+      expect(adopted?.pid).toBe(handle.pid)
+      expect(
+        (adopted as (VmHandle & { exeIno?: number }) | undefined)?.exeIno
+      ).toBe((handle as VmHandle & { exeIno?: number }).exeIno)
+      expect(await driverB.listInstanceIds()).toContain(id)
+
+      await driverB.destroy(id)
+      expect(await waitGone(handle.pid)).toBe(true)
+      expect(await pathExists(path.join(configB.runDir, id))).toBe(false)
+    } finally {
+      liveProcesses.push(handle.pid)
+      await driverA.destroy(id).catch(() => undefined)
+    }
+  })
+
+  test('jailer mode: an old-basename jail remains adoptable and destroyable', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-switch-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const binA = await copyFakeBinary(root, 'firecracker-a')
+    const binB = await copyFakeBinary(root, 'firecracker-b')
+    const jailerBin = await writeJailer(
+      root,
+      `${jailerPrelude}
+"$dir/$b" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
+printf '%s\\n' "$!" > "$dir/$b.pid"
+`
+    )
+    const configA = await makeVmConfig({
+      dirs,
+      overrides: { mode: 'jailer', firecrackerBin: binA, jailerBin },
+    })
+    const configB = await makeVmConfig({
+      dirs,
+      overrides: { mode: 'jailer', firecrackerBin: binB, jailerBin },
+    })
+    const driverA = createVmDriver(configA, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: spawnWithEnv,
+    })
+    const driverB = createVmDriver(configB, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: spawnWithEnv,
+    })
+    const id = newInstanceId()
+    await makeImage(configA.imagesDir, 'web-demo')
+    const handle = await driverA.launch(makeRequest(id, 'web-demo'))
+    liveProcesses.push(handle.pid)
+    const oldJail = path.join(configA.chrootBase, 'firecracker-a', id)
+    try {
+      expect(await pathExists(oldJail)).toBe(true)
+      // Simulate the newly configured driver having no marker in runDir: the
+      // jail copy itself is the trust anchor.
+      await rm(path.join(configA.runDir, id), {
+        recursive: true,
+        force: true,
+      })
+      expect(await driverB.listInstanceIds()).toContain(id)
+      expect(await driverB.isAlive(handle)).toBe(true)
+      const reloaded: VmHandle = {
+        instanceId: id,
+        pid: handle.pid,
+        pidStartTicks: handle.pidStartTicks,
+        apiSocket: handle.apiSocket,
+        dir: handle.dir,
+      }
+      // No marker and no identity fields: the old jail copy still anchors it.
+      expect(await driverB.isAlive(reloaded)).toBe(true)
+      const adopted = await driverB.adopt(id)
+      expect(adopted?.pid).toBe(handle.pid)
+      expect(adopted?.apiSocket).toBe(path.join(oldJail, 'root', 'api.sock'))
+      expect(adopted?.dir).toBe(oldJail)
+
+      await driverB.destroy(id)
+      expect(await waitGone(handle.pid)).toBe(true)
+      expect(await pathExists(oldJail)).toBe(false)
+    } finally {
+      await driverA.destroy(id).catch(() => undefined)
+    }
+  })
+})
+
 describe('destroy', () => {
   const launchOne = async (
     config: VmConfig,
@@ -532,9 +791,7 @@ describe('destroy', () => {
 
     await driver.destroy(id)
     expect(await driver.isAlive(handle)).toBe(false)
-    expect(
-      await findInstanceProcesses(id, await exeNamesFor(config.firecrackerBin))
-    ).toEqual([])
+    expect(await findDirectInstances(config, id)).toEqual([])
     expect(await pathExists(path.join(config.runDir, id))).toBe(false)
 
     await driver.destroy(id)
@@ -549,6 +806,23 @@ describe('destroy', () => {
     await writeFile(path.join(dir, 'rootfs.ext4'), 'partial')
     await driver.destroy(id)
     expect(await pathExists(dir)).toBe(false)
+  })
+
+  test('fails destroy when a cgroup cannot be removed (busy/non-empty)', async () => {
+    const { config, driver } = await setup()
+    const id = newInstanceId()
+    const fcBase = await canonicalFirecrackerBasename(config.firecrackerBin)
+    const cgroup = path.join(config.cgroupRoot, fcBase, id)
+    await mkdir(cgroup, { recursive: true })
+    await writeFile(path.join(cgroup, 'cgroup.procs'), '12345\n')
+    await expect(driver.destroy(id)).rejects.toThrow(
+      /ENOTEMPTY|directory not empty/i
+    )
+    // The manager keeps the teardown pending and retries; once the cgroup is
+    // empty a second destroy succeeds.
+    await rm(path.join(cgroup, 'cgroup.procs'))
+    await driver.destroy(id)
+    expect(await pathExists(cgroup)).toBe(false)
   })
 
   test('never follows a symlinked instance dir', async () => {

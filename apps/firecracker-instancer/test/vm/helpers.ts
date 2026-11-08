@@ -25,7 +25,13 @@ import type { Logger } from '../../src/log'
 import { bunCommandRunner } from '../../src/util/exec'
 import { vmConfigSchema, type VmConfig } from '../../src/agent/vm/config'
 import type { VmSpawn } from '../../src/agent/vm/driver'
-import { readStartTicks } from '../../src/agent/vm/proc'
+import {
+  findInstanceProcesses,
+  readStartTicks,
+  statExeIdentity,
+  type FoundProcess,
+  type ProcessExpectation,
+} from '../../src/agent/vm/proc'
 
 export const FAKE_SCRIPT = path.join(import.meta.dir, 'fake-firecracker.ts')
 
@@ -104,6 +110,22 @@ export const exeNamesFor = async (
   firecrackerBin: string
 ): Promise<ReadonlySet<string>> =>
   new Set([await canonicalFirecrackerBasename(firecrackerBin)])
+
+/** Identity a direct-mode fake-firecracker process must present. */
+export const directProcessExpectation = async (
+  config: VmConfig,
+  instanceId: string
+): Promise<ProcessExpectation> => ({
+  instanceId,
+  exe: await statExeIdentity(await realpath(config.firecrackerBin)),
+  uid: typeof process.getuid === 'function' ? process.getuid() : 0,
+})
+
+export const findDirectInstances = async (
+  config: VmConfig,
+  instanceId: string
+): Promise<FoundProcess[]> =>
+  findInstanceProcesses(await directProcessExpectation(config, instanceId))
 
 export interface RecordedRunner {
   runner: CommandRunner

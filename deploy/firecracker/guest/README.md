@@ -76,7 +76,11 @@ reachable through the host network stack.
 }
 ```
 
-- `env` is non-secret and is exported to the service.
+- `env` is non-secret and is exported to the service. Keys beginning with
+  `RCTF_` are reserved for init: they are skipped (and logged) so challenge
+  config can never spoof `RCTF_FLAGS_DIR`/`RCTF_INSTANCE_ID`/`RCTF_HOSTNAME`.
+  The environment is sourced only in the service's subshell, so a challenge key
+  such as `FLAGS_DIR` cannot overwrite init's own state either.
 - `flags` are secrets. `init` writes each one to
   `/run/rctf/flags/<sanitised provider>` with mode 0400 on a tmpfs, and never
   to the ext4 rootfs. Provider names are sanitised (`[^A-Za-z0-9._-]` → `_`);
@@ -98,11 +102,11 @@ reachable through the host network stack.
 
 - `RCTF_FLAGS_DIR` (e.g. `/run/rctf/flags`),
 - `RCTF_INSTANCE_ID`, `RCTF_HOSTNAME`,
-- every key from `rctf.env`, and sets the hostname.
+- every non-reserved key from `rctf.env`, and sets the hostname.
 
 Then it `exec`s the first of:
 
-1. `$RCTF_SERVICE` (may also come from the metadata env),
+1. `$RCTF_SERVICE` (from init's own environment, not challenge metadata),
 2. `/app/start`,
 3. `/sbin/rctf-service`,
 4. `/etc/rctf/service`,
