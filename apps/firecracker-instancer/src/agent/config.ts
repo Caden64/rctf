@@ -1,6 +1,18 @@
 import * as z from 'zod/mini'
+import { loadTlsIdentity, type LoadedTlsIdentity } from '../util/tls'
 import { networkConfigSchema } from './net/config'
 import { vmConfigSchema } from './vm/config'
+
+/**
+ * Native TLS listener settings. `caFile` turns the listener into mTLS: client
+ * certificates are requested and must verify against that CA.
+ */
+export const agentTlsConfigSchema = z.object({
+  certFile: z.string(),
+  keyFile: z.string(),
+  caFile: z.optional(z.string()),
+})
+export type AgentTlsConfig = z.output<typeof agentTlsConfigSchema>
 
 /** Owner: track 4 (agent). Composes the per-track sub-configs. */
 export const agentConfigSchema = z.object({
@@ -13,6 +25,11 @@ export const agentConfigSchema = z.object({
   ),
   /** Bearer token; env FIRECRACKER_AGENT_TOKEN overrides. */
   token: z.optional(z.string()),
+  /**
+   * Serve HTTPS natively. Without this the agent serves plain HTTP (bind it to
+   * a private address and firewall it to the controller).
+   */
+  tls: z.optional(agentTlsConfigSchema),
   /** Durable agent state: instance records (no flags). */
   stateDir: z.optional(
     z.prefault(z.string(), '/var/lib/rctf-firecracker/state')
@@ -43,7 +60,26 @@ export const agentConfigSchema = z.object({
   vm: z.optional(z.prefault(vmConfigSchema, {})),
   network: networkConfigSchema,
 })
-export type AgentConfig = z.output<typeof agentConfigSchema>
+export type AgentConfig = z.output<typeof agentConfigSchema> & {
+  /**
+   * Loaded and validated from `tls` at startup. Never logged: it contains the
+   * private key bytes.
+   */
+  tlsMaterial?: LoadedTlsIdentity
+}
+
+/**
+ * Load and validate the configured TLS material. Exported so `loadAgentConfig`
+ * can fail before any privileged preflight runs, and so tests can exercise the
+ * same path the listener uses.
+ */
+export const resolveAgentTls = (
+  config: AgentConfig,
+  opts?: { now?: number; expirySkewMs?: number }
+): LoadedTlsIdentity | undefined =>
+  config.tls === undefined
+    ? undefined
+    : loadTlsIdentity(config.tls, { label: 'agent tls', ...opts })
 
 /**
  * In jailer mode Firecracker runs as `vm.jailUid:vm.jailGid` and must be able to

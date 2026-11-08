@@ -1,7 +1,12 @@
 import { readFile } from 'node:fs/promises'
 import yaml from 'yaml'
 import { createLogger } from '../log'
-import { agentConfigSchema, alignTapOwner, type AgentConfig } from './config'
+import {
+  agentConfigSchema,
+  alignTapOwner,
+  resolveAgentTls,
+  type AgentConfig,
+} from './config'
 import { createInstanceManager } from './manager'
 import { createNetworkManager } from './net'
 import { createAgentServer } from './server'
@@ -22,6 +27,8 @@ export const loadAgentConfig = async (file: string): Promise<AgentConfig> => {
       'agent token is required (config.token or FIRECRACKER_AGENT_TOKEN)'
     )
   }
+  // Fail before any privileged preflight or VM recovery work starts.
+  config.tlsMaterial = resolveAgentTls(config)
   return config
 }
 
@@ -58,6 +65,8 @@ export const runAgent = async (configPath: string): Promise<void> => {
     {
       hostId: config.hostId,
       listen: config.listen ?? { host: '127.0.0.1', port: 7001 },
+      tls: config.tls !== undefined,
+      mtls: config.tls?.caFile !== undefined,
     },
     'firecracker agent listening'
   )

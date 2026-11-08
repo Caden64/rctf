@@ -21,7 +21,7 @@ import {
 } from '@rctf/firecracker-protocol'
 import type { InstanceManager } from '../interfaces'
 import { createLogger, type Logger } from '../log'
-import type { AgentConfig } from './config'
+import { resolveAgentTls, type AgentConfig } from './config'
 
 export const MAX_REQUEST_BODY_BYTES = 1024 * 1024
 /** A create may legitimately take ~30s; do not cut the connection earlier. */
@@ -248,12 +248,33 @@ export const createAgentServer = (deps: {
   }
 
   const listen = config.listen ?? { host: '127.0.0.1', port: 7001 }
+  // Loading/validating here as well as in loadAgentConfig keeps the listener
+  // fail-closed for callers that build an AgentConfig directly (tests, tools).
+  const tlsMaterial = config.tlsMaterial ?? resolveAgentTls(config)
+  const tls =
+    tlsMaterial === undefined
+      ? undefined
+      : {
+          cert: tlsMaterial.cert,
+          key: tlsMaterial.key,
+          // A configured client CA means mTLS: require and verify a client
+          // certificate. rejectUnauthorized is explicit so an operator's
+          // NODE_TLS_REJECT_UNAUTHORIZED=0 cannot silently disable it.
+          ...(tlsMaterial.ca === undefined
+            ? {}
+            : {
+                ca: tlsMaterial.ca,
+                requestCert: true,
+                rejectUnauthorized: true,
+              }),
+        }
   const server = Bun.serve({
     hostname: listen.host,
     port: listen.port,
     /** Reject oversized bodies before Bun buffers them. */
     maxRequestBodySize: deps.maxRequestBodyBytes ?? MAX_REQUEST_BODY_BYTES,
     idleTimeout: SERVER_IDLE_TIMEOUT_SECONDS,
+    ...(tls === undefined ? {} : { tls }),
     fetch,
     error(err) {
       logger.error(
@@ -263,6 +284,13 @@ export const createAgentServer = (deps: {
       return errorResponse('internal', 'internal error')
     },
   })
+  if (tls !== undefined && server.protocol !== 'https') {
+    // Never silently fall back to plaintext when TLS was requested.
+    void server.stop(true)
+    throw new Error(
+      `Bun.serve did not enable TLS (protocol ${String(server.protocol)}); refusing to serve the agent API in plaintext`
+    )
+  }
 
   return {
     server,
