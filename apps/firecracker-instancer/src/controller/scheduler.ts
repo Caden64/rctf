@@ -22,6 +22,8 @@ export interface PlacementCandidate {
   config: HostConfig
   host: HostRecord
   reserved: Reserved
+  /** Max |clock skew| in ms allowed for placement (default: unlimited). */
+  maxClockSkewMs?: number
 }
 
 export const effectiveCapacity = (
@@ -37,10 +39,15 @@ export const effectiveCapacity = (
         maxInstances: Math.min(configured.maxInstances, reported.maxInstances),
       }
 
+const withinClockSkew = (candidate: PlacementCandidate): boolean =>
+  candidate.maxClockSkewMs === undefined ||
+  Math.abs(candidate.host.clockSkewMs) <= candidate.maxClockSkewMs
+
 export const isPlaceable = (candidate: PlacementCandidate): boolean =>
   candidate.host.health === 'healthy' &&
   !candidate.host.draining &&
-  candidate.host.accepting
+  candidate.host.accepting &&
+  withinClockSkew(candidate)
 
 export interface FitResult {
   fits: boolean
@@ -146,6 +153,23 @@ export const describeNoCapacity = (
   if (placeable.length === 0) {
     if (candidates.every(candidate => candidate.host.health !== 'healthy')) {
       return 'no capacity: all hosts are unhealthy'
+    }
+    const clockSkew = candidates.filter(
+      candidate =>
+        candidate.host.health === 'healthy' &&
+        !candidate.host.draining &&
+        candidate.host.accepting &&
+        !withinClockSkew(candidate)
+    )
+    if (
+      clockSkew.length > 0 &&
+      clockSkew.length ===
+        candidates.filter(
+          candidate =>
+            candidate.host.health === 'healthy' && !candidate.host.draining
+        ).length
+    ) {
+      return 'no capacity: all hosts exceed the maximum clock skew'
     }
     return 'no capacity: no host is accepting instances'
   }

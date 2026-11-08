@@ -96,6 +96,82 @@ describe('HttpAgentClient', () => {
     expect((error as AgentRejectedError).code).toBe('no_capacity')
   })
 
+  test('documented pre-create rejections stay AgentRejectedError', async () => {
+    for (const [code, status] of [
+      ['no_capacity', 507],
+      ['draining', 503],
+      ['invalid_request', 400],
+      ['unauthorized', 401],
+    ] as const) {
+      const { client } = startServer(() =>
+        json({ kind: 'agentError', code, message: code }, status)
+      )
+      const error = await client()
+        .create(makeAgentSpec('a'.repeat(24)))
+        .catch(error => error)
+      expect(error).toBeInstanceOf(AgentRejectedError)
+      expect((error as AgentRejectedError).code).toBe(code)
+    }
+  })
+
+  test('a well-formed HTTP 500 body after a create is ambiguous', async () => {
+    let created = false
+    const { client } = startServer(request => {
+      if (request.method === 'PUT') {
+        created = true
+        return json(
+          { kind: 'agentError', code: 'internal', message: 'mid-create' },
+          500
+        )
+      }
+      return json(agentInfo)
+    })
+    const error = await client()
+      .create(makeAgentSpec('a'.repeat(24)))
+      .catch(error => error)
+    // The VM may exist: the controller must keep the row and reconcile.
+    expect(created).toBe(true)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
+
+  test('non-definitive create error codes are ambiguous', async () => {
+    for (const [code, status] of [
+      ['host_unavailable', 503],
+      ['conflict', 409],
+      ['spec_mismatch', 409],
+      ['in_progress', 409],
+      ['internal', 500],
+    ] as const) {
+      const { client } = startServer(() =>
+        json({ kind: 'agentError', code, message: code }, status)
+      )
+      const error = await client()
+        .create(makeAgentSpec('a'.repeat(24)))
+        .catch(error => error)
+      expect(error).toBeInstanceOf(AgentUnreachableError)
+    }
+  })
+
+  test('a malformed 2xx create body is ambiguous', async () => {
+    const { client } = startServer(
+      () => new Response('not json', { status: 200 })
+    )
+    const error = await client()
+      .create(makeAgentSpec('a'.repeat(24)))
+      .catch(error => error)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
+
+  test('a 500 on GET is unreachable, not a rejection', async () => {
+    const { client } = startServer(() =>
+      json({ kind: 'agentError', code: 'internal', message: 'boom' }, 500)
+    )
+    const error = await client()
+      .get(agentInstance.id)
+      .catch(error => error)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
+
   test('malformed JSON is an error, not a crash', async () => {
     const { client } = startServer(
       () => new Response('<html>oops</html>', { status: 200 })

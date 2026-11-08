@@ -36,7 +36,7 @@ import {
   type ControllerService,
 } from '../interfaces'
 import { createLogger, type Logger } from '../log'
-import { HttpAgentClient } from './agent-client'
+import { HttpAgentClient, isConfirmedGone } from './agent-client'
 import type { ControllerConfig, HostConfig } from './config'
 import {
   defaultTimers,
@@ -214,6 +214,11 @@ class ControllerServiceImpl implements ControllerService {
     const attempted = new Set<string>()
     let lastFailure: string | undefined
 
+    // A terminal `errored` row does not hold the key, but its agent-side
+    // tombstone would otherwise live forever. Best-effort GC before the new
+    // placement; the reconciler sweeps anything this misses.
+    await this.gcErroredForKey(key)
+
     for (let attempt = 0; attempt < this.config.hosts.length; attempt++) {
       const outcome = this.reserve(req, challenge, key, request, attempted)
       if (outcome.kind === 'existing') return this.detailsForRow(outcome.row)
@@ -236,6 +241,17 @@ class ControllerServiceImpl implements ControllerService {
         const agent = await client.create(spec)
         const applied = this.applyAgentCreate(row, agent)
         if (!applied) {
+          const current = this.store.getInstance(row.id)
+          // A concurrent GET (or a reconciler adoption) may already have
+          // promoted this row to running, or it may still be creating. In
+          // both cases the VM is healthy and owned: accept it. Tear down only
+          // when the row is gone or no longer live.
+          if (
+            current !== null &&
+            (current.state === 'creating' || current.state === 'running')
+          ) {
+            return this.detailsForRow(current)
+          }
           // The player deleted (or the host was written off) while the create
           // was in flight. Make sure no VM is leaked behind their back.
           try {
@@ -247,7 +263,13 @@ class ControllerServiceImpl implements ControllerService {
         }
         return this.detailsForRow(this.store.getInstance(row.id) ?? row)
       } catch (error) {
-        if (error instanceof AgentRejectedError) {
+        if (
+          error instanceof AgentRejectedError &&
+          (error.code === 'no_capacity' ||
+            error.code === 'draining' ||
+            error.code === 'invalid_request' ||
+            error.code === 'unauthorized')
+        ) {
           // Definitive: nothing was created. Release and try the next host.
           this.store.deleteInstanceIfState(row.id, 'creating')
           lastFailure = `${error.code}: ${error.message}`
@@ -264,10 +286,23 @@ class ControllerServiceImpl implements ControllerService {
         if (error instanceof AgentUnreachableError) {
           // AMBIGUOUS: the request may have created the VM. Do not release the
           // reservation or try another host; the reconciler resolves it by
-          // adopting the agent record or cleaning the row.
+          // adopting the agent record or fencing it.
           this.logger.warn(
             { instanceId: row.id, hostId: row.hostId },
             'agent create outcome unknown; reconciler will resolve'
+          )
+          return this.detailsForRow(this.store.getInstance(row.id) ?? row)
+        }
+        if (error instanceof AgentRejectedError) {
+          // Defense in depth: a non-definitive rejection code (for example a
+          // misclassified 500/internal) is not proof the VM was not created.
+          this.logger.warn(
+            {
+              instanceId: row.id,
+              hostId: row.hostId,
+              code: error.code,
+            },
+            'non-definitive agent create rejection; treating as ambiguous'
           )
           return this.detailsForRow(this.store.getInstance(row.id) ?? row)
         }
@@ -380,6 +415,7 @@ class ControllerServiceImpl implements ControllerService {
 
       const at = this.now()
       const reserved = this.store.reservedByHost()
+      const maxClockSkewMs = (this.config.maxClockSkewSeconds ?? 10) * 1000
       const candidates = this.config.hosts
         .filter(host => !attempted.has(host.id))
         .map(host => {
@@ -388,6 +424,7 @@ class ControllerServiceImpl implements ControllerService {
             config: host,
             host: record,
             reserved: reserved.get(host.id) ?? EMPTY_RESERVED,
+            maxClockSkewMs,
           }
         })
 
@@ -438,6 +475,10 @@ class ControllerServiceImpl implements ControllerService {
     })
   }
 
+  private skewFor(hostId: string): number {
+    return this.store.getHost(hostId)?.clockSkewMs ?? 0
+  }
+
   private buildSpec(
     row: InstanceRecord,
     challenge: NormalizedChallenge,
@@ -475,7 +516,8 @@ class ControllerServiceImpl implements ControllerService {
               title: entry.title,
             }
       ),
-      expiresAtMs: row.expiresAtMs,
+      // Deadlines are on the AGENT clock.
+      expiresAtMs: row.expiresAtMs + this.skewFor(row.hostId),
       flags: req.flags,
     }
   }
@@ -499,7 +541,8 @@ class ControllerServiceImpl implements ControllerService {
     return this.store.casState(row.id, ['creating'], target, at, {
       endpoints,
       message: agent.message ?? null,
-      agentExpirySynced: true,
+      agentExpirySynced:
+        agent.expiresAtMs - this.skewFor(row.hostId) >= row.expiresAtMs,
     })
   }
 
@@ -530,7 +573,6 @@ class ControllerServiceImpl implements ControllerService {
           Math.max(0, row.expiresAtMs - this.now()),
           row.endpoints
         )
-      case 'reserving':
       case 'creating':
         return details(
           'starting',
@@ -690,9 +732,15 @@ class ControllerServiceImpl implements ControllerService {
           message: 'instance changed state while extending',
         }
       }
+      // updateExpiry is monotonic: a competing/out-of-order extend can never
+      // shorten the deadline.
       return {
         kind: 'ok',
-        row: { ...row, expiresAtMs, agentExpirySynced: false },
+        row: {
+          ...row,
+          expiresAtMs: Math.max(row.expiresAtMs, expiresAtMs),
+          agentExpirySynced: false,
+        },
       }
     })
 
@@ -705,9 +753,12 @@ class ControllerServiceImpl implements ControllerService {
     const row = outcome.row
     const client = this.clients[row.hostId]
     if (client !== undefined) {
+      const skewMs = this.skewFor(row.hostId)
       try {
-        await client.extend(row.id, row.expiresAtMs)
-        this.store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
+        const confirmed = await client.extend(row.id, row.expiresAtMs + skewMs)
+        if (confirmed.expiresAtMs - skewMs >= row.expiresAtMs) {
+          this.store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
+        }
       } catch (error) {
         this.logger.warn(
           {
@@ -737,7 +788,7 @@ class ControllerServiceImpl implements ControllerService {
           await client.delete(row.id)
           this.store.deleteInstanceIfState(row.id, 'lost')
         } catch (error) {
-          if (this.isConfirmedGone(error)) {
+          if (isConfirmedGone(error)) {
             this.store.deleteInstanceIfState(row.id, 'lost')
           }
           // Unreachable: keep the tombstone; the host's return cleans it up.
@@ -749,7 +800,7 @@ class ControllerServiceImpl implements ControllerService {
     if (row.state !== 'deleting') {
       const changed = this.store.casState(
         row.id,
-        ['reserving', 'creating', 'running', 'errored'],
+        ['creating', 'running', 'errored'],
         'deleting',
         at
       )
@@ -766,7 +817,7 @@ class ControllerServiceImpl implements ControllerService {
         this.store.deleteInstanceIfState(row.id, 'deleting')
         return stoppedDetails()
       } catch (error) {
-        if (this.isConfirmedGone(error)) {
+        if (isConfirmedGone(error)) {
           this.store.deleteInstanceIfState(row.id, 'deleting')
           return stoppedDetails()
         }
@@ -784,11 +835,24 @@ class ControllerServiceImpl implements ControllerService {
     return details('stopping', 0, row.endpoints)
   }
 
-  private isConfirmedGone(error: unknown): boolean {
-    return (
-      error instanceof AgentRejectedError &&
-      (error.code === 'not_found' || error.code === 'expired')
-    )
+  /**
+   * Best-effort GC of terminal `errored` rows for one key. The agent delete is
+   * confirmed (200/404) before the DB row is removed; failures are left for
+   * the reconciler sweep.
+   */
+  private async gcErroredForKey(key: InstanceKey): Promise<void> {
+    for (const row of this.store.listErroredForKey(key)) {
+      const client = this.clients[row.hostId]
+      if (client === undefined) continue
+      try {
+        await client.delete(row.id)
+        this.store.deleteInstanceIfState(row.id, 'errored')
+      } catch (error) {
+        if (isConfirmedGone(error)) {
+          this.store.deleteInstanceIfState(row.id, 'errored')
+        }
+      }
+    }
   }
 
   // ---- ops: hosts -------------------------------------------------------
@@ -846,8 +910,18 @@ class ControllerServiceImpl implements ControllerService {
   }
 
   async removeHost(hostId: string): Promise<void> {
-    this.configuredHost(hostId)
-    this.store.removeHost(hostId)
+    const host = this.configuredHost(hostId)
+    const record = this.store.getHost(host.id)
+    if (record === null || record.health !== 'unhealthy') {
+      throw new ProtocolError(
+        'conflict',
+        'host must be unhealthy before it can be removed'
+      )
+    }
+    // Write the live rows off as `lost` tombstones (cleanup still happens when
+    // the agent returns) and leave the host draining; config seeding and later
+    // heartbeats must not resurrect it.
+    this.store.removeHost(host.id, this.now())
   }
 
   // ---- lifecycle --------------------------------------------------------
@@ -907,7 +981,8 @@ class ControllerServiceImpl implements ControllerService {
   }
 
   async stop(): Promise<void> {
-    for (const loop of this.loops) loop.stop()
+    // Stop scheduling and await any in-flight tick before closing SQLite.
+    for (const loop of this.loops) await loop.stop()
     this.loops = []
     this.started = false
     this.store.close()

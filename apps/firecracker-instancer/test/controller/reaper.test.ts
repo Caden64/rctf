@@ -31,6 +31,7 @@ const setup = () => {
     diskMiB: 65536,
     maxInstances: 100,
   })
+  agent.setClock(clock.now)
   const service = createControllerService(
     makeConfig(dir, [makeHost('host-a')]),
     {
@@ -124,6 +125,31 @@ describe('reaper vs extend', () => {
       } finally {
         await service.stop()
       }
+    }
+  })
+
+  test('the reaper treats a missing instance as confirmed teardown', async () => {
+    const { service, agent, clock, timers } = setup()
+    await service.start()
+    try {
+      await service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 1000 })
+      )
+      const id = [...agent.instances.keys()][0]!
+      // The VM vanished but the agent reports not_found on DELETE.
+      agent.forceDrop(id)
+      agent.deleteMissingMode = 'not_found'
+
+      clock.t += 1000
+      await timers.trigger(1)
+      expect(agent.deleteCalls).toContain(id)
+      const details = await service.get({
+        teamId: 'team-1',
+        challengeIntegrationId: 'chal-1',
+      })
+      expect(details.status).toBe('stopped')
+    } finally {
+      await service.stop()
     }
   })
 

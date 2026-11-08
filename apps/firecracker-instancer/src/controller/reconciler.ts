@@ -4,22 +4,33 @@
  * the two for every reachable host and repairs both directions with CAS
  * updates, so it is safe to run concurrently with player requests.
  *
- * - creating rows: adopt the agent record (promote to running/errored) or, if
- *   the agent never saw the instance, clean the row so the team can retry.
- * - running rows missing on the agent: `errored` ("instance lost on host").
- * - unsynced deadlines: re-push to the agent (agent keeps the max).
- * - deleting rows: retry the teardown.
- * - lost tombstones: delete the agent side when the host returns.
- * - agent ids unknown to the DB: delete after a short grace (in-flight creates).
+ * Safety rules:
+ * - Rows are read BEFORE the agent listing. A listing is only a hint: every
+ *   "missing on the agent" conclusion is re-confirmed with a fresh per-id
+ *   `get`, and transitions are CAS'd against the row snapshot taken before the
+ *   listing (state + updated_at), never against a row read afterwards.
+ * - `creating` rows are never abandoned because one listing was stale. An
+ *   absent instance is fenced only after `createFenceSeconds`: the row moves to
+ *   `deleting` and the agent gets a DELETE (which writes a tombstone, so a
+ *   delayed original PUT can never create the VM). The row is removed only
+ *   after the agent confirms 200/404.
+ * - Unsynced deadlines are retried for every live non-deleting row, and are
+ *   marked synced only when the agent reports a deadline >= the translated
+ *   controller deadline.
+ * - `lost` tombstones (host written off / removed) are cleaned up when the
+ *   agent returns; superseded `errored` rows are garbage-collected the same
+ *   way so their agent-side records do not live forever.
+ * - Agent ids unknown to the DB are deleted after a short grace (in-flight
+ *   creates).
  */
 import type { AgentInstance } from '@rctf/firecracker-protocol'
 import {
-  AgentRejectedError,
   AgentUnreachableError,
   type AgentClient,
   type Clock,
 } from '../interfaces'
 import type { Logger } from '../log'
+import { isConfirmedGone } from './agent-client'
 import type { ControllerConfig } from './config'
 import { controllerEndpoints, Store, type InstanceRecord } from './store'
 
@@ -58,8 +69,18 @@ export class Reconciler {
       const client = clients[host.id]
       if (client === undefined) continue
       try {
+        // Snapshot the rows FIRST. The listing below can be stale relative to
+        // creates that complete while it is in flight; decisions must be based
+        // on this snapshot and re-confirmed per id.
+        const rows = store.listInstancesForHost(host.id)
         const agentInstances = await client.list()
-        await this.reconcileHost(host.id, client, agentInstances)
+        await this.reconcileHost(
+          host.id,
+          client,
+          rows,
+          agentInstances,
+          record.clockSkewMs
+        )
       } catch (error) {
         if (error instanceof AgentUnreachableError) {
           this.deps.logger.warn(
@@ -77,44 +98,56 @@ export class Reconciler {
         }
       }
     }
+
+    await this.sweepErrored()
   }
 
   private async reconcileHost(
     hostId: string,
     client: AgentClient,
-    agentInstances: readonly AgentInstance[]
+    rows: readonly InstanceRecord[],
+    agentInstances: readonly AgentInstance[],
+    skewMs: number
   ): Promise<void> {
     const { store, now, logger } = this.deps
-    const rows = store.listInstancesForHost(hostId)
     const agentById = new Map(
       agentInstances.map(instance => [instance.id, instance])
     )
 
     for (const row of rows) {
       switch (row.state) {
-        case 'reserving':
-          // Placement inserts as `creating`; a reserving row is never orphaned.
-          break
         case 'creating':
-          await this.reconcileCreating(row, agentById.get(row.id), client)
+          await this.reconcileCreating(
+            row,
+            agentById.get(row.id),
+            client,
+            skewMs
+          )
           break
         case 'running':
-          await this.reconcileRunning(row, agentById.get(row.id), client)
+          await this.reconcileRunning(
+            row,
+            agentById.get(row.id),
+            client,
+            skewMs
+          )
           break
         case 'deleting':
-          await this.reconcileDeleting(row, client)
+          await this.confirmDelete(row, client)
           break
         case 'lost':
           await this.reconcileLost(row, client)
           break
         case 'errored':
           // Terminal-until-delete; visible to the player until they delete it.
+          // Superseded errored rows are swept after the host loop.
           break
       }
     }
 
     // Agent records nobody owns. Skip a short grace so a create that is still
-    // on the wire is not torn down, and never rows still in `reserving`.
+    // on the wire is not torn down. `createdAtMs` is on the agent clock, so
+    // translate it before comparing with controller time.
     const graceMs = (this.deps.config.orphanGraceSeconds ?? 30) * 1000
     const at = now()
     for (const agent of agentInstances) {
@@ -124,7 +157,7 @@ export class Reconciler {
         // as an orphan.
         continue
       }
-      if (at - agent.createdAtMs < graceMs) continue
+      if (at - (agent.createdAtMs - skewMs) < graceMs) continue
       try {
         await client.delete(agent.id)
         logger.warn(
@@ -146,71 +179,114 @@ export class Reconciler {
 
   private async reconcileCreating(
     row: InstanceRecord,
-    agent: AgentInstance | undefined,
-    client: AgentClient
+    listed: AgentInstance | undefined,
+    client: AgentClient,
+    skewMs: number
   ): Promise<void> {
     const { store, now, logger } = this.deps
     if (this.deps.isCreateInFlight(row.id)) return
 
-    if (agent === undefined) {
-      if (store.deleteInstanceIfState(row.id, 'creating')) {
-        logger.warn(
-          { instanceId: row.id, hostId: row.hostId },
-          'reconciler: create never reached agent, reservation released'
-        )
-      }
+    const fresh =
+      listed !== undefined
+        ? ({ kind: 'present', agent: listed } as const)
+        : await this.freshGet(row, client)
+    if (fresh.kind === 'unknown') return
+    if (fresh.kind === 'present') {
+      await this.applyCreatingObservation(row, fresh.agent, client, skewMs)
       return
     }
 
+    // Still absent after a fresh per-id GET. Only fence once the create is old
+    // enough that a delayed PUT can no longer be considered in flight.
+    const fenceMs = (this.deps.config.createFenceSeconds ?? 45) * 1000
+    if (now() - row.createdAtMs < fenceMs) return
+
+    if (
+      !store.casStateSnapshot(row, 'deleting', now(), {
+        message: 'create never reached the agent',
+      })
+    ) {
+      return
+    }
+    logger.warn(
+      { instanceId: row.id, hostId: row.hostId },
+      'reconciler: fencing ambiguous create; agent DELETE makes a late PUT conflict'
+    )
+    await this.confirmDelete(row, client)
+  }
+
+  private async applyCreatingObservation(
+    row: InstanceRecord,
+    agent: AgentInstance,
+    client: AgentClient,
+    skewMs: number
+  ): Promise<void> {
+    const { store, now } = this.deps
     const endpoints = controllerEndpoints(row.expose, agent.endpoints)
     switch (agent.state) {
       case 'running':
-        store.casState(row.id, ['creating'], 'running', now(), {
+        store.casStateSnapshot(row, 'running', now(), {
           endpoints,
           message: null,
-          agentExpirySynced: true,
+          agentExpirySynced: this.agentDeadlineSynced(row, agent, skewMs),
         })
         break
-      case 'errored': {
-        store.casState(row.id, ['creating'], 'errored', now(), {
+      case 'errored':
+        store.casStateSnapshot(row, 'errored', now(), {
           message: agent.message ?? 'instance failed to start',
           endpoints: null,
         })
         break
-      }
       case 'stopping':
-      case 'stopped': {
-        if (store.casState(row.id, ['creating'], 'deleting', now())) {
+      case 'stopped':
+        if (store.casStateSnapshot(row, 'deleting', now())) {
           await this.confirmDelete(row, client)
         }
         break
-      }
       default:
         // creating/starting: note progress (endpoints may be empty) but keep
         // the row in `creating` until the agent reports running.
-        store.casState(row.id, ['creating'], 'creating', now(), { endpoints })
+        store.casStateSnapshot(row, 'creating', now(), { endpoints })
         break
+    }
+    const current = store.getInstance(row.id)
+    if (
+      current !== null &&
+      (current.state === 'creating' || current.state === 'running') &&
+      (current.agentExpirySynced === false ||
+        this.agentDeadlineSynced(current, agent, skewMs) === false)
+    ) {
+      await this.syncExpiry(current, client, skewMs)
     }
   }
 
   private async reconcileRunning(
     row: InstanceRecord,
-    agent: AgentInstance | undefined,
-    client: AgentClient
+    listed: AgentInstance | undefined,
+    client: AgentClient,
+    skewMs: number
   ): Promise<void> {
     const { store, now } = this.deps
-    if (agent === undefined) {
-      store.casState(row.id, ['running'], 'errored', now(), {
+    const fresh =
+      listed !== undefined
+        ? ({ kind: 'present', agent: listed } as const)
+        : await this.freshGet(row, client)
+    if (fresh.kind === 'unknown') return
+
+    if (fresh.kind === 'absent') {
+      // Confirmed by a fresh per-id GET: the VM really is gone.
+      store.casStateSnapshot(row, 'errored', now(), {
         message: LOST_MESSAGE,
         endpoints: null,
       })
       return
     }
 
+    const agent = fresh.agent
     const endpoints = controllerEndpoints(row.expose, agent.endpoints)
     switch (agent.state) {
       case 'errored':
-        store.casState(row.id, ['running'], 'errored', now(), {
+        store.casStateSnapshot(row, 'errored', now(), {
           message: agent.message ?? 'instance failed on host',
           endpoints: null,
         })
@@ -218,7 +294,9 @@ export class Reconciler {
       case 'stopping':
       case 'stopped':
         if (
-          store.casState(row.id, ['running'], 'deleting', now(), { endpoints })
+          store.casStateSnapshot(row, 'deleting', now(), {
+            endpoints,
+          })
         ) {
           await this.confirmDelete(row, client)
         }
@@ -227,30 +305,89 @@ export class Reconciler {
         break
     }
 
-    store.casState(row.id, ['running'], 'running', now(), { endpoints })
+    store.casStateSnapshot(row, 'running', now(), {
+      endpoints,
+      agentExpirySynced: this.agentDeadlineSynced(row, agent, skewMs),
+    })
 
-    if (!row.agentExpirySynced || agent.expiresAtMs < row.expiresAtMs) {
-      await this.syncExpiry(row, client)
+    const current = store.getInstance(row.id)
+    if (
+      current !== null &&
+      current.state === 'running' &&
+      (current.agentExpirySynced === false ||
+        this.agentDeadlineSynced(current, agent, skewMs) === false)
+    ) {
+      await this.syncExpiry(current, client, skewMs)
     }
+  }
+
+  /** Fresh per-id confirmation; a failed GET is "unknown", never "absent". */
+  private async freshGet(
+    row: InstanceRecord,
+    client: AgentClient
+  ): Promise<
+    | { kind: 'present'; agent: AgentInstance }
+    | { kind: 'absent' }
+    | { kind: 'unknown' }
+  > {
+    try {
+      const agent = await client.get(row.id)
+      return agent === undefined
+        ? { kind: 'absent' }
+        : { kind: 'present', agent }
+    } catch (error) {
+      this.deps.logger.warn(
+        {
+          instanceId: row.id,
+          hostId: row.hostId,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        'reconciler: per-id get failed, keeping row unchanged'
+      )
+      return { kind: 'unknown' }
+    }
+  }
+
+  /** True when the agent reports a deadline covering the controller deadline. */
+  private agentDeadlineSynced(
+    row: InstanceRecord,
+    agent: AgentInstance,
+    skewMs: number
+  ): boolean {
+    return agent.expiresAtMs - skewMs >= row.expiresAtMs
   }
 
   private async syncExpiry(
     row: InstanceRecord,
-    client: AgentClient
+    client: AgentClient,
+    skewMs: number
   ): Promise<void> {
     const { store, logger } = this.deps
+    const target = row.expiresAtMs + skewMs
     try {
-      await client.extend(row.id, row.expiresAtMs)
-      store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
+      const confirmed = await client.extend(row.id, target)
+      // Only trust a confirmation that covers the row's translated deadline.
+      if (confirmed.expiresAtMs >= target) {
+        store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
+      } else {
+        logger.warn(
+          {
+            instanceId: row.id,
+            hostId: row.hostId,
+            wanted: target,
+            got: confirmed.expiresAtMs,
+          },
+          'reconciler: agent did not confirm the requested deadline'
+        )
+      }
     } catch (error) {
-      if (
-        error instanceof AgentRejectedError &&
-        (error.code === 'not_found' || error.code === 'expired')
-      ) {
-        store.casState(row.id, ['running'], 'errored', this.deps.now(), {
-          message: LOST_MESSAGE,
-          endpoints: null,
-        })
+      if (isConfirmedGone(error)) {
+        if (row.state === 'running') {
+          store.casStateSnapshot(row, 'errored', this.deps.now(), {
+            message: LOST_MESSAGE,
+            endpoints: null,
+          })
+        }
         return
       }
       logger.warn(
@@ -264,13 +401,6 @@ export class Reconciler {
     }
   }
 
-  private async reconcileDeleting(
-    row: InstanceRecord,
-    client: AgentClient
-  ): Promise<void> {
-    await this.confirmDelete(row, client)
-  }
-
   private async confirmDelete(
     row: InstanceRecord,
     client: AgentClient
@@ -280,12 +410,10 @@ export class Reconciler {
       await client.delete(row.id)
       store.deleteInstanceIfState(row.id, 'deleting')
     } catch (error) {
-      if (
-        error instanceof AgentRejectedError &&
-        (error.code === 'not_found' || error.code === 'expired')
-      ) {
+      if (isConfirmedGone(error)) {
         store.deleteInstanceIfState(row.id, 'deleting')
       }
+      // Otherwise keep the row `deleting`; the next tick retries.
     }
   }
 
@@ -298,11 +426,34 @@ export class Reconciler {
       await client.delete(row.id)
       store.deleteInstanceIfState(row.id, 'lost')
     } catch (error) {
-      if (
-        error instanceof AgentRejectedError &&
-        (error.code === 'not_found' || error.code === 'expired')
-      ) {
+      if (isConfirmedGone(error)) {
         store.deleteInstanceIfState(row.id, 'lost')
+      }
+    }
+  }
+
+  /**
+   * Garbage-collect `errored` rows superseded by a newer row for the same key.
+   * The agent delete is confirmed (200/404) before the DB row is removed; an
+   * unreachable host leaves it for the next sweep.
+   */
+  private async sweepErrored(): Promise<void> {
+    const { store, clients, logger } = this.deps
+    for (const row of store.listSupersededErrored()) {
+      const client = clients[row.hostId]
+      if (client === undefined) continue
+      try {
+        await client.delete(row.id)
+        store.deleteInstanceIfState(row.id, 'errored')
+        logger.info(
+          { instanceId: row.id, hostId: row.hostId },
+          'reconciler: garbage-collected superseded errored instance'
+        )
+      } catch (error) {
+        if (isConfirmedGone(error)) {
+          store.deleteInstanceIfState(row.id, 'errored')
+        }
+        // Unreachable: keep the tombstone for the next sweep.
       }
     }
   }
