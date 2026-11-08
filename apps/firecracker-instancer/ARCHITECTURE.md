@@ -162,6 +162,38 @@ Anything that needs root/KVM/nft must be isolated behind an injectable `CommandR
 1. Guest is hostile: jailer (uid/gid, chroot, cgroups, seccomp default), rate limiters on disk/net, no virtio-fs, no vsock, MMDS only.
 2. Agent is privileged: authenticated (constant-time bearer), bind to private iface, every id/path/image/hostname validated by the
    regexes in `common.ts`; image path resolved with `realpath` and required to stay under `imagesDir`; no shell — `Bun.spawn` with argv arrays only.
-3. Controller → agent auth per host; rCTF → controller auth separate from ops admin token.
+   Native TLS (optionally mTLS) is available so the control plane does not need a TLS proxy.
+3. Controller → agent auth per host; rCTF → controller auth separate from ops admin token. Controller→agent TLS uses an explicit CA
+   (inline or file) and optional client certificate; certificate verification is always on.
 4. Flags: request memory → MMDS only. Redact in logs via `redactSpec`. Never in cmdline, files, SQLite, error messages.
 5. Team isolation: per-VM /30 + nft forward-drop + anti-spoof; hostnames contain a random instance id, never the team id.
+
+## Control-plane TLS (normative)
+
+The agent can terminate TLS natively (`agent.tls.{certFile,keyFile,caFile?}`); no reverse proxy is required. Setting
+`caFile` makes the listener mTLS (`requestCert: true`, `rejectUnauthorized: true`): a missing or unverifiable client
+certificate is rejected during the handshake. Without it the listener still serves HTTPS but does not request a client
+certificate. The bearer token remains mandatory in every mode.
+
+Both sides load TLS material through `src/util/tls.ts` at startup and fail closed:
+
+- files must be regular files owned by root or the current uid (read through one descriptor so stat and bytes describe
+  the same inode);
+- private keys and leaf certificates must be mode 0600 (no group/other bits); a CA bundle may be world-readable but not
+  group/other-writable;
+- PEM must parse (`node:crypto` `X509Certificate` / `createPrivateKey`), the leaf must be currently valid (60 s expiry
+  skew, not-yet-valid rejected), and the certificate public key must match the private key;
+- errors name the file and reason, never PEM/key bytes. Pino additionally redacts `tlsMaterial` and `tls.{key,cert,ca}`.
+
+Controller hosts accept `caCertificate` (inline PEM) XOR `caCertificateFile` (path), plus `clientCertFile` and
+`clientKeyFile` together for mTLS. TLS settings on an `http` URL are a startup error (they would be silently unused).
+`HttpAgentClient` passes `{ ca, cert, key, rejectUnauthorized: true }` to `fetch`; verification is explicit so a process
+environment with `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot disable it. Key material is never logged.
+
+Bun 1.4.4 option names were verified against the installed type definitions and a real handshake: `Bun.serve({ tls: {
+cert, key, ca, requestCert, rejectUnauthorized } })` and `fetch(url, { tls: { ca, cert, key, rejectUnauthorized } })`.
+After `Bun.serve`, the agent checks `server.protocol === 'https'` and refuses to serve if Bun ignored the TLS options,
+so a misconfiguration can never silently fall back to plaintext. Real-handshake tests generate an ephemeral CA, server
+leaf and client certificate with the `openssl` CLI (1-day validity) and assert: correct CA succeeds, wrong CA fails,
+mTLS rejects no-client-cert and a certificate from another CA, a valid client certificate is accepted, and bearer auth
+still applies over TLS.
