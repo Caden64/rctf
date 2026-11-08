@@ -14,6 +14,7 @@
 #   FIRECRACKER_BIN      default /usr/local/bin/firecracker
 #   JAILER_BIN           default /usr/local/bin/jailer
 #   MIN_FC_VERSION       default 1.7.0
+#   CHROOT_BASE          default /srv/jailer (vm.chrootBase)
 #   TRAEFIK_DYNAMIC_DIR  default /etc/traefik/dynamic/rctf-firecracker
 #
 set -euo pipefail
@@ -28,7 +29,7 @@ STATUS_DIR="/var/lib/rctf-firecracker"
 STATE_DIR="${STATUS_DIR}/state"
 RUN_DIR="${STATUS_DIR}/run"
 IMAGES_DIR="${STATUS_DIR}/images"
-ROUTES_DIR="${STATUS_DIR}/net-routes"
+CHROOT_BASE="${CHROOT_BASE:-/srv/jailer}"
 TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DYNAMIC_DIR:-/etc/traefik/dynamic/rctf-firecracker}"
 CONFIG_DIR="/etc/rctf-firecracker"
 SYSCTL_FILE="/etc/sysctl.d/90-rctf-firecracker.conf"
@@ -56,6 +57,10 @@ binary_version() {
 [ "$(uname -s)" = "Linux" ] || die "Linux only"
 command -v ip >/dev/null 2>&1 || die "iproute2 (ip) is required"
 command -v nft >/dev/null 2>&1 || die "nftables (nft) is required"
+# net.requireConntrack defaults to true: without conntrack-tools a released
+# lease can leak conntrack/NAT state to the next tenant.
+command -v conntrack >/dev/null 2>&1 ||
+  die "conntrack-tools (conntrack) is required (set network.requireConntrack=false only on isolated dev hosts)"
 command -v sysctl >/dev/null 2>&1 || die "sysctl is required"
 
 if [ ! -c /dev/kvm ]; then
@@ -77,8 +82,9 @@ version_ge "${JAILER_VERSION}" "${MIN_FC_VERSION}" ||
 log "firecracker ${FC_VERSION}, jailer ${JAILER_VERSION} (minimum ${MIN_FC_VERSION})"
 
 log "printing tool versions (informational)"
-printf '    nft:  %s\n' "$(nft --version 2>/dev/null | head -n 1 || echo unknown)"
-printf '    ip:   %s\n' "$(ip -V 2>/dev/null | head -n 1 || echo unknown)"
+printf '    nft:       %s\n' "$(nft --version 2>/dev/null | head -n 1 || echo unknown)"
+printf '    ip:        %s\n' "$(ip -V 2>/dev/null | head -n 1 || echo unknown)"
+printf '    conntrack: %s\n' "$(conntrack --version 2>/dev/null | head -n 1 || echo unknown)"
 
 # ---------------------------------------------------------------------------
 # Directories (no delete; modes are set explicitly)
@@ -88,8 +94,10 @@ install -d -m 0755 -o root -g root "${STATUS_DIR}"
 install -d -m 0700 -o root -g root "${STATE_DIR}"
 install -d -m 0700 -o root -g root "${RUN_DIR}"
 install -d -m 0755 -o root -g root "${IMAGES_DIR}"
-# Route sidecars contain no secrets but are agent-owned.
-install -d -m 0700 -o root -g root "${ROUTES_DIR}"
+# The jailer chroots below this path and the systemd unit mounts it read-write
+# (ProtectSystem=strict). Create it root-owned; the jailer creates the
+# per-uid/per-instance subtrees itself.
+install -d -m 0700 -o root -g root "${CHROOT_BASE}"
 # Traefik reads these files after dropping privileges.
 install -d -m 0755 -o root -g root "${TRAEFIK_DYNAMIC_DIR}"
 install -d -m 0755 -o root -g root "${CONFIG_DIR}"
@@ -124,7 +132,7 @@ Created/updated:
   ${STATE_DIR}                        agent instance state (0700)
   ${RUN_DIR}                          per-instance runtime/jail roots (0700)
   ${IMAGES_DIR}                       read-only image store (0755)
-  ${ROUTES_DIR}                       per-instance route sidecars (0700)
+  ${CHROOT_BASE}                      jailer --chroot-base-dir (0700)
   ${TRAEFIK_DYNAMIC_DIR}              Traefik file provider directory (0755)
   ${CONFIG_DIR}                       agent config (0755)
 
@@ -137,4 +145,5 @@ Still required by the operator:
   - Point the wildcard DNS record for *.<httpDomain> at this host's public IP.
   - If the jailer runs Firecracker as a non-root uid, set the agent's
     network.tapUser/tapGroup to that uid/gid so it can open its tap device.
+    The VM driver defaults (vm.jailUid/vm.jailGid) are 10000.
 EOF
