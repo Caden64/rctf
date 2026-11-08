@@ -1,17 +1,19 @@
 #!/bin/sh
 # rCTF Firecracker guest init (boot contract v1).
 #
-# This is meant to be installed as /sbin/init (or /init) inside rootfs.ext4.
-# It must run as PID 1 in a busybox-style userland:
+# This is installed as /rctf/init and selected with `init=/rctf/init` on the
+# kernel command line. It must run as PID 1 in a busybox-style userland:
 #
 #   1. mount /proc, /sys, /dev and a private tmpfs on /run,
-#   2. bring eth0 up and route 169.254.169.254/32 via it (kernel `ip=` does
+#   2. refuse to continue unless /run really is tmpfs (flags must never touch
+#      the persistent ext4 rootfs),
+#   3. bring eth0 up and route 169.254.169.254/32 via it (kernel `ip=` does
 #      the actual addressing; the guest kernel needs CONFIG_IP_PNP),
-#   3. fetch an MMDS V2 token (PUT /latest/api/token),
-#   4. GET / with that token and `Accept: application/json`,
-#   5. write each flag to /run/rctf/flags/<provider> (tmpfs, mode 0400),
-#   6. export rctf.env and the instance/hostname variables from the document,
-#   7. exec the challenge service.
+#   4. fetch an MMDS V2 token (PUT /latest/api/token),
+#   5. GET / with that token and `Accept: application/json`,
+#   6. write each flag to /run/rctf/flags/<sanitised provider> (tmpfs, mode 0400),
+#   7. export rctf.env and the instance/hostname variables from the document,
+#   8. exec the challenge service.
 #
 # The service is $RCTF_SERVICE if set, else /app/start, /sbin/rctf-service or
 # /etc/rctf/service (first executable that exists), else /bin/sh.
@@ -21,11 +23,13 @@
 # Keep this file POSIX sh (no bashisms).
 set -u
 
-MMDS_HOST=169.254.169.254
-MMDS_PORT=80
-RUN_ROOT=/run/rctf
+MMDS_HOST=${RCTF_MMDS_HOST:-169.254.169.254}
+MMDS_PORT=${RCTF_MMDS_PORT:-80}
+RUN_ROOT=${RCTF_RUN_ROOT:-/run/rctf}
+RUN_MOUNT=${RCTF_RUN_MOUNT:-/run}
 FLAGS_DIR=$RUN_ROOT/flags
 ENV_FILE=$RUN_ROOT/env.sh
+PROC_MOUNTS=${RCTF_PROC_MOUNTS:-/proc/mounts}
 TOKEN_TTL=21600
 BOOT_RETRIES=60
 
@@ -33,42 +37,83 @@ log() {
   printf 'rctf-init: %s\n' "$*" >&2
 }
 
-# --- basic filesystems -----------------------------------------------------
-mkdir -p /proc /sys /dev /run /tmp /etc 2>/dev/null || true
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-# Private, non-persistent /run; flags live only here.
-mount -t tmpfs -o mode=0700,nosuid,nodev,size=16m tmpfs /run 2>/dev/null ||
-  true
-chmod 1777 /tmp 2>/dev/null || true
-
-umask 077
-mkdir -p "$FLAGS_DIR"
-chmod 0700 "$RUN_ROOT" "$FLAGS_DIR" 2>/dev/null || true
-
-# --- network ---------------------------------------------------------------
-ip link set lo up 2>/dev/null || true
-ip link set eth0 up 2>/dev/null || true
-# Firecracker answers MMDS on 169.254.169.254 regardless of the guest /30, but
-# the route must point at eth0.
-ip route add "$MMDS_HOST/32" dev eth0 2>/dev/null || true
-
-# --- MMDS HTTP client ------------------------------------------------------
-# Minimal HTTP/1.1 over nc for environments without curl. Firecracker answers
-# with Content-Length and closes the connection.
-raw_http() {
-  method=$1
-  path=$2
-  headers=$3
-  printf '%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n%s\r\n' \
-    "$method" "$path" "$MMDS_HOST" "$headers" |
-    nc -w 3 "$MMDS_HOST" "$MMDS_PORT"
+# Provider names become file names. Everything outside the allow-list becomes
+# `_`; an empty result is rejected by write_flags.
+sanitize_provider() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
+# True only when `target` is a tmpfs mount point in `mounts` (usually
+# /proc/mounts). Used before any flag is written.
+is_tmpfs() {
+  target=$1
+  mounts=${2:-$PROC_MOUNTS}
+  [ -r "$mounts" ] || return 1
+  awk -v target="$target" '
+    $2 == target && $3 == "tmpfs" { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$mounts"
+}
+
+# Verify the flag directory is really on tmpfs and create it. Returns non-zero
+# (and writes nothing) when it is not, so main can exit instead of leaking
+# flags onto the rootfs.
+prepare_run_root() {
+  case "$RUN_ROOT" in
+    "$RUN_MOUNT" | "$RUN_MOUNT"/*) ;;
+    *)
+      log "RUN_ROOT ($RUN_ROOT) is not inside RUN_MOUNT ($RUN_MOUNT)"
+      return 1
+      ;;
+  esac
+  if ! is_tmpfs "$RUN_MOUNT" "$PROC_MOUNTS"; then
+    log "refusing to write flags: $RUN_MOUNT is not a tmpfs (checked $PROC_MOUNTS)"
+    return 1
+  fi
+  umask 077
+  mkdir -p "$FLAGS_DIR" || {
+    log "could not create $FLAGS_DIR"
+    return 1
+  }
+  chmod 0700 "$RUN_ROOT" "$FLAGS_DIR" 2>/dev/null || true
+  return 0
+}
+
+# Minimal HTTP/1.1 over nc. Every header is its own printf with an explicit
+# CRLF in the *format* string (values are never re-interpreted as escapes).
+raw_http() {
+  method=$1
+  req_path=$2
+  shift 2
+  {
+    printf '%s %s HTTP/1.1\r\n' "$method" "$req_path"
+    printf 'Host: %s\r\n' "$MMDS_HOST"
+    printf 'Connection: close\r\n'
+    for header in "$@"; do
+      printf '%s\r\n' "$header"
+    done
+    printf '\r\n'
+  } | nc -w 3 "$MMDS_HOST" "$MMDS_PORT"
+}
+
+# Emit the body only for a 200 status line. Anything else (non-200, malformed,
+# empty) produces no body and a non-zero exit, so callers fail closed.
 http_body() {
-  # Drop the status line and headers, then CR characters.
-  awk 'body { print } /^\r?$/ { body = 1 }' | tr -d '\r'
+  awk '
+    NR == 1 {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line !~ /^HTTP\/1\.[01] 200( |$)/) bad = 1
+      next
+    }
+    bad { next }
+    body {
+      sub(/\r$/, "", $0)
+      print
+    }
+    /^\r?$/ { body = 1 }
+    END { if (bad) exit 1 }
+  '
 }
 
 fetch_token() {
@@ -78,7 +123,7 @@ fetch_token() {
       "http://$MMDS_HOST/latest/api/token" 2>/dev/null
   else
     raw_http PUT /latest/api/token \
-      "X-metadata-token-ttl-seconds: $TOKEN_TTL\r\n" | http_body
+      "X-metadata-token-ttl-seconds: $TOKEN_TTL" | http_body
   fi
 }
 
@@ -91,92 +136,164 @@ fetch_metadata() {
       "http://$MMDS_HOST/" 2>/dev/null
   else
     raw_http GET / \
-      "X-metadata-token: $token\r\nAccept: application/json\r\n" | http_body
+      "X-metadata-token: $token" \
+      "Accept: application/json" | http_body
   fi
 }
 
-# --- fetch the metadata document ------------------------------------------
-token=
-attempt=0
-while [ "$attempt" -lt "$BOOT_RETRIES" ]; do
-  token=$(fetch_token | tr -d '\r\n')
-  if [ -n "$token" ]; then
-    break
-  fi
-  attempt=$((attempt + 1))
-  sleep 1
-done
-
-metadata=
-if [ -n "$token" ]; then
-  metadata=$(fetch_metadata "$token")
-fi
-
-if [ -z "$metadata" ]; then
-  log "could not fetch MMDS metadata; starting the service without flags"
-  metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
-fi
-
-if ! command -v jq >/dev/null 2>&1; then
-  log "jq is missing; flags cannot be parsed"
-elif ! printf '%s' "$metadata" | jq -e . >/dev/null 2>&1; then
-  log "MMDS metadata is not valid JSON"
-  metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
-fi
-
-# --- flags: one 0400 file per provider, in tmpfs only ---------------------
-if command -v jq >/dev/null 2>&1; then
-  printf '%s' "$metadata" |
-    jq -r '.rctf.flags[]? | [.provider, .flag] | @tsv' |
-    while IFS="$(printf '\t')" read -r provider flag; do
-      [ -n "$provider" ] || continue
-      # Provider names come from rCTF but sanitise anyway: no path traversal.
-      safe=$(printf '%s' "$provider" | tr -c 'A-Za-z0-9._-' '_')
-      printf '%s' "$flag" >"$FLAGS_DIR/$safe"
-      chmod 0400 "$FLAGS_DIR/$safe"
+# Write every flag with `jq -j` by index: no @tsv/read/printf round trip, so
+# backslashes, tabs, newlines, quotes and non-ASCII bytes are preserved.
+write_flags() {
+  metadata=$1
+  count=$(printf '%s' "$metadata" | jq -r '.rctf.flags | length // 0') ||
+    return 1
+  case "$count" in
+    '' | *[!0-9]*)
+      log "could not count flags in MMDS metadata"
+      return 1
+      ;;
+  esac
+  index=0
+  while [ "$index" -lt "$count" ]; do
+    provider=$(printf '%s' "$metadata" |
+      jq -r --argjson i "$index" '.rctf.flags[$i].provider // ""') ||
+      return 1
+    safe=$(sanitize_provider "$provider")
+    if [ -z "$safe" ]; then
+      log "flag provider at index $index sanitizes to empty; refusing to write flags"
+      return 1
+    fi
+    dest=$FLAGS_DIR/$safe
+    if [ -e "$dest" ]; then
+      dest=$FLAGS_DIR/$safe.$index
+    fi
+    suffix=1
+    while [ -e "$dest" ]; do
+      dest=$FLAGS_DIR/$safe.$index.$suffix
+      suffix=$((suffix + 1))
     done
-fi
+    if ! printf '%s' "$metadata" |
+      jq -j --argjson i "$index" '.rctf.flags[$i].flag' >"$dest"; then
+      rm -f "$dest"
+      log "could not write flag at index $index"
+      return 1
+    fi
+    chmod 0400 "$dest" || return 1
+    index=$((index + 1))
+  done
+  return 0
+}
 
-# --- environment -----------------------------------------------------------
-: >"$ENV_FILE"
-chmod 0600 "$ENV_FILE"
-if command -v jq >/dev/null 2>&1; then
-  printf '%s' "$metadata" |
-    jq -r '.rctf.env // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' \
-      >>"$ENV_FILE"
-  instance_id=$(printf '%s' "$metadata" | jq -r '.rctf.instanceId // ""')
-  hostname=$(printf '%s' "$metadata" | jq -r '.rctf.hostname // ""')
-else
-  instance_id=
-  hostname=
-fi
+main() {
+  # --- basic filesystems ---------------------------------------------------
+  mkdir -p /proc /sys /dev /run /tmp /etc 2>/dev/null || true
+  mount -t proc proc /proc 2>/dev/null || true
+  mount -t sysfs sysfs /sys 2>/dev/null || true
+  mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+  # Private, non-persistent /run; flags live only here.
+  mount -t tmpfs -o mode=0700,nosuid,nodev,size=16m tmpfs /run 2>/dev/null ||
+    true
+  chmod 1777 /tmp 2>/dev/null || true
 
-# shellcheck disable=SC1090
-. "$ENV_FILE"
+  # Fail closed: no tmpfs, no flags, no service.
+  if ! prepare_run_root; then
+    log "not starting the service: flags cannot be stored safely"
+    exit 1
+  fi
 
-export RCTF_FLAGS_DIR="$FLAGS_DIR"
-export RCTF_INSTANCE_ID="$instance_id"
-export RCTF_HOSTNAME="$hostname"
-if [ -n "$hostname" ]; then
-  printf '%s\n' "$hostname" >/etc/hostname 2>/dev/null || true
-  hostname "$hostname" 2>/dev/null || true
-fi
+  # --- network -------------------------------------------------------------
+  ip link set lo up 2>/dev/null || true
+  ip link set eth0 up 2>/dev/null || true
+  # Firecracker answers MMDS on 169.254.169.254 regardless of the guest /30,
+  # but the route must point at eth0.
+  ip route add "$MMDS_HOST/32" dev eth0 2>/dev/null || true
 
-# --- service ---------------------------------------------------------------
-SERVICE=${RCTF_SERVICE:-}
-if [ -z "$SERVICE" ]; then
-  for candidate in /app/start /sbin/rctf-service /etc/rctf/service; do
-    if [ -x "$candidate" ]; then
-      SERVICE=$candidate
+  # --- fetch the metadata document ----------------------------------------
+  token=
+  attempt=0
+  while [ "$attempt" -lt "$BOOT_RETRIES" ]; do
+    token=$(fetch_token | tr -d '\r\n')
+    if [ -n "$token" ]; then
       break
     fi
+    attempt=$((attempt + 1))
+    sleep 1
   done
+
+  metadata=
+  if [ -n "$token" ]; then
+    metadata=$(fetch_metadata "$token")
+  fi
+
+  if [ -z "$metadata" ]; then
+    log "could not fetch MMDS metadata; starting the service without flags"
+    metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq is missing; flags cannot be parsed"
+  elif ! printf '%s' "$metadata" | jq -e . >/dev/null 2>&1; then
+    log "MMDS metadata is not valid JSON"
+    metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
+  fi
+
+  # --- flags: one 0400 file per provider, in tmpfs only --------------------
+  if command -v jq >/dev/null 2>&1; then
+    if ! write_flags "$metadata"; then
+      log "not starting the service: could not write flags safely"
+      exit 1
+    fi
+  fi
+
+  # --- environment ---------------------------------------------------------
+  : >"$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$metadata" |
+      jq -r '.rctf.env // {} | to_entries[] | "export \(.key)=\(.value | @sh)"' \
+        >>"$ENV_FILE"
+    instance_id=$(printf '%s' "$metadata" | jq -r '.rctf.instanceId // ""')
+    hostname=$(printf '%s' "$metadata" | jq -r '.rctf.hostname // ""')
+  else
+    instance_id=
+    hostname=
+  fi
+
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+
+  export RCTF_FLAGS_DIR="$FLAGS_DIR"
+  export RCTF_INSTANCE_ID="$instance_id"
+  export RCTF_HOSTNAME="$hostname"
+  if [ -n "$hostname" ]; then
+    printf '%s\n' "$hostname" >/etc/hostname 2>/dev/null || true
+    hostname "$hostname" 2>/dev/null || true
+  fi
+
+  # --- service -------------------------------------------------------------
+  SERVICE=${RCTF_SERVICE:-}
+  if [ -z "$SERVICE" ]; then
+    for candidate in /app/start /sbin/rctf-service /etc/rctf/service; do
+      if [ -x "$candidate" ]; then
+        SERVICE=$candidate
+        break
+      fi
+    done
+  fi
+
+  if [ -z "$SERVICE" ]; then
+    log "no service found; dropping to a shell"
+    exec /bin/sh
+  fi
+
+  log "starting $SERVICE"
+  exec "$SERVICE"
+}
+
+# Tests source this file to exercise the pure functions. Running as PID 1 (the
+# normal case) ignores this and starts main.
+if [ "${RCTF_INIT_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
 fi
 
-if [ -z "$SERVICE" ]; then
-  log "no service found; dropping to a shell"
-  exec /bin/sh
-fi
-
-log "starting $SERVICE"
-exec "$SERVICE"
+main "$@"
