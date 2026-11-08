@@ -5,6 +5,8 @@
  * does not allow unprivileged user namespaces.
  */
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { NetLease } from '../../src/interfaces'
 import { renderRuleset } from '../../src/agent/net/nftables'
@@ -29,21 +31,37 @@ interface SpawnResult {
 }
 
 const spawn = async (argv: string[], stdin?: string): Promise<SpawnResult> => {
-  const proc = Bun.spawn(argv, {
-    stdin: stdin === undefined ? 'ignore' : 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  if (stdin !== undefined && proc.stdin !== undefined) {
-    proc.stdin.write(stdin)
-    await proc.stdin.end()
+  // Per Bun 1.4.4 (and thus every real root host running the tests), a
+  // stdin:"pipe" child gets a socketpair. `nft -f -` resolves /dev/stdin and
+  // rejects non-regular, non-pipe input with:
+  //   internal:0:0-0: Error: Not a regular file: "/dev/stdin"
+  // Hand the child a real temp file instead, exactly like the production
+  // CommandRunner does with a Blob.
+  let tempDir: string | undefined
+  const stdinInput = (() => {
+    if (stdin === undefined) return 'ignore' as const
+    tempDir = mkdtempSync(join(tmpdir(), 'rctf-ns-stdin-'))
+    const path = join(tempDir, 'ruleset.nft')
+    writeFileSync(path, stdin)
+    return Bun.file(path)
+  })()
+  try {
+    const proc = Bun.spawn(argv, {
+      stdin: stdinInput,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+    return { code, stdout, stderr }
+  } finally {
+    if (tempDir !== undefined) {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   }
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  return { code, stdout, stderr }
 }
 
 describe('real namespace networking', () => {

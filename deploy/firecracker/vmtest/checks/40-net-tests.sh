@@ -40,18 +40,17 @@ FULL_CODE=$?
 set +e
 echo "  -- full suite tail --"
 tail -25 "$FULLLOG" | sed 's/^/  | /'
-# The FC_REAL tests are the privileged ones this check owns; the two
-# namespace.test.ts failures are an environment/harness issue (reported below).
 if grep -q '(fail) real host (FC_REAL)' "$FULLLOG"; then
   bad "a FC_REAL test failed in the full suite"
 else
   ok "every FC_REAL test passes inside the full net suite as root"
 fi
-if grep -q '(fail) real namespace networking' "$FULLLOG"; then
-  echo "  verbatim namespace failures:" | tee -a "$LOG"
-  grep -A12 '(fail) real namespace networking' "$FULLLOG" | sed 's/^/  | /' | tee -a "$LOG"
+# The namespace tests feed nft a real temp file (not a Bun stdin socketpair),
+# so they must pass here too, as root and as ubuntu.
+if [ "$FULL_CODE" -eq 0 ] && grep -q '^ 0 fail' "$FULLLOG"; then
+  ok "FC_REAL=1 bun test test/net (full suite) passes as root with 0 failures"
 else
-  ok "namespace tests also passed in the full root suite"
+  bad "FC_REAL=1 bun test test/net (full suite) failed as root (exit $FULL_CODE)"
 fi
 
 # --- the namespace tests as an unprivileged user ---------------------------
@@ -68,12 +67,15 @@ if grep -q '(pass) real namespace networking > dummy fctap9 survives restore' "$
 else
   bad "real tap/alias/release namespace test failed as an unprivileged user"
 fi
-if grep -q 'Not a regular file: "/dev/stdin"' "$NSLOG"; then
-  echo "  NOTE: the remaining namespace failure is a Bun.spawn stdin bug: a" \
-       "'pipe' is a socketpair, and nft rejects non-regular -f input." | tee -a "$LOG"
-  echo "        repro: deploy/firecracker/vmtest/repros/bun-spawn-nft-stdin.sh" | tee -a "$LOG"
+if grep -q '(pass) real namespace networking > full rendered ruleset' "$NSLOG"; then
+  ok "real nft -c ruleset test passes as an unprivileged user (temp-file stdin)"
 else
-  ok "no nft stdin harness failure observed"
+  bad "real nft -c ruleset test failed as an unprivileged user"
+fi
+if [ "$NS_CODE" -eq 0 ] && grep -q '^ 0 fail' "$NSLOG"; then
+  ok "the namespace suite has no failures as an unprivileged user"
+else
+  bad "the namespace suite reported failures as an unprivileged user (exit $NS_CODE)"
 fi
 
 echo

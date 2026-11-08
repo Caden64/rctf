@@ -47,8 +47,37 @@ version_ge() {
 }
 
 binary_version() {
-  "$1" --version 2>/dev/null | awk '{print $NF}' | sed 's/^v//'
+  # Only the banner line is the version: Firecracker >= 1.17 also logs
+  # "Firecracker exiting successfully. exit_code=0" to stdout after it, which
+  # made the old `awk '{print $NF}'` return "1.17.0\nexit_code=0" and
+  # version_ge reject a supported binary. Take the first line, then the first
+  # x.y.z token (tolerating a leading "v" and ignoring a pre-release/build
+  # suffix such as "-rc1"). An unparsable binary yields the empty string, which
+  # the caller already rejects as "could not read ... version".
+  "$1" --version 2>/dev/null |
+    head -n 1 |
+    grep -m1 -Eo '[0-9]+\.[0-9]+\.[0-9]+' || true
 }
+
+# ---------------------------------------------------------------------------
+# Rootless version probe (used by apps/firecracker-instancer/test): parse and
+# compare the binaries, print the result, and exit BEFORE any privileged
+# precondition or directory change. Never touches the host.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" = "--check-version-only" ]; then
+  [ -x "${FIRECRACKER_BIN}" ] || die "firecracker binary not executable: ${FIRECRACKER_BIN}"
+  [ -x "${JAILER_BIN}" ] || die "jailer binary not executable: ${JAILER_BIN}"
+  FC_VERSION="$(binary_version "${FIRECRACKER_BIN}")"
+  JAILER_VERSION="$(binary_version "${JAILER_BIN}")"
+  [ -n "${FC_VERSION}" ] || die "could not read firecracker version from ${FIRECRACKER_BIN}"
+  [ -n "${JAILER_VERSION}" ] || die "could not read jailer version from ${JAILER_BIN}"
+  version_ge "${FC_VERSION}" "${MIN_FC_VERSION}" ||
+    die "firecracker ${FC_VERSION} is older than the supported minimum ${MIN_FC_VERSION}"
+  version_ge "${JAILER_VERSION}" "${MIN_FC_VERSION}" ||
+    die "jailer ${JAILER_VERSION} is older than the supported minimum ${MIN_FC_VERSION}"
+  printf 'firecracker %s\njailer %s\n' "${FC_VERSION}" "${JAILER_VERSION}"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Preconditions

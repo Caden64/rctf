@@ -9,7 +9,7 @@ The Firecracker instancer boots a prebuilt kernel and root filesystem in a [Fire
 For the participant controls, common `<red>instancerConfig</red>` fields, and endpoint types, see [Instancer](/integrations/instancer).
 
 :::warning[Hardware and verification status]
-This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. Most of the automated tests fake the privileged edges. In addition, an unprivileged smoke test (`deploy/firecracker/smoke/{:dir}`) boots real Firecracker v1.17.0 microVMs under real KVM with the real agent, tap devices and nftables, and checks flag delivery, agent-crash recovery, and team isolation from inside the guests. It does not cover jailer mode, Traefik, TLS, egress NAT, conntrack, or systemd, and nothing has been run across several hosts. Run the checks in [Verify a host](#verify-a-host) as root on your own hardware before trusting this with a live event.
+This backend needs bare-metal or nested-virtualization Linux hosts with `/dev/kvm`. Most of the automated tests fake the privileged edges. In addition, an unprivileged smoke test (`deploy/firecracker/smoke/{:dir}`) boots real Firecracker v1.17.0 microVMs under real KVM with the real agent, tap devices and nftables, and checks flag delivery, agent-crash recovery, and team isolation from inside the guests. A second harness (`deploy/firecracker/vmtest/{:dir}`) runs everything privileged as root inside a throwaway Ubuntu 24.04 QEMU VM: the shipped `host-setup.sh` and systemd unit, real jailer mode, restart/`kill -9`, conntrack flushing, egress masquerade and public DNAT. It still does not cover Traefik/TLS loading, and nothing has been run across several hosts. Run the checks in [Verify a host](#verify-a-host) as root on your own hardware before trusting this with a live event.
 :::
 
 ## Architecture
@@ -32,7 +32,7 @@ Key properties:
 - **Ownership is pinned.** An instance stays on the host that created it. Get, extend, and delete always go to that host.
 - **No oversubscription.** Placement and reservation happen in a single SQLite transaction, and the agent enforces its own limits again. A full fleet returns a clear `no capacity` message.
 - **Idempotent and race-safe.** A team can never have two live instances of the same challenge, even with duplicate or concurrent create requests (the one exception is a partitioned host, see [Host health, draining, and removal](#host-health-draining-and-removal)). Extend and expiry race on one row, so exactly one wins.
-- **Survives restarts.** The controller resumes from SQLite. The agent re-adopts running VMs from its state files, cleans orphans, and does not kill VMs when it restarts or shuts down. The shipped systemd unit uses `KillMode=process` for this reason, so `systemctl stop` also leaves VMs running: drain the host and delete its instances first if you want them gone. This unit behaviour has not been tested under a real systemd.
+- **Survives restarts.** The controller resumes from SQLite. The agent re-adopts running VMs from its state files, cleans orphans, and does not kill VMs when it restarts or shuts down. The shipped systemd unit uses `KillMode=process` for this reason, so `systemctl stop` also leaves VMs running: drain the host and delete its instances first if you want them gone. Verified under a real systemd 255 on Ubuntu 24.04 in a throwaway VM on 2026-11-08: `systemctl restart` and `kill -9` of the agent leave the VMs running and the agent re-adopts them. Still test this before an event.
 - **The instancer never persists flags.** Flags travel in request memory to Firecracker's MMDS and appear only on the guest's tmpfs. The controller and agent never write them to the kernel command line, a disk, SQLite, or logs. This covers the instancer's own state only: your guest service can still store a flag it receives, and host-level swap or core dumps are outside its control.
 
 ## Requirements
@@ -236,7 +236,7 @@ $ <red>deploy/firecracker/smoke/fetch-artifacts.sh</red>
 $ <red>deploy/firecracker/smoke/run.sh</red>
 ```
 
-It covers 24 checks, listed with its limits in `deploy/firecracker/smoke/README.md{:file}`. Then, on the real host as root, cover what it cannot: jailer mode, Traefik and TLS, egress, conntrack, and systemd.
+It covers 24 checks, listed with its limits in `deploy/firecracker/smoke/README.md{:file}`. The privileged harness in `deploy/firecracker/vmtest/{:dir}` additionally covers jailer mode, the shipped systemd unit, egress masquerade, conntrack and public DNAT as root in a throwaway Ubuntu 24.04 VM, so you can run it on a development machine without touching that machine (only QEMU runs unprivileged there). Then, on the real host as root, cover what neither can: Traefik actually loading the generated routes, TLS, and your distro's systemd/kernel combination.
 
 ```ansi
 $ <red>FC_REAL</red>=1 <red>sudo</red> bun test apps/firecracker-instancer/test/net

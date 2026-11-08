@@ -2,8 +2,8 @@
 # Check a) host-setup.sh on a fresh distro (Ubuntu 24.04 cloud image).
 #
 # Expects a FRESH host: no /var/lib/rctf-firecracker, no /srv/jailer. The
-# harness intentionally runs the shipped script unmodified first and records
-# the real result before using a documented workaround to continue.
+# harness runs the shipped script unmodified (no version wrapper, no drop-in)
+# and asserts its real behaviour, including the Firecracker 1.17 version parse.
 . "$(dirname "$0")/lib.sh"
 
 HOSTDIR=$REPO/deploy/firecracker/host
@@ -32,42 +32,28 @@ else
   bad "host-setup.sh fails on a fresh host as shipped (exit $SHIPPED_CODE): $(grep -m1 'ERROR' "$SETUP_LOG" || true)"
 fi
 
-# --- 2. identify the cause (version parsing, FC 1.17.0) --------------------
+# --- 2. version parsing, FC 1.17.0 ----------------------------------------
+# Firecracker 1.17.0 prints an extra stdout line after the banner; the parser
+# must keep only the first x.y.z token. The rootless hook exercises exactly the
+# shipped parser/comparison (the fake-binary unit test lives in
+# apps/firecracker-instancer/test/host-setup-version.test.ts).
 RAW_VERSION=$(/usr/local/bin/firecracker --version 2>/dev/null)
-PARSED=$(/usr/local/bin/firecracker --version 2>/dev/null | awk '{print $NF}')
 if printf '%s\n' "$RAW_VERSION" | grep -q 'exiting successfully'; then
-  ok "Firecracker 1.17.0 prints an extra stdout line on --version (the cause)"
+  ok "Firecracker 1.17.0 still prints an extra stdout line on --version"
 else
   bad "Firecracker --version output did not show the expected extra line"
 fi
-if printf '%s\n' "$PARSED" | grep -q 'exit_code='; then
-  ok "host-setup's 'awk {print \$NF}' captures the log line too, making version_ge fail"
-else
-  bad "version parsing unexpectedly produced a single clean version: '$PARSED'"
-fi
-
-# --- 3. documented workaround: filter --version through a wrapper ----------
-cat >/tmp/fc-version-wrapper <<'EOF'
-#!/bin/sh
-# TEST-ONLY wrapper. Firecracker 1.17.0 logs "Firecracker exiting successfully.
-# exit_code=0" on stdout after --version, which host-setup.sh's version parser
-# mistakes for part of the version. This wrapper only filters that output.
-if [ "$1" = "--version" ]; then
-  /usr/local/bin/firecracker --version | head -n 1
-  exit 0
-fi
-exec /usr/local/bin/firecracker "$@"
-EOF
-chmod 0755 /tmp/fc-version-wrapper
-
 set +e
-(cd "$HOSTDIR" && FIRECRACKER_BIN=/tmp/fc-version-wrapper ./host-setup.sh) \
-  >"$SETUP_LOG" 2>&1
-WORK_CODE=$?
+VPROBE=$(cd "$HOSTDIR" && ./host-setup.sh --check-version-only 2>&1)
+VPROBE_CODE=$?
 set +e
-echo "  (with version-filter wrapper: exit $WORK_CODE)"
-sed -n '1,18p' "$SETUP_LOG" | sed 's/^/  | /'
-expect_eq "$WORK_CODE" 0 "host-setup.sh completes once version parsing is worked around"
+echo "  (--check-version-only: exit $VPROBE_CODE)"
+printf '%s\n' "$VPROBE" | sed 's/^/  | /'
+expect_eq "$VPROBE_CODE" 0 "--check-version-only succeeds as shipped"
+expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '1p')" "firecracker 1.17.0" \
+  "the extra exit_code log line is not part of the parsed version"
+expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '2p')" "jailer 1.17.0" \
+  "the jailer version is parsed the same way"
 
 # --- 4. installed state ----------------------------------------------------
 for spec in \
@@ -99,8 +85,7 @@ expect_eq "$(sysctl -n net.ipv4.conf.all.rp_filter)" 1 "net.ipv4.conf.all.rp_fil
 # --- 5. idempotent rerun ---------------------------------------------------
 before=$(stat -c '%a %U %G' /var/lib/rctf-firecracker/state /srv/jailer /var/lib/rctf-firecracker/images)
 set +e
-(cd "$HOSTDIR" && FIRECRACKER_BIN=/tmp/fc-version-wrapper ./host-setup.sh) \
-  >"$SETUP_LOG" 2>&1
+(cd "$HOSTDIR" && ./host-setup.sh) >"$SETUP_LOG" 2>&1
 RERUN_CODE=$?
 set +e
 after=$(stat -c '%a %U %G' /var/lib/rctf-firecracker/state /srv/jailer /var/lib/rctf-firecracker/images)
@@ -117,6 +102,7 @@ install -m 0644 /tmp/fc-vmtest/artifacts/vmtest-rootfs.ext4 "$IMAGES/vmtest/root
 chmod 0755 "$IMAGES" "$IMAGES/smoke" "$IMAGES/vmtest"
 
 echo
-echo "NOTE: the as-shipped failure is a product bug; minimal repro:"
-echo "      deploy/firecracker/vmtest/repros/host-setup-version-parse.sh"
+echo "NOTE: version parsing regression coverage:"
+echo "      apps/firecracker-instancer/test/host-setup-version.test.ts (rootless fakes)"
+echo "      deploy/firecracker/vmtest/repros/host-setup-version-parse.sh (old-parser repro)"
 finish

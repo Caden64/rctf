@@ -39,15 +39,15 @@ to `~/.cache/rctf-vmtest/`). Bun is downloaded inside the VM (pinned 1.4.4).
 
 ## What is checked (numbered assertions)
 
-| Check | Assertions |
-| ----- | ---------- |
-| `00-host-setup.sh` | `host-setup.sh` on a fresh host; version parsing; directories and modes; sysctl (`ip_forward`, `rp_filter`); idempotent rerun. |
-| `10-agent-systemd.sh` | The repository unit (byte-identical) starts the agent under real systemd; `KillMode=process`; preflight `accepting:true` in jailer mode; every blocking preflight check true; both images visible; CAP_SETUID behaviour of the unit. |
-| `20-jailer-instance.sh` | HTTP create in jailer mode; Firecracker uid 10000; executable inside the jail; `/proc/<pid>/root` == jail root; per-instance cgroup + `pids.max`; real tun/tap with `rctf-fc:rctf-fc` alias and /30; MMDS v2 flag byte-exact; flag absent from agent state, run dir, jail tree, Traefik dir, journal, cmdline, rootfs and base images; delete removes process/jail/cgroup/tap/nft rules; tombstone fencing. |
-| `30-restart-survival.sh` | `systemctl restart` and `kill -9` leave the VM alive and re-adopted (strict identity, `vm-identity.json`); `KillMode=process`; CAP_SYS_PTRACE drop-in experiment and recovery. |
-| `40-net-tests.sh` | `FC_REAL=1 bun test test/net/real.test.ts` as root; full root net suite; unprivileged namespace suite, with failures quoted verbatim. |
-| `50-conntrack-quarantine.sh` | A real DNAT TCP flow is tracked; delete flushes every entry for the guest address; the freed /30 index and public port are durably quarantined and not reused. |
-| `60-egress-dnat-isolation.sh` | `egress:true` masquerade to an outside netns service (plus a conntrack masquerade proof); `egress:false` blocked; public DNAT from the outside netns; team isolation measured inside the guests with a flush control; `nmap` from outside sees only the published ports. |
+| Check                         | Assertions                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh`            | `host-setup.sh` on a fresh host as shipped (no wrapper); `--check-version-only` parses Firecracker 1.17's extra `exit_code=0` line; directories and modes; sysctl (`ip_forward`, `rp_filter`); idempotent rerun.                                                                                                                                                                                                                                                     |
+| `10-agent-systemd.sh`         | The repository unit (byte-identical, **no drop-in**) starts the agent under real systemd; `KillMode=process`; preflight `accepting:true` in jailer mode; every blocking preflight check true; both images visible; `CAP_SETUID`+`CAP_SETGID` effective and ambient in the agent.                                                                                                                                                                                     |
+| `20-jailer-instance.sh`       | The installed unit is byte-identical and has no drop-in; HTTP create in jailer mode; Firecracker uid 10000; executable inside the jail; `/proc/<pid>/root` == jail root; per-instance cgroup + `pids.max`; real tun/tap with `rctf-fc:rctf-fc` alias and /30; MMDS v2 flag byte-exact; flag absent from agent state, run dir, jail tree, Traefik dir, journal, cmdline, rootfs and base images; delete removes process/jail/cgroup/tap/nft rules; tombstone fencing. |
+| `30-restart-survival.sh`      | `systemctl restart` and `kill -9` leave the VM alive and re-adopted (strict identity, `vm-identity.json`); `KillMode=process`; CAP_SYS_PTRACE drop-in experiment and recovery (the shipped ambient caps stay in effect).                                                                                                                                                                                                                                             |
+| `40-net-tests.sh`             | `FC_REAL=1 bun test test/net` as root (105 tests, 0 fail); the unprivileged namespace suite as `ubuntu` (real nft via a temp file, not Bun's stdin socketpair).                                                                                                                                                                                                                                                                                                      |
+| `50-conntrack-quarantine.sh`  | A real DNAT TCP flow is tracked; delete flushes every entry for the guest address; the freed /30 index and public port are durably quarantined and not reused.                                                                                                                                                                                                                                                                                                       |
+| `60-egress-dnat-isolation.sh` | `egress:true` masquerade to an outside netns service (plus a conntrack masquerade proof); `egress:false` blocked; public DNAT from the outside netns; team isolation measured inside the guests with a flush control; `nmap` from outside sees only the published ports.                                                                                                                                                                                             |
 
 The guest used for the checks is `guest-start` in this directory: it keeps the
 flag on tmpfs (never on the ext4 rootfs) and exposes `/probe.txt` with the
@@ -70,21 +70,22 @@ An HTTP service on `192.0.2.2:9999` represents the internet. `nmap` runs in
 
 ## Files
 
-| Path | Purpose |
-| ---- | ------- |
-| `vm.sh` | create/start/ssh/status/stop/destroy the VM (idempotent) |
-| `provision.sh` | runs as root in the VM: packages, Bun, checkout, guest image |
-| `run.sh` | host driver: boot, copy, provision, run checks, stop, summary |
-| `guest-start` | test-only guest service (flag on tmpfs + probe results) |
-| `checks/*.sh` | numbered pass/fail assertions |
-| `repros/*.sh` | minimal reproductions for product bugs / harness issues |
-| `RESULTS.md` | dated log of what actually ran and the exact outcomes |
+| Path           | Purpose                                                       |
+| -------------- | ------------------------------------------------------------- |
+| `vm.sh`        | create/start/ssh/status/stop/destroy the VM (idempotent)      |
+| `provision.sh` | runs as root in the VM: packages, Bun, checkout, guest image  |
+| `run.sh`       | host driver: boot, copy, provision, run checks, stop, summary |
+| `guest-start`  | test-only guest service (flag on tmpfs + probe results)       |
+| `checks/*.sh`  | numbered pass/fail assertions                                 |
+| `repros/*.sh`  | minimal reproductions for product bugs / harness issues       |
+| `RESULTS.md`   | dated log of what actually ran and the exact outcomes         |
 
 ## Honest limitations
 
 - **Only this environment.** Ubuntu 24.04 (systemd 255, kernel 6.8, nftables
   1.0.9, conntrack 1.4.8) and Firecracker v1.17.0. Other kernels/systemd
-  versions may behave differently (particularly the unit bug below).
+  versions may behave differently (particularly the capability interaction the
+  unit's `AmbientCapabilities=` works around; see RESULTS).
 - **One host.** No controller, scheduler, multi-host or rCTF provider.
 - **Nested virtualization.** Firecracker runs on KVM-on-KVM. It works here, but
   it is slower than bare metal and cannot validate hardware-specific behaviour.
@@ -94,7 +95,10 @@ An HTTP service on `192.0.2.2:9999` represents the internet. `nmap` runs in
   production sample. `cgroupLimits: ['pids.max=512']` is set so the jailer
   creates a per-VM cgroup (with the default empty list jailer v2 creates none).
 - **Conntrack-tools and unprivileged user namespaces** are installed/enabled
-  in the VM; the unprivileged namespace suite still hits a Bun stdin harness
-  issue (see RESULTS).
+  in the VM. The namespace suite now feeds `nft` a real temp file instead of a
+  Bun stdin socketpair; `bunCommandRunner` (production) already used a Blob.
+- **The version parser has rootless regression coverage** (fake binaries) in
+  `apps/firecracker-instancer/test/host-setup-version.test.ts`; the VM check
+  still runs the real pinned 1.17.0 binary.
 - The host artifacts cache is shared with other workers; never delete it while
   they run.

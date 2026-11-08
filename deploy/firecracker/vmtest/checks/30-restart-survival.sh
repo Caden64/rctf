@@ -73,13 +73,14 @@ if wait_state "$ID" running 60; then ok "agent re-adopted the VM after kill -9 (
 fi
 
 # --- 3. is CAP_SYS_PTRACE really required? ---------------------------------
+mkdir -p "$(dirname "$DROPIN")"
 cat >"$DROPIN" <<'EOF'
-# TEST-ONLY: remove CAP_SYS_PTRACE (with resets, because systemd merges lists).
+# TEST-ONLY: remove CAP_SYS_PTRACE (with a reset, because systemd merges
+# lists). The shipped unit's AmbientCapabilities=CAP_SETUID CAP_SETGID stays in
+# effect: both are still in this bounding set.
 [Service]
 CapabilityBoundingSet=
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
-AmbientCapabilities=
-AmbientCapabilities=CAP_SETUID CAP_SETGID
 EOF
 systemctl daemon-reload
 systemctl restart rctf-firecracker-agent

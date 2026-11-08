@@ -10,51 +10,73 @@ user; every root operation happened inside the VM.
   Python 3.12.
 - Guest runtime: Firecracker/jailer v1.17.0, kernel 6.1.155 (Firecracker CI
   bucket), busybox 1.35.0, Bun 1.4.4.
-- Command: `deploy/firecracker/vmtest/run.sh` (fresh overlay, full run).
-- Transcript: `~/.cache/rctf-vmtest/logs/run-20261108-113959.log`.
+- Command: `deploy/firecracker/vmtest/run.sh` (full run, shipped unit with no
+  drop-in, shipped `host-setup.sh` with no version wrapper).
+- Transcript: `~/.cache/rctf-vmtest/logs/run-20261108-120034.log`.
 - VM stopped (`vm.sh status` → `stopped`); the qcow2 overlay is kept for fast
   reruns (`vm.sh destroy` removes it). No qemu/seed processes left on the host.
 
 ## Summary
 
-| Check | Assertions | Verdict |
-| ----- | ---------- | ------- |
-| `00-host-setup.sh` (a) | 16 pass / 1 fail | **FAIL**: `host-setup.sh` as shipped rejects Firecracker 1.17.0 — **product bug B1**; everything after the workaround passes (dirs, modes, sysctl, idempotency). |
-| `10-agent-systemd.sh` (b) | 28 pass / 1 fail | **b PASSES** (agent starts, `KillMode=process`, preflight `accepting:true`, all checks true). **1 extra assertion FAILS**: the shipped unit drops CAP_SETUID, so the jailer cannot `setuid(10000)` — **product bug B2**. |
-| `20-jailer-instance.sh` (c) | 32 / 0 | **PASS** — real jailer create, uid/chroot/cgroup/tap, MMDS flag, no host flag, full teardown, fencing. |
-| `30-restart-survival.sh` (d) | 17 / 0 | **PASS** — VM survives `systemctl restart` and `kill -9`, is re-adopted; CAP_SYS_PTRACE is genuinely required. |
-| `40-net-tests.sh` (e) | 9 / 0 | **PASS** — all 3 `FC_REAL` tests pass as root. One non-FC_REAL namespace test fails on a Bun stdin issue (test harness, quoted below). |
-| `50-conntrack-quarantine.sh` (f) | 17 / 0 | **PASS** — real DNAT flow tracked, flushed on delete, /30 + port quarantined, not reused. |
-| `60-egress-dnat-isolation.sh` (g,h) | 21 / 0 | **PASS** — egress masquerade, egress deny, public DNAT, team isolation with a positive control, nmap only published ports. |
+All checks pass. Two product bugs found by the previous run of this harness
+(B1, B2) and one harness-only failure (item 3) are fixed in this change; the
+numbered assertions below were re-run against the fixed tree.
 
-Total: **140 passed, 2 failed**. Both failures are real product defects in
-`deploy/firecracker/host/`; no assertion was weakened.
+| Check                               | Assertions       | Verdict                                                                                                                                                                 |
+| ----------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0 (extra `exit_code=0` line ignored), creates the dirs/modes, applies sysctl, idempotent.                |
+| `10-agent-systemd.sh` (b)           | 31 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent, `KillMode=process`, preflight `accepting:true`, `CAP_SETUID`+`CAP_SETGID` effective and ambient. |
+| `20-jailer-instance.sh` (c)         | 35 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, no host flag, full teardown, fencing.                                  |
+| `30-restart-survival.sh` (d)        | 17 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, is re-adopted; CAP_SYS_PTRACE is genuinely required.                                                          |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                   |
+| `50-conntrack-quarantine.sh` (f)    | 17 pass / 0 fail | **PASS** — real DNAT flow tracked, flushed on delete, /30 + port quarantined, not reused.                                                                               |
+| `60-egress-dnat-isolation.sh` (g,h) | 21 pass / 0 fail | **PASS** — egress masquerade, egress deny, public DNAT, team isolation with a positive control, nmap only published ports.                                              |
 
-## a) host-setup.sh on a fresh Ubuntu 24.04
+Total: **151 passed, 0 failed**. Before the fixes the same harness reported
+140 passed / 2 failed (B1 in check 00, B2 in check 10) plus one non-FC_REAL
+namespace test failing on Bun's stdin socketpair. No assertion was weakened:
+the workarounds (a version-filter wrapper and an ambient-capability drop-in)
+were removed, and the checks now assert the shipped files directly.
 
-The shipped script was run first on a host with no rctf directories:
+## a) host-setup.sh on a fresh Ubuntu 24.04 (18 assertions)
+
+The shipped script was run first on a host with no rctf directories, with no
+wrapper:
 
 ```text
 ==> checking Firecracker binaries
-ERROR: firecracker 1.17.0
-
-exit_code=0 is older than the supported minimum 1.7.0
+==> firecracker 1.17.0, jailer 1.17.0 (minimum 1.7.0)
+==> printing tool versions (informational)
+    nft:       nftables v1.0.9 (Old Doc Yak #3)
+    ip:        ip utility, iproute2-6.1.0, libbpf 1.3.0
+    conntrack: conntrack v1.4.8 (conntrack-tools)
+==> creating directories
+==> installing /etc/sysctl.d/90-rctf-firecracker.conf
+==> net.ipv4.ip_forward=1
+...
+PASS [01]: host-setup.sh runs clean on a fresh host as shipped
 ```
 
-That is bug B1. With the version-output wrapper (documented in the check and in
-`repros/host-setup-version-parse.sh`), the same script:
+The extra Firecracker line is still present and is now parsed correctly. The
+rootless hook (also covered by fake binaries in
+`apps/firecracker-instancer/test/host-setup-version.test.ts`) prints:
 
-- exits 0 and installs the directories with the documented modes
-  (`state`/`run` 0700, `images`/`traefik` 0755, `/srv/jailer` 0700, config 0755),
-- installs `/etc/sysctl.d/90-rctf-firecracker.conf` and applies
-  `net.ipv4.ip_forward=1`, `net.ipv4.conf.all.rp_filter=1`,
-- exits 0 again on a second run with unchanged modes/owners (idempotent).
+```text
+firecracker 1.17.0
+jailer 1.17.0
+```
 
-## b) systemd, jailer preflight, and the unit bug
+Verified: directories and documented modes (`state`/`run` 0700,
+`images`/`traefik` 0755, `/srv/jailer` 0700, config 0755),
+`/etc/sysctl.d/90-rctf-firecracker.conf`, `net.ipv4.ip_forward=1`,
+`net.ipv4.conf.all.rp_filter=1`, and a byte-for-byte idempotent rerun.
+
+## b) systemd, jailer preflight, and the capability bug (31 assertions)
 
 The installed unit is byte-identical to
-`deploy/firecracker/host/rctf-firecracker-agent.service`. It started on the
-first try; `KillMode=process`, `User=root`. `/v1/info` in jailer mode:
+`deploy/firecracker/host/rctf-firecracker-agent.service` and there is **no
+drop-in**. It started on the first try; `KillMode=process`, `User=root`.
+`/v1/info` in jailer mode:
 
 ```json
 "checks":{"recovered":true,"orphanBacklog":true,"stalledOperations":true,
@@ -65,29 +87,36 @@ first try; `KillMode=process`, `User=root`. `/v1/info` in jailer mode:
 "quarantineWritable":true,"tcpPortRange":true,"subnetPool":true}
 ```
 
-`accepting: true`. But the shipped unit's effective capabilities are:
+`accepting: true`. The capability assertions under the shipped unit:
 
 ```text
-CapEff: 00000000082c316b
-CapBnd: 00000000082c31eb     # bit 7 (0x80, CAP_SETUID) only in bounding
+PASS [27]: no systemd drop-in: the agent runs from the shipped unit alone
+PASS [28]: shipped unit applies AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapEff: 00000000082c31eb
+CapBnd: 00000000082c31eb
+PASS [29]: agent process has CAP_SETUID+CAP_SETGID effective (jailer can drop to uid 10000)
+PASS [30]: the two restored capabilities are ambient (inherited across the jailer exec)
+PASS [31]: preflight accepting:true with no drop-in
 ```
 
-so the jailer fails with `Failed to exec into Firecracker: Operation not
-permitted (os error 1)` and the create returns `state: errored, message: launch
-failed` (see B2). A test-only drop-in
-`AmbientCapabilities=CAP_SETUID CAP_SETGID` restores CAP_SETUID and the jailer
-works; the check then passes `accepting:true` again. This drop-in is the only
-modification to the unit made by the harness and is removed at the start of the
-next run.
+`CapAmb` is `00000000000000c0` (CAP_SETUID|CAP_SETGID). Without the fix this
+was `CapEff=00000000082c316b`, `CapBnd=00000000082c31eb` (CAP_SETUID missing
+from effective) and the jailer failed with
+`Failed to exec into Firecracker: Operation not permitted (os error 1)`.
 
-## c) jailer-mode create (32 assertions)
+## c) jailer-mode create (35 assertions)
 
-Create over the agent API (`PUT /v1/instances/:id`) with `mode: jailer`:
+This check now starts by asserting the installed unit is byte-identical and
+that no drop-in exists, then creates over the agent API (`PUT
+/v1/instances/:id`) with `mode: jailer`:
 
 ```text
+PASS [01]: installed unit is byte-identical to the repository unit
+PASS [02]: no systemd drop-in installed (shipped unit alone)
 create: HTTP 200 {"state":"starting", ... "endpoints":[{"host":"192.0.2.1","port":30000}]}
-pid=8005 guest=10.200.0.2 host=10.200.0.1 tap=fctap0 public=30000
-jail=/srv/jailer/firecracker/vmtest1794163342j1/root
+PASS [06]: jailer launched Firecracker under the shipped unit (no drop-in)
+pid=2843 guest=10.200.0.2 host=10.200.0.1 tap=fctap0 public=30000
+jail=/srv/jailer/firecracker/vmtest1794164443j1/root
 ```
 
 Verified: process alive, uid `10000`, jailed executable (`/proc/<pid>/exe` is
@@ -100,7 +129,7 @@ host /30 address.
 Flag delivered via MMDS v2 and served byte-exactly:
 
 ```text
-guest served: rctf{vmtest-jailer-1794163342-canary}
+guest served: rctf{vmtest-jailer-1794164443-canary}
 guest probe: peer:10.200.0.6=blocked ... outside=REACHED
 ```
 
@@ -110,24 +139,15 @@ cmdline, and both base images. (The test guest keeps its flag on tmpfs; the
 reference smoke guest copies it to `/www` on the rootfs, which is guest
 behaviour, not an agent leak.)
 
-Delete:
-
-```text
-delete: HTTP 200 {"state":"stopped", ...}
-PASS firecracker process removed
-PASS jail directory removed
-PASS per-instance cgroup removed
-PASS tap fctap0 removed
-PASS nftables rules for the released guest IP removed
-PASS nftables rules for the removed tap removed
-PASS re-create of a deleted id is fenced (HTTP 409)
-```
+Delete: `HTTP 200 {"state":"stopped", ...}`; process, jail directory,
+per-instance cgroup, tap and both nft rule sets removed; re-create of the
+deleted id fenced with HTTP 409.
 
 ## d) restart / `kill -9` / CAP_SYS_PTRACE (17 assertions)
 
 ```text
-fc pid=8266 guest=10.200.0.6 tap=fctap1 agent=7824
-PASS systemctl restart replaced the agent process (7824 -> 8306)
+fc pid=2578 guest=10.200.0.2 tap=fctap0 agent=...
+PASS systemctl restart replaced the agent process (2578 -> 3139)
 PASS firecracker survived systemctl restart (KillMode=process)
 PASS guest still serves its flag after restart
 PASS restarted agent re-adopted the instance as running
@@ -135,12 +155,13 @@ PASS tap was preserved across the restart
 sidecar: {"instanceId":"vmtest...r1","uid":10000,
           "jailRoot":"/srv/jailer/firecracker/vmtest...r1/root",
           "exePath":".../root/firecracker"}
-PASS systemd restarted the agent after kill -9 (8306 -> 8366)
+PASS systemd restarted the agent after kill -9 (3139 -> 3200)
 PASS firecracker survived kill -9 of the agent
 PASS agent re-adopted the VM after kill -9 (strict identity)
 ```
 
-CAP_SYS_PTRACE experiment (drop-in removing it, test-only):
+CAP_SYS_PTRACE experiment (a test-only drop-in removes it; the shipped
+`AmbientCapabilities=` stays in effect):
 
 ```text
 PASS drop-in really removed CAP_SYS_PTRACE from the agent's effective set
@@ -150,6 +171,8 @@ PASS without CAP_SYS_PTRACE the VM process is left alive (no unverified signal)
 reported state/message: errored (vm died)
 PASS with CAP_SYS_PTRACE restored the agent reclaimed and destroyed the
      unauthenticated VM
+PASS jail dir removed after cleanup
+PASS tap removed after cleanup
 ```
 
 **Conclusion: CAP_SYS_PTRACE is really required.** Without it a live jailed
@@ -159,33 +182,35 @@ refuses to signal a process it cannot authenticate. When the capability is
 restored the same agent destroys it. (A transient orphan between those two
 moments is the designed fail-safe, not silent data loss.)
 
-## e) FC_REAL privileged network tests
+## e) privileged and namespace network tests
 
 As root inside the VM:
 
 ```text
-bun test v1.4.4
-(pass) real host (FC_REAL) > rendered inet + arp ruleset passes nft -c [16.61ms]
-(pass) real host (FC_REAL) > tap create/delete only touches our interface [32.92ms]
-(pass) real host (FC_REAL) > conntrack flush succeeds on an empty table [12.19ms]
- 3 pass, 0 fail
+(pass) real host (FC_REAL) > rendered inet + arp ruleset passes nft -c
+(pass) real host (FC_REAL) > tap create/delete only touches our interface
+(pass) real host (FC_REAL) > conntrack flush succeeds on an empty table
+  3 pass, 0 fail
 ```
 
-Full `FC_REAL=1 bun test test/net` as root: **104 pass, 1 fail**. The one failure
-is not `FC_REAL`-gated and is a test-harness/Bun issue:
+Full `FC_REAL=1 bun test test/net` as root: **105 pass, 0 fail** across 8
+files. The two `namespace.test.ts` tests now pass both as root and as the
+unprivileged `ubuntu` user:
 
 ```text
-(fail) real namespace networking > full rendered ruleset (2 leases) passes nft -c -f - [4.28ms]
-error: expect(received).toBe(expected)
-- ""
-+ "internal:0:0-0: Error: Not a regular file: "/dev/stdin"
+(pass) real namespace networking > full rendered ruleset (2 leases) passes nft -c -f -
+(pass) real namespace networking > dummy fctap9 survives restore; a manager-created tap gets the alias and is removed on release
+  2 pass, 0 fail
 ```
 
-`Bun.spawn(..., {stdin: "pipe"})` hands the child a socketpair, and `nft -c -f -`
-accepts only a regular file or a pipe. The same ruleset passes `nft -c` through
-the repository's `CommandRunner` (real test #1). Repro:
-`repros/bun-spawn-nft-stdin.sh`. The other namespace test (tap alias/restore)
-passes both as root and as `ubuntu`.
+The previous failure was harness-only: Bun 1.4.4's `stdin:"pipe"` is a
+socketpair, and `nft -f -` rejects it with
+`internal:0:0-0: Error: Not a regular file: "/dev/stdin"`. The test now writes
+the ruleset to a real temp file and passes it as a Blob/BunFile; `nft -c` sees
+a regular file. The production `bunCommandRunner` already passed stdin as a
+`Blob` (not `stdin:"pipe"`), so no `src` change was needed; the real
+`nft -c -f -` test using that runner passes as root above. Repro of the Bun
+behaviour is kept at `repros/bun-spawn-nft-stdin.sh`.
 
 ## f) conntrack flush and reuse quarantine
 
@@ -250,107 +275,131 @@ Only the two published DNAT ports are open. Port 22 is closed because the VM's
 management sshd is bound to the QEMU management address (10.0.2.15) only; the
 agent API is bound to 127.0.0.1 and does not appear.
 
-## Product bugs found (not fixed; `src` untouched)
+## Fixes landed in this change (2026-11-08)
 
-### B1 — `host-setup.sh` cannot parse Firecracker 1.17.0's `--version`
+### B1 — `host-setup.sh` could not parse Firecracker 1.17.0's `--version`
 
 - File: `deploy/firecracker/host/host-setup.sh` (`binary_version()`).
-- Repro: `deploy/firecracker/vmtest/repros/host-setup-version-parse.sh`.
-- Exact failure:
-
-  ```text
-  ==> checking Firecracker binaries
-  ERROR: firecracker 1.17.0
-
-  exit_code=0 is older than the supported minimum 1.7.0
-  ```
-
 - Cause: Firecracker v1.17.0 writes this to **stdout** after `--version`:
 
   ```text
   Firecracker v1.17.0
-
-  2026-11-08T18:14:08.188685327 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0
+  2026-11-08T18:14:08 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0
   ```
 
-  `awk '{print $NF}'` returns `1.17.0\nexit_code=0`, so `version_ge` fails.
-- Impact: the documented fresh-host install aborts before creating any
-  directory; the shipped minimum-version check is unusable with the pinned
-  v1.17.0 artifact used by the smoke tests. Fix should take the first line (or
-  the last whitespace field of the `Firecracker vX.Y.Z` line only).
+  The old `awk '{print $NF}'` returned `1.17.0\nexit_code=0`, so `version_ge`
+  rejected a supported binary and the documented fresh-host install aborted
+  before creating any directory.
 
-### B2 — the shipped systemd unit cannot run the jailer (CAP_SETUID dropped)
+- Fix: take the first line only and the first `x.y.z` token
+  (`grep -m1 -Eo '[0-9]+\.[0-9]+\.[0-9]+'`), for both firecracker and jailer;
+  a leading `v` and pre-release/build suffixes are tolerated, and garbage
+  still yields the existing "could not read ... version" error.
+- Added `--check-version-only`, a rootless hook that runs the same parser and
+  comparison and exits before any privileged precondition. The new
+  `apps/firecracker-instancer/test/host-setup-version.test.ts` drives it with
+  fake binaries (banner + `exit_code=0`, plain 1.7.0, pre-release, garbage,
+  below-minimum), and `bun run test:firecracker` runs it.
+- Evidence: check 00 is 18/0 (was 16/1); `--check-version-only` printed
+  `firecracker 1.17.0` / `jailer 1.17.0`. `repros/host-setup-version-parse.sh`
+  now compares the old and fixed parsers.
 
-- Files: `deploy/firecracker/host/rctf-firecracker-agent.service`
-  (`RestrictAddressFamilies=...` + `CapabilityBoundingSet=...`).
-- Repro: `deploy/firecracker/vmtest/repros/systemd-unit-setuid.sh`.
-- Exact failure (from the real agent journal / jailer):
+### B2 — the shipped unit could not run the jailer on systemd 255
+
+- File: `deploy/firecracker/host/rctf-firecracker-agent.service`.
+- Cause: on systemd `255.4-1ubuntu8.18` (Ubuntu 24.04), `NoNewPrivileges=yes`
+  combined with a seccomp filter (`RestrictAddressFamilies=` installs one)
+  starts a root service with `CAP_SETUID` in `CapBnd` but **not** in
+  `CapPrm`/`CapEff`. Measured with otherwise identical transient units:
 
   ```text
-  Failed to exec into Firecracker: Operation not permitted (os error 1)
-  Error: Exec(Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" })
+  NoNewPrivileges=yes alone:        CapPrm=CapEff=CapBnd=0x82c31eb
+  RestrictAddressFamilies= alone:   CapPrm=CapEff=CapBnd=0x82c31eb
+  both together:                    CapPrm=CapEff=0x82c316b, CapBnd=0x82c31eb
   ```
 
-  and the API create returns HTTP 200 with
-  `{"state":"errored","message":"launch failed"}`.
-- Evidence: under the shipped unit, `CapEff=00000000082c316b` but
-  `CapBnd=00000000082c31eb` — CAP_SETUID (bit 7) is in the bounding set but not
-  effective. Removing `RestrictAddressFamilies` (or adding
-  `AmbientCapabilities=CAP_SETUID`) restores it. The repro's systemd-run
-  demonstration (same directives as the unit) prints:
+  (Any seccomp filter + NNP behaves the same; a `SystemCallFilter=` variant
+  reproduced it.) The jailer setuid/setgid()s to uid/gid 10000 before execing
+  Firecracker, so it failed with
+  `Failed to exec into Firecracker: Operation not permitted (os error 1)` and
+  creates returned `state: errored`, `message: launch failed`.
 
-  ```text
-  CapEff:	00000000082c316b
-  CapBnd:	00000000082c31eb
-  CapEff bit 7 (0x80) is CAP_SETUID. It is missing under RestrictAddressFamilies.
-  setpriv: setresuid failed: Operation not permitted
-  ```
+- Fix: keep `RestrictAddressFamilies=` and add
+  `AmbientCapabilities=CAP_SETUID CAP_SETGID`. With it, `CapAmb=0xc0` and
+  `CapEff=CapBnd=0x82c31eb`; the address-family filter stays in force. Removing
+  `RestrictAddressFamilies=` also works, but restoring exactly the two bits the
+  jailer needs is narrower and was chosen after the full vmtest (create/delete,
+  restart, `kill -9`, conntrack, egress NAT, public DNAT) passed with the
+  shipped unit and **no drop-in**.
+- Harness: the test-only `AmbientCapabilities` drop-in was removed from
+  check 10 (and check 30's drop-in no longer recreates ambient caps). Check 10
+  asserts the effective/ambient bits; check 20 asserts the installed unit is
+  byte-identical and that no drop-in exists, then launches a real jailer.
+- Tests/docs: `apps/firecracker-instancer/test/samples.test.ts` asserts the
+  unit's capability directives; the unit's "not yet verified" comment now
+  records what was verified (systemd version, distro, date);
+  `deploy/firecracker/host/README.md` and
+  `apps/docs/src/content/docs/integrations/instancer/firecracker.md` are
+  updated.
+- Evidence: check 10 is 31/0 (was 28/1), check 20 is 35/0; `CapEff` was
+  `0x82c31eb` with `CapAmb=0xc0` under the shipped unit alone.
+  `repros/systemd-unit-setuid.sh` reproduces the measurement and shows the
+  shipped fix.
 
-  This is systemd 255 on Ubuntu 24.04; it is a real interaction, and the unit
-  as shipped is broken for its default jailer mode.
-- Test workaround: a drop-in with `AmbientCapabilities=CAP_SETUID CAP_SETGID`
-  (kept out of the committed unit; created by the harness at run time).
+### Harness-only item 3 — namespace test fed nft a Bun stdin socketpair
+
+- File: `apps/firecracker-instancer/test/net/namespace.test.ts` (test only).
+- Cause: Bun 1.4.4's `stdin:"pipe"` child stdin is a socketpair; `nft -f -`
+  rejects non-regular, non-pipe input:
+  `internal:0:0-0: Error: Not a regular file: "/dev/stdin"`.
+- Fix: write the ruleset to a real temp file (`mkdtempSync`) and pass it as
+  `Bun.file(path)`; remove the temp dir afterwards. No shell, no host path.
+- Evidence: full `FC_REAL=1 bun test test/net` as root in the VM: 105 pass,
+  0 fail; `namespace.test.ts` 2 pass as root and 2 pass as `ubuntu`.
+- `src` audit: `applyRuleset` goes through `bunCommandRunner`, which passes
+  `new Blob([stdin])` (not `stdin:"pipe"`), and the FC_REAL
+  `nft -c -f -` test using it passes as root. The only other `Bun.spawn` in
+  `src` (`vm/driver.ts`) uses `stdin: "ignore"`. **No production code path is
+  affected; `src` was not edited.**
 
 ## Test-harness / environment findings (not product bugs)
 
-- **Bun 1.4.4 stdin pipe**: `test/net/namespace.test.ts` feeds `nft -c -f -`
-  through `Bun.spawn(..., {stdin:"pipe"})`. Bun uses a socketpair; nft prints
-  `internal:0:0-0: Error: Not a regular file: "/dev/stdin"`. The FC_REAL tests
-  use the repository's `CommandRunner` (a Blob/regular-file stdin) and pass.
-  Repro: `repros/bun-spawn-nft-stdin.sh`. This test is not FC_REAL-gated, so
-  the full suite reports 1 failure even on a real host.
-- **Ubuntu 24.04 unprivileged user namespaces**: `kernel.apparmor_restrict_unprivileged_userns`
-  is disabled by `provision.sh` so the namespace test can run as `ubuntu`.
-  (The `test.skipIf` guard still runs it as root, where it now passes except
-  for the nft stdin issue.)
+- **Bun 1.4.4 stdin pipe (fixed in the harness):** see item 3 above. The
+  behaviour is still reproducible with
+  `deploy/firecracker/vmtest/repros/bun-spawn-nft-stdin.sh`, which is kept as
+  documentation; the test no longer depends on it.
+- **Ubuntu 24.04 unprivileged user namespaces**:
+  `kernel.apparmor_restrict_unprivileged_userns` is disabled by `provision.sh`
+  so the namespace test can run as `ubuntu`. It also passes as root.
 - **`ip netns exec` transient EPERM**: on this nested kernel,
   `ip netns exec <ns>` intermittently fails with `setting the network
-  namespace "fcoutside" failed: Operation not permitted` even for root. The
+namespace "fcoutside" failed: Operation not permitted` even for root. The
   harness uses `nsenter --net=/run/netns/<ns>` with retries, which is stable;
   this is an environment quirk, not a product result.
 
 ## Real vs simulated
 
-| Real | Simulated / limited |
-| ---- | ------------------- |
-| Nested KVM (`/dev/kvm` inside the VM), real Firecracker v1.17.0 boots | Nested virtualization, not bare metal; timings are slower |
-| Real jailer: uid/gid 10000, chroot, cgroup v2, pid namespace, copies | One host only; no controller/scheduler/multi-host |
-| Real systemd unit, `systemctl restart`, `kill -9`, journal | systemd 255/Ubuntu 24.04 only; another distro may differ |
-| Real nftables rules, taps, conntrack, DNAT, masquerade | The "internet" is a veth + netns with TEST-NET-1 (192.0.2.0/24) |
-| Real nmap from a separate network namespace | nmap scans the test host's public test IP, not a real public IP |
-| Real guest MMDS v2 flag delivery and byte-exact service response | Test guest/service is a fixture (`guest-start`); no TLS/Traefik |
-| Real `host-setup.sh`, unit and agent binaries from this checkout | `FIRECRACKER_BIN` wrapper only for the version bug; ambient drop-in only for the unit bug |
+| Real                                                                            | Simulated / limited                                             |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Nested KVM (`/dev/kvm` inside the VM), real Firecracker v1.17.0 boots           | Nested virtualization, not bare metal; timings are slower       |
+| Real jailer: uid/gid 10000, chroot, cgroup v2, pid namespace, copies            | One host only; no controller/scheduler/multi-host               |
+| Real shipped systemd unit (no drop-in), `systemctl restart`, `kill -9`, journal | systemd 255/Ubuntu 24.04 only; another distro may differ        |
+| Real nftables rules, taps, conntrack, DNAT, masquerade                          | The "internet" is a veth + netns with TEST-NET-1 (192.0.2.0/24) |
+| Real nmap from a separate network namespace                                     | nmap scans the test host's public test IP, not a real public IP |
+| Real guest MMDS v2 flag delivery and byte-exact service response                | Test guest/service is a fixture (`guest-start`); no TLS/Traefik |
+| Real `host-setup.sh`, unit and agent binaries from this checkout                | Nothing replaced: no version wrapper, no capability drop-in     |
 
 ## Leftovers / cleanup
 
 - The VM was stopped by `run.sh`'s trap; the overlay from this run is kept in
   `~/.cache/rctf-vmtest/` for fast reruns (`vm.sh destroy` removes it), and
   `vm.sh status` reports `stopped`.
-- All three repros were executed inside that VM on 2026-11-08 (the version,
-  capability/setuid and Bun-stdin outputs quoted above are from those runs).
+- The repros were executed inside the VM on 2026-11-08 (the version,
+  capability/setuid and Bun-stdin outputs above are from those runs).
 - No `qemu-system-x86_64`, seed HTTP server or ssh tunnel remains on the host.
 - The shared artifact cache (`~/.cache/rctf-fc-smoke`) is untouched; the VM
-  image cache (`~/.cache/rctf-vmtest`) keeps only `noble-base.img` + ssh key.
+  image cache (`~/.cache/rctf-vmtest`) keeps only `noble-base.img`, the
+  overlay and the ssh key.
 - The throwaway VM's `/srv/jailer`, cgroups, taps and nft rules were removed by
   the checks; nothing privileged ran on the host.
 

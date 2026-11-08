@@ -50,7 +50,10 @@ printf 'FIRECRACKER_AGENT_TOKEN=%s\n' "$TOKEN" >"$ENVFILE"
 chmod 0600 "$ENVFILE"
 
 systemctl daemon-reload
-systemctl enable --now rctf-firecracker-agent >/dev/null 2>&1
+systemctl enable rctf-firecracker-agent >/dev/null 2>&1
+# Restart explicitly: `enable --now` does not replace an already-running agent,
+# and the capability assertions below must observe THIS unit file.
+systemctl restart rctf-firecracker-agent
 
 if wait_agent_active; then ok "agent starts under systemd (unit from deploy/firecracker/host)"; else
   bad "agent did not start under systemd"
@@ -88,40 +91,36 @@ expect_eq "$(printf '%s' "$INFO" | jq -c '.images | sort')" '["smoke","vmtest"]'
   "both test images are visible to the agent"
 
 # ---------------------------------------------------------------------------
-# The shipped unit's RestrictAddressFamilies= makes systemd (255, Ubuntu
-# 24.04) drop CAP_SETUID from the effective set, so jailer's setuid(10000)
-# fails with EPERM. This assertion is expected to FAIL until the unit is fixed.
+# The jailer forks and setuid/setgid()s to jailUid/jailGid (10000) before it
+# execs Firecracker. The shipped unit must deliver CAP_SETUID and CAP_SETGID
+# to the agent's effective set with NO test-only drop-in (systemd 255 +
+# NoNewPrivileges + a seccomp filter otherwise loses CAP_SETUID; see the unit's
+# comment and repros/systemd-unit-setuid.sh).
 # ---------------------------------------------------------------------------
-CAPEFF=$(grep '^CapEff:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')
-if [ $((0x$CAPEFF & 0x80)) -ne 0 ]; then
-  ok "agent process has CAP_SETUID effective (jailer can drop to uid 10000)"
-  UNIT_CAP_BUG=0
+if [ -d "$DROPIN" ] && [ -n "$(ls -A "$DROPIN" 2>/dev/null)" ]; then
+  bad "test-only systemd drop-in is still installed ($(ls "$DROPIN"))"
 else
-  bad "agent process lacks CAP_SETUID effective under the shipped unit; jailer setuid will fail (product bug)"
-  UNIT_CAP_BUG=1
+  ok "no systemd drop-in: the agent runs from the shipped unit alone"
 fi
-
-mkdir -p "$DROPIN"
-# Test-only drop-in: restore the capability systemd dropped because of
-# RestrictAddressFamilies. Everything else in the shipped unit stays active.
-cat >"$DROPIN/10-vmtest-ambient.conf" <<'EOF'
-[Service]
-AmbientCapabilities=CAP_SETUID CAP_SETGID
-EOF
-systemctl daemon-reload
-systemctl restart rctf-firecracker-agent
-wait_agent_active || true
+expect_eq "$(systemctl show -p AmbientCapabilities --value rctf-firecracker-agent | tr ' ' '\n' | sort | tr '\n' ' ')" \
+  "cap_setgid cap_setuid " \
+  "shipped unit applies AmbientCapabilities=CAP_SETUID CAP_SETGID"
 CAPEFF=$(grep '^CapEff:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')
-if [ $((0x$CAPEFF & 0x80)) -ne 0 ]; then
-  ok "with the test-only AmbientCapabilities drop-in the agent can setuid to the jail uid"
+CAPBND=$(grep '^CapBnd:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')
+echo "  CapEff: $CAPEFF"
+echo "  CapBnd: $CAPBND"
+if [ $((0x$CAPEFF & 0x80)) -ne 0 ] && [ $((0x$CAPEFF & 0x40)) -ne 0 ]; then
+  ok "agent process has CAP_SETUID+CAP_SETGID effective (jailer can drop to uid 10000)"
 else
-  bad "AmbientCapabilities drop-in did not restore CAP_SETUID"
+  bad "agent process lacks CAP_SETUID/CAP_SETGID effective under the shipped unit; jailer setuid will fail"
 fi
+expect_eq "$(grep '^CapAmb:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')" 00000000000000c0 \
+  "the two restored capabilities are ambient (inherited across the jailer exec)"
 expect_eq "$(api "$API/v1/info" | jq -r '.accepting')" true \
-  "preflight still accepting:true after the drop-in"
+  "preflight accepting:true with no drop-in"
 
 echo
-echo "NOTE: the as-shipped unit cannot run jailer mode on systemd 255/Ubuntu 24.04."
-echo "      minimal repro: deploy/firecracker/vmtest/repros/systemd-unit-setuid.sh"
-echo "      (test drop-in kept at $DROPIN/10-vmtest-ambient.conf)"
+echo "NOTE: the shipped unit keeps RestrictAddressFamilies= and restores the two"
+echo "      capabilities the jailer needs via AmbientCapabilities=."
+echo "      minimal repro/experiment: deploy/firecracker/vmtest/repros/systemd-unit-setuid.sh"
 finish
