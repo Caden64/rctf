@@ -65,8 +65,18 @@ const shQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 if (filter === '.') {
   if (exitStatus && (doc === null || doc === false)) process.exit(1)
   process.stdout.write(JSON.stringify(doc))
+} else if (filter.includes('keys[]')) {
+  for (const key of Object.keys(asRecord(rctf.env))) {
+    if (filter.includes('startswith("RCTF_")') && !key.startsWith('RCTF_')) {
+      continue
+    }
+    process.stdout.write(`${key}\n`)
+  }
 } else if (filter.includes('to_entries[]')) {
   for (const [key, value] of Object.entries(asRecord(rctf.env))) {
+    if (filter.includes('startswith("RCTF_")') && key.startsWith('RCTF_')) {
+      continue
+    }
     process.stdout.write(`export ${key}=${shQuote(String(value))}\n`)
   }
 } else if (filter.includes('length')) {
