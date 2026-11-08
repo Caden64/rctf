@@ -35,15 +35,20 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectClock=yes
 # ReadWritePaths keeps exactly the agent-owned state + Traefik output writable.
-ReadWritePaths=/var/lib/rctf-firecracker /etc/traefik/dynamic/rctf-firecracker /run
+# /srv/jailer is the jailer's --chroot-base-dir (vm.chrootBase default); without
+# it ProtectSystem=strict makes the jail root read-only and every launch fails.
+# The jails themselves live below /var/lib/rctf-firecracker/run.
+ReadWritePaths=/var/lib/rctf-firecracker /srv/jailer /etc/traefik/dynamic/rctf-firecracker /run
 # NOT set on purpose:
 #  - PrivateDevices: /dev/kvm must stay available.
 #  - ProtectHostname: the jailer may set the hostname inside its UTS namespace.
 #  - ProtectControlGroups: the jailer creates/writes per-VM cgroups.
+#  - ProtectKernelTunables: the jailer also writes cgroup files below
+#    /sys/fs/cgroup (vm.cgroupRoot), which ProtectKernelTunables=yes would make
+#    read-only.
 #  - MemoryDenyWriteExecute: Bun/JSC JIT requires writable-executable memory.
 #  - RestrictNamespaces: the jailer creates mount/pid/... namespaces.
 #  - SystemCallFilter: Firecracker + jailer need a broad, version-dependent set.

@@ -42,9 +42,16 @@ export class FakeHost implements CommandRunner {
   failAt: number | undefined
   nftOk = true
   ipOk = true
+  conntrackOk = true
+  /** `conntrack -D` reports "0 flow entries have been deleted" (exit 1). */
+  conntrackEmpty = false
+  /** Any conntrack delete fails with this stderr (simulates EPERM etc.). */
+  conntrackFlushError: string | undefined
+  /** Fail `ip link del dev <name>` for exactly this device. */
+  failDeleteTap: string | undefined
 
-  seedTap(name: string, addresses: string[] = []): void {
-    this.links.set(name, { addresses: new Set(addresses), up: true })
+  seedTap(name: string, addresses: string[] = [], up = true): void {
+    this.links.set(name, { addresses: new Set(addresses), up })
   }
 
   async run(
@@ -64,6 +71,9 @@ export class FakeHost implements CommandRunner {
     }
     if (argv[0] === 'nft') {
       return this.nft([...argv], opts.stdin ?? '')
+    }
+    if (argv[0] === 'conntrack') {
+      return this.conntrack([...argv])
     }
     return fail(`unexpected binary: ${argv[0] ?? '<empty>'}`)
   }
@@ -137,12 +147,38 @@ export class FakeHost implements CommandRunner {
       return ok()
     }
     if (argv[1] === 'link' && argv[2] === 'del' && dev !== undefined) {
+      if (this.failDeleteTap === dev) {
+        return fail('RTNETLINK answers: Operation not permitted')
+      }
       if (!this.links.delete(dev)) {
         return fail(`Cannot find device "${dev}"`)
       }
       return ok()
     }
     return fail(`unhandled ip invocation: ${argv.join(' ')}`)
+  }
+
+  private conntrack(argv: string[]): CommandResult {
+    if (!this.conntrackOk) {
+      return { code: 127, stdout: '', stderr: 'conntrack: command not found' }
+    }
+    if (argv.includes('--version')) {
+      return ok('conntrack v1.4.7 (conntrack-tools)\n')
+    }
+    if (argv[1] === '-D') {
+      if (this.conntrackFlushError !== undefined) {
+        return fail(this.conntrackFlushError)
+      }
+      if (this.conntrackEmpty) {
+        return {
+          code: 1,
+          stdout: '0 flow entries have been deleted.\n',
+          stderr: '',
+        }
+      }
+      return ok('1 flow entries have been deleted.\n')
+    }
+    return fail(`unhandled conntrack invocation: ${argv.join(' ')}`)
   }
 
   private nft(argv: string[], stdin: string): CommandResult {
@@ -182,16 +218,14 @@ export const makeConfig = (
     ...overrides,
   })
 
-/** Temp config with existing Traefik/routes directories. */
+/** Temp config with existing Traefik directory. */
 export const makeTempConfig = async (
   overrides: Partial<Record<keyof NetworkConfig, unknown>> = {}
 ): Promise<NetworkConfig> => {
   const root = await mkdtemp(join(tmpdir(), 'rctf-fc-net-'))
   const traefikDynamicDir = join(root, 'traefik')
-  const routesDir = join(root, 'routes')
   await mkdir(traefikDynamicDir, { recursive: true })
-  await mkdir(routesDir, { recursive: true })
-  return makeConfig({ traefikDynamicDir, routesDir, ...overrides })
+  return makeConfig({ traefikDynamicDir, ...overrides })
 }
 
 export const makeLease = (overrides: Partial<NetLease> = {}): NetLease => ({

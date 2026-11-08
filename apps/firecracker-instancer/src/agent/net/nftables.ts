@@ -1,18 +1,20 @@
 import type { CommandRunner, NetLease } from '../../interfaces'
 import type { NetworkConfig } from './config'
+import { deriveLeaseRoutes } from './lease'
 import { parseSubnetPool } from './ipam'
 import {
   assertIfaceName,
   assertInstanceId,
   assertIpv4,
   assertTapName,
-  isValidHostname,
   isValidMacAddress,
   isValidPort,
   parseIpv4,
 } from './validate'
 
 export const NFT_TABLE = 'rctf_fc'
+/** ARP is not part of the `inet` family, so it gets its own table. */
+export const NFT_ARP_TABLE = 'rctf_fc_arp'
 
 /**
  * Destinations a guest with `egress: true` is still never allowed to reach:
@@ -34,25 +36,30 @@ export const EGRESS_DENY_CIDRS = [
   '240.0.0.0/4',
 ] as const
 
-/** Guest port for `lease.publicPorts[index]` (needed for DNAT). */
-export type GuestPorts = Readonly<
-  Record<string, Readonly<Record<number, number>> | undefined>
->
+export interface RulesetOptions {
+  /**
+   * Leases whose public ingress (DNAT + matching forward accept) is installed.
+   * Omitted means "every lease is published". Security rules (isolation,
+   * anti-spoof, IPv6 drop, egress policy, ARP) are rendered for EVERY lease
+   * regardless, so `unpublish` can never strip them from a live tap.
+   */
+  published?: ReadonlySet<string>
+}
 
 interface ValidatedLease {
   lease: NetLease
-  /** tcp/raw public ports with their guest port, ordered by expose index. */
-  routes: { index: number; publicPort: number; guestPort?: number }[]
+  /** tcp/raw routes with their guest port, ordered by expose index. */
+  routes: { index: number; publicPort: number; guestPort: number }[]
 }
 
 const validateLease = (
   lease: NetLease,
-  guestPorts: GuestPorts,
   seen: {
     ids: Set<string>
     taps: Set<string>
     guests: Set<string>
     ports: Set<number>
+    hostnames: Map<string, string>
   }
 ): ValidatedLease => {
   assertInstanceId(lease.instanceId)
@@ -95,76 +102,55 @@ const validateLease = (
     throw new Error(`lease ${lease.instanceId} has an invalid egress flag`)
   }
 
-  const guestPortMap = guestPorts[lease.instanceId]
-  const routes: ValidatedLease['routes'] = []
-  for (const [key, publicPort] of Object.entries(lease.publicPorts)) {
-    const index = Number(key)
-    if (!Number.isInteger(index) || index < 0) {
+  // Every route is derived from the lease itself; an incomplete expose list
+  // throws instead of silently dropping a public route.
+  const derived = deriveLeaseRoutes(lease)
+  for (const route of derived.tcp) {
+    if (!isValidPort(route.publicPort)) {
       throw new Error(
-        `lease ${lease.instanceId} has an invalid expose index: ${key}`
+        `lease ${lease.instanceId} has an invalid public port: ${route.publicPort}`
       )
     }
-    if (!isValidPort(publicPort)) {
-      throw new Error(
-        `lease ${lease.instanceId} has an invalid public port: ${publicPort}`
-      )
+    if (seen.ports.has(route.publicPort)) {
+      throw new Error(`public port ${route.publicPort} is mapped twice`)
     }
-    if (seen.ports.has(publicPort)) {
-      throw new Error(`public port ${publicPort} is mapped twice`)
-    }
-    seen.ports.add(publicPort)
-    let guestPort: number | undefined
-    if (guestPortMap !== undefined) {
-      const candidate = guestPortMap[index]
-      if (candidate !== undefined) {
-        if (!isValidPort(candidate)) {
-          throw new Error(
-            `lease ${lease.instanceId} has an invalid guest port: ${candidate}`
-          )
-        }
-        guestPort = candidate
-      }
-    }
-    routes.push({ index, publicPort, guestPort })
+    seen.ports.add(route.publicPort)
   }
-  routes.sort((a, b) => a.index - b.index)
-
-  for (const [key, hostname] of Object.entries(lease.publicHostnames)) {
-    if (!Number.isInteger(Number(key)) || Number(key) < 0) {
+  for (const route of derived.hostnames) {
+    const owner = seen.hostnames.get(route.hostname)
+    if (owner !== undefined && owner !== lease.instanceId) {
       throw new Error(
-        `lease ${lease.instanceId} has an invalid hostname index: ${key}`
+        `public hostname ${route.hostname} is assigned to both ${owner} and ${lease.instanceId}`
       )
     }
-    if (!isValidHostname(hostname)) {
-      throw new Error(
-        `lease ${lease.instanceId} has an invalid public hostname: ${JSON.stringify(hostname)}`
-      )
-    }
+    seen.hostnames.set(route.hostname, lease.instanceId)
   }
 
-  return { lease, routes }
+  return { lease, routes: derived.tcp }
 }
 
-const validateLeases = (
-  leases: readonly NetLease[],
-  guestPorts: GuestPorts
-): ValidatedLease[] => {
+const validateLeases = (leases: readonly NetLease[]): ValidatedLease[] => {
   const seen = {
     ids: new Set<string>(),
     taps: new Set<string>(),
     guests: new Set<string>(),
     ports: new Set<number>(),
+    hostnames: new Map<string, string>(),
   }
   return leases
-    .map(lease => validateLease(lease, guestPorts, seen))
+    .map(lease => validateLease(lease, seen))
     .sort((a, b) => a.lease.instanceId.localeCompare(b.lease.instanceId))
 }
 
 /**
- * Render the complete `inet rctf_fc` table as a PURE function of the current
- * leases plus config. The output replaces the whole table in one `nft -f -`
- * transaction (`add table` + `flush table` + re-declare), so a failure leaves
- * the previous table untouched.
+ * Render the complete `inet rctf_fc` + `arp rctf_fc_arp` tables as a PURE
+ * function of the current leases plus config. The output is applied as one
+ * `nft -f -` transaction (`add table` + `flush table` + re-declare), so a
+ * failure leaves the previous tables untouched.
+ *
+ * The forward chain keeps `policy accept` so this agent never takes over
+ * unrelated host forwarding (Docker, VPN, ...); only traffic entering or
+ * leaving one of OUR `fctap*` interfaces is explicitly filtered and dropped.
  *
  * Only validated ints, IPv4 addresses, MACs, interface names and regex-checked
  * ids are interpolated; there is no shell and no escaping-by-guessing.
@@ -172,14 +158,17 @@ const validateLeases = (
 export const renderRuleset = (
   leases: readonly NetLease[],
   config: NetworkConfig,
-  guestPorts: GuestPorts = {}
+  options: RulesetOptions = {}
 ): string => {
   const external = assertIfaceName(config.externalInterface)
   const pool = parseSubnetPool(config.subnetPool)
-  const validated = validateLeases(leases, guestPorts)
+  const validated = validateLeases(leases)
+  const published = options.published
+  const isPublished = (lease: NetLease): boolean =>
+    published === undefined || published.has(lease.instanceId)
 
   const lines: string[] = [
-    '# rctf-firecracker: managed nftables table. Generated file, manual edits are lost.',
+    '# rctf-firecracker: managed nftables tables. Generated file, manual edits are lost.',
     `add table inet ${NFT_TABLE}`,
     `flush table inet ${NFT_TABLE}`,
     `table inet ${NFT_TABLE} {`,
@@ -187,7 +176,7 @@ export const renderRuleset = (
     '    type filter hook input priority filter; policy accept;',
     '    # (c) A guest may not reach the host stack (MMDS is inside Firecracker).',
     '    #     Replies to host-initiated connections (readiness probe, Traefik) are',
-    '    #     the only justified exception; they are established/related.',
+    '    #     the only justified exception; they are scoped to this lease.',
   ]
 
   for (const { lease } of validated) {
@@ -197,14 +186,20 @@ export const renderRuleset = (
     lines.push(
       `    iifname "${lease.tapName}" ip saddr != ${lease.guestIp} drop`
     )
+    lines.push(`    iifname "${lease.tapName}" meta nfproto ipv6 drop`)
+  }
+  for (const { lease } of validated) {
+    lines.push(
+      `    iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
   }
   lines.push(
-    '    iifname "fctap*" ct state established,related accept',
     '    iifname "fctap*" drop',
     '  }',
     '',
     '  chain forward {',
-    '    type filter hook forward priority filter; policy drop;',
+    '    # Policy accept: other tables/subsystems own unrelated forwarding.',
+    '    type filter hook forward priority filter; policy accept;',
     '    # (a) team isolation: no forwarded traffic between guest taps.',
     '    iifname "fctap*" oifname "fctap*" drop',
     '    # (b) anti-spoof: a tap may only emit its lease address/MAC.'
@@ -220,6 +215,23 @@ export const renderRuleset = (
     lines.push(`    iifname "${lease.tapName}" meta nfproto ipv6 drop`)
   }
 
+  lines.push('    # (g) invalid conntrack state, scoped to our taps only.')
+  lines.push('    iifname "fctap*" ct state invalid drop')
+  lines.push('    oifname "fctap*" ct state invalid drop')
+
+  lines.push(
+    '    # (f) return traffic, scoped to the lease interface/address pair so',
+    '    #     inherited conntrack state can never be accepted across tenants.'
+  )
+  for (const { lease } of validated) {
+    lines.push(
+      `    iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
+    lines.push(
+      `    oifname "${lease.tapName}" ip daddr ${lease.guestIp} ct state established,related accept`
+    )
+  }
+
   lines.push(
     '    # (d) Egress is denied by default: leases without egress cannot start flows.',
     '    #     (Inbound DNAT is not iifname <tap>, and its replies are established.)'
@@ -227,32 +239,6 @@ export const renderRuleset = (
   for (const { lease } of validated) {
     if (!lease.egress) {
       lines.push(`    iifname "${lease.tapName}" ct state new drop`)
-    }
-  }
-  lines.push(
-    '    ct state invalid drop',
-    '    # (f) return traffic for flows that were explicitly accepted below.',
-    '    ct state established,related accept'
-  )
-
-  const dnat = validated.flatMap(({ lease, routes }) =>
-    routes
-      .filter(route => route.guestPort !== undefined)
-      .map(route => ({
-        lease,
-        index: route.index,
-        publicPort: route.publicPort,
-        guestPort: route.guestPort as number,
-      }))
-  )
-  if (dnat.length > 0) {
-    lines.push(
-      '    # (e) Public tcp/raw ingress (matching DNAT in chain prerouting).'
-    )
-    for (const route of dnat) {
-      lines.push(
-        `    iifname "${external}" oifname "${route.lease.tapName}" ip daddr ${route.lease.guestIp} tcp dport ${route.guestPort} ct status dnat accept`
-      )
     }
   }
 
@@ -275,15 +261,41 @@ export const renderRuleset = (
     }
   }
 
+  const dnat = validated
+    .filter(entry => isPublished(entry.lease))
+    .flatMap(({ lease, routes }) =>
+      routes.map(route => ({
+        lease,
+        publicPort: route.publicPort,
+        guestPort: route.guestPort,
+      }))
+    )
+  if (dnat.length > 0) {
+    lines.push(
+      '    # (e) Public tcp/raw ingress (matching DNAT in chain prerouting).'
+    )
+    for (const route of dnat) {
+      lines.push(
+        `    iifname "${external}" oifname "${route.lease.tapName}" ip daddr ${route.lease.guestIp} tcp dport ${route.guestPort} ct status dnat accept`
+      )
+    }
+  }
+
   lines.push(
+    '    # (h) Everything else on a guest tap is denied; non-fctap forwarding is',
+    '    #     untouched by this table.',
+    '    iifname "fctap*" drop',
+    '    oifname "fctap*" drop',
     '  }',
     '',
     '  chain prerouting {',
-    '    type nat hook prerouting priority dstnat; policy accept;'
+    '    type nat hook prerouting priority dstnat; policy accept;',
+    '    # Only traffic addressed to a LOCAL address (this host) is DNATed, so',
+    '    # transit traffic through the host is never rewritten.'
   )
   for (const route of dnat) {
     lines.push(
-      `    iifname "${external}" tcp dport ${route.publicPort} dnat ip to ${route.lease.guestIp}:${route.guestPort}`
+      `    iifname "${external}" fib daddr type local tcp dport ${route.publicPort} dnat ip to ${route.lease.guestIp}:${route.guestPort}`
     )
   }
   lines.push(
@@ -295,6 +307,30 @@ export const renderRuleset = (
   for (const { lease } of egress) {
     lines.push(
       `    iifname "${lease.tapName}" oifname "${external}" ip saddr ${lease.guestIp} masquerade`
+    )
+  }
+  lines.push('  }', '}', '')
+
+  // -------------------------------------------------------------------------
+  // ARP: `inet` rules never see ARP frames, so switch them to their own table.
+  // -------------------------------------------------------------------------
+  lines.push(
+    `add table arp ${NFT_ARP_TABLE}`,
+    `flush table arp ${NFT_ARP_TABLE}`,
+    `table arp ${NFT_ARP_TABLE} {`,
+    '  chain input {',
+    '    type filter hook input priority filter; policy accept;',
+    '    # (i) ARP anti-spoof + only the host side of the /30 may be resolved.'
+  )
+  for (const { lease } of validated) {
+    lines.push(
+      `    iifname "${lease.tapName}" arp saddr ip != ${lease.guestIp} drop`
+    )
+    lines.push(
+      `    iifname "${lease.tapName}" arp saddr ether != "${lease.guestMac}" drop`
+    )
+    lines.push(
+      `    iifname "${lease.tapName}" arp operation request arp taddr ip != ${lease.hostIp} drop`
     )
   }
   lines.push('  }', '}', '')
