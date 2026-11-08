@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import yaml from 'yaml'
 import { createLogger } from '../log'
-import { agentConfigSchema, type AgentConfig } from './config'
+import { agentConfigSchema, alignTapOwner, type AgentConfig } from './config'
 import { createInstanceManager } from './manager'
 import { createNetworkManager } from './net'
 import { createAgentServer } from './server'
@@ -14,7 +14,7 @@ import { vmConfigSchema } from './vm/config'
  */
 export const loadAgentConfig = async (file: string): Promise<AgentConfig> => {
   const source = await readFile(file, 'utf8')
-  const config = agentConfigSchema.parse(yaml.parse(source))
+  const config = alignTapOwner(agentConfigSchema.parse(yaml.parse(source)))
   const envToken = process.env.FIRECRACKER_AGENT_TOKEN
   if (envToken) config.token = envToken
   if (!config.token) {

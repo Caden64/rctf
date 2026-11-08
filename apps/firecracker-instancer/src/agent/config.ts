@@ -37,3 +37,36 @@ export const agentConfigSchema = z.object({
   network: networkConfigSchema,
 })
 export type AgentConfig = z.output<typeof agentConfigSchema>
+
+/**
+ * In jailer mode Firecracker runs as `vm.jailUid:vm.jailGid` and must be able to
+ * open the tap the agent creates, so the tap owner has to be that same
+ * identity. Unset owners default to the jailer identity; an explicit NUMERIC
+ * owner that differs is a configuration error (it would be a tap the dropped
+ * uid cannot attach to). Names are accepted as-is: they cannot be resolved here.
+ */
+export const alignTapOwner = (config: AgentConfig): AgentConfig => {
+  const vm = config.vm
+  if (vm === undefined || vm.mode !== 'jailer') return config
+  const check = (
+    label: string,
+    configured: string | undefined,
+    expected: number
+  ): string => {
+    if (configured === undefined) return String(expected)
+    if (/^\d+$/.test(configured) && Number(configured) !== expected) {
+      throw new Error(
+        `network.${label}=${configured} does not match the jailer identity (${expected}); the unprivileged Firecracker process could not open its tap`
+      )
+    }
+    return configured
+  }
+  return {
+    ...config,
+    network: {
+      ...config.network,
+      tapUser: check('tapUser', config.network.tapUser, vm.jailUid),
+      tapGroup: check('tapGroup', config.network.tapGroup, vm.jailGid),
+    },
+  }
+}
