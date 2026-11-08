@@ -23,6 +23,12 @@
 #   MH_VM_MEM     default 3584 (MiB)
 #   MH_VM_SMP     default 2
 #   MH_VM_DISK    default 30G
+#   MH_BASE_IMAGE override the base image (still digest-verified)
+#
+# The base image is the same pinned Ubuntu 24.04 dated release the vmtest
+# harness uses (noble/20261017, SHA256 + SHA256SUMS.gpg verified). A cached
+# image is re-hashed on every boot and the boot is refused on a mismatch; a
+# floating noble/current download is never used.
 #
 # The cloud-init seed is served over the QEMU user-network gateway
 # (10.0.2.2) and selected with the SMBIOS serial `ds=nocloud;s=...` trick, so
@@ -33,7 +39,20 @@ VM_ROOT=${MH_VM_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-multihost}
 VM_MEM=${MH_VM_MEM:-3584}
 VM_SMP=${MH_VM_SMP:-2}
 VM_DISK=${MH_VM_DISK:-30G}
-BASE_IMAGE_URL=${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}
+
+# Pinned Ubuntu cloud image (same release and digest as vmtest/vm.sh).
+UBUNTU_SERIES=${UBUNTU_SERIES:-noble}
+UBUNTU_RELEASE=${UBUNTU_RELEASE:-20261017}
+UBUNTU_IMAGE=${UBUNTU_IMAGE:-noble-server-cloudimg-amd64.img}
+# Digest published in noble/20261017/SHA256SUMS (2026-10-17). Pinned here as
+# well as cross-checked against the published SHA256SUMS on every fresh fetch.
+UBUNTU_IMAGE_SHA256=${UBUNTU_IMAGE_SHA256:-04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}
+UBUNTU_GPG_FINGERPRINT=${UBUNTU_GPG_FINGERPRINT:-D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81}
+UBUNTU_BASE_URL=${UBUNTU_BASE_URL:-https://cloud-images.ubuntu.com/$UBUNTU_SERIES/$UBUNTU_RELEASE}
+BASE_IMAGE_URL=${BASE_IMAGE_URL:-$UBUNTU_BASE_URL/$UBUNTU_IMAGE}
+SHA256SUMS_URL=${SHA256SUMS_URL:-$UBUNTU_BASE_URL/SHA256SUMS}
+SHA256SUMS_GPG_URL=${SHA256SUMS_GPG_URL:-$UBUNTU_BASE_URL/SHA256SUMS.gpg}
+UBUNTU_GPG_KEY_URL=${UBUNTU_GPG_KEY_URL:-https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$UBUNTU_GPG_FINGERPRINT}
 
 NAME=
 SSH_PORT=
@@ -122,14 +141,91 @@ stop_seed_server() {
   rm -f "$SEED_PID"
 }
 
+sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+
+# Verify the pinned image digest and Ubuntu's SHA256SUMS / SHA256SUMS.gpg.
+# Copied from deploy/firecracker/vmtest/vm.sh so both harnesses trust exactly
+# the same dated release. Returns 0 with a verified digest; dies on a mismatch.
+# GPG failure caused by unavailable key infrastructure is reported honestly and
+# does not block the pinned SHA256, which is the authoritative check.
+verify_ubuntu_sums() {
+  local dir=$1 pub got rc
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA256SUMS" "$SHA256SUMS_URL" ||
+    die "could not download $SHA256SUMS_URL"
+  pub=$(awk -v f="$UBUNTU_IMAGE" '$2 == f || $2 == "*" f { print $1; exit }' "$dir/SHA256SUMS")
+  [ -n "$pub" ] || die "published SHA256SUMS has no entry for $UBUNTU_IMAGE"
+  [ "$pub" = "$UBUNTU_IMAGE_SHA256" ] ||
+    die "pinned digest $UBUNTU_IMAGE_SHA256 does not match published $pub for $UBUNTU_IMAGE (refusing to use it)"
+
+  if ! command -v gpg >/dev/null 2>&1; then
+    log "WARNING: gpg is not installed; SHA256SUMS.gpg not verified (pinned SHA256 still enforced)"
+    return 0
+  fi
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA256SUMS.gpg" "$SHA256SUMS_GPG_URL" ||
+    die "could not download $SHA256SUMS_GPG_URL"
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/ubuntu-key.asc" "$UBUNTU_GPG_KEY_URL" ||
+    die "could not download the pinned Ubuntu cloud-image signing key from $UBUNTU_GPG_KEY_URL"
+
+  if (
+    export GNUPGHOME=$dir/gnupg
+    mkdir -m 700 "$GNUPGHOME" || exit 2
+    gpg --batch --quiet --import "$dir/ubuntu-key.asc" 2>"$dir/gpg-import.err" || exit 2
+    gpg --batch --with-colons --list-keys "$UBUNTU_GPG_FINGERPRINT" >/dev/null 2>&1 || exit 3
+    gpg --batch --quiet --verify "$dir/SHA256SUMS.gpg" "$dir/SHA256SUMS" 2>"$dir/gpg-verify.err" || exit 4
+    exit 0
+  ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  case "$rc" in
+    0) log "GPG signature on SHA256SUMS verified (key $UBUNTU_GPG_FINGERPRINT)" ;;
+    2) die "could not import the pinned Ubuntu cloud-image signing key" ;;
+    3) die "the fetched key does not have the pinned fingerprint $UBUNTU_GPG_FINGERPRINT" ;;
+    *) cat "$dir/gpg-verify.err" >&2 2>/dev/null || true
+       die "GPG verification of SHA256SUMS FAILED (signature mismatch)" ;;
+  esac
+}
+
 ensure_base_image() {
-  [ -f "$BASE_IMAGE" ] && return 0
-  command -v curl >/dev/null || die "curl is required"
   mkdir -p "$(dirname "$BASE_IMAGE")"
-  log "downloading Ubuntu 24.04 cloud image (~600 MiB) to $BASE_IMAGE"
-  local tmp=$BASE_IMAGE.part
+  if [ -f "$BASE_IMAGE" ]; then
+    log "re-hashing cached Ubuntu image $BASE_IMAGE"
+    local got
+    got=$(sha256_of "$BASE_IMAGE")
+    if [ "$got" = "$UBUNTU_IMAGE_SHA256" ]; then
+      printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+      return 0
+    fi
+    if [ "$BASE_IMAGE" != "$VM_ROOT/noble-base.img" ]; then
+      # Never delete an image this run does not own (for example the shared
+      # read-only vmtest cache): refuse to boot instead.
+      die "cached image $BASE_IMAGE has digest $got, expected $UBUNTU_IMAGE_SHA256 (refusing to boot; not deleting a shared image)"
+    fi
+    log "cached image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256); discarding"
+    rm -f "$BASE_IMAGE" "$BASE_IMAGE.sha256"
+  fi
+  command -v curl >/dev/null || die "curl is required"
+  command -v sha256sum >/dev/null || die "sha256sum is required"
+  local tmp=$BASE_IMAGE.part dir
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/rctf-mh-image.XXXXXX")
+  rm -f "$tmp"
+  verify_ubuntu_sums "$dir"
+  log "downloading Ubuntu $UBUNTU_SERIES/$UBUNTU_RELEASE image (~600 MiB) to $BASE_IMAGE"
   curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$BASE_IMAGE_URL"
+  local got
+  got=$(sha256_of "$tmp")
+  if [ "$got" != "$UBUNTU_IMAGE_SHA256" ]; then
+    rm -f "$tmp"
+    rm -rf "$dir"
+    die "downloaded image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256)"
+  fi
   mv "$tmp" "$BASE_IMAGE"
+  printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+  printf 'url=%s\ndigest=%s\ngpg_fingerprint=%s\ndate=%s\n' \
+    "$BASE_IMAGE_URL" "$got" "$UBUNTU_GPG_FINGERPRINT" "$(date -Is)" >"$BASE_IMAGE.meta"
+  rm -rf "$dir"
+  log "Ubuntu image verified ($got)"
 }
 
 ensure_ssh_key() {

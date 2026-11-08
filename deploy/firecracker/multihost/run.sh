@@ -56,23 +56,34 @@ B_SSH=$(free_tcp)
 A_SEED=$(free_tcp)
 B_SEED=$(free_tcp)
 CTRL_PORT=$(free_tcp)
-MCAST_PORT=$(python3 - <<'PY'
+# Private L2 group/port. QEMU's socket mcast netdev sets SO_REUSEADDR, so two
+# parallel workers that picked the same port would silently share a segment.
+# Pick a random group in 239.255.0.0/16 and a random port that can be bound on
+# the loopback interface, the wildcard address and the group address itself;
+# the bind without SO_REUSEADDR fails if another QEMU already holds the port.
+read -r MCAST_GROUP MCAST_PORT < <(python3 - <<'PY'
 import random, socket, sys
-for _ in range(50):
-    p = random.randint(40000, 60000)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.bind(('0.0.0.0', p))
-    except OSError:
-        continue
-    finally:
-        s.close()
-    print(p)
-    sys.exit(0)
+group = f"239.255.{random.randint(1, 254)}.{random.randint(1, 254)}"
+for _ in range(200):
+    port = random.randint(20000, 60000)
+    ok = True
+    for addr in (group, '0.0.0.0', '127.0.0.1'):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind((addr, port))
+        except OSError:
+            ok = False
+        finally:
+            sock.close()
+        if not ok:
+            break
+    if ok:
+        print(group, port)
+        sys.exit(0)
 raise SystemExit('no free udp port')
 PY
 )
-MCAST_GROUP="239.$((RANDOM % 250 + 1)).$((RANDOM % 250 + 1)).$((RANDOM % 250 + 1))"
+[ -n "${MCAST_PORT:-}" ] || die "could not allocate a multicast group/port"
 MCAST="$MCAST_GROUP:$MCAST_PORT"
 A_IP=10.77.0.10
 B_IP=10.77.0.11

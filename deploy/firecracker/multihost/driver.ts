@@ -254,6 +254,133 @@ const hostStats = (host: string): HostStats =>
     )
   ) as HostStats
 
+// --- fail-closed probes ----------------------------------------------------
+//
+// Every negative assertion below ("the VM is gone", "the port is closed")
+// must be based on a definitive observation. A failed ssh/curl is a probe
+// error, never proof of absence: these helpers keep the two apart so a broken
+// probe fails the assertion instead of passing it vacuously.
+
+interface StatsProbe {
+  ok: boolean
+  stats?: HostStats
+  error?: string
+}
+
+const probeHostStats = (host: string): StatsProbe => {
+  try {
+    const stats = hostStats(host)
+    if (stats.httpCode !== 200) {
+      return { ok: false, error: `agent HTTP ${stats.httpCode}` }
+    }
+    if (!Array.isArray(stats.instances)) {
+      return { ok: false, error: 'agent instance list was null' }
+    }
+    return { ok: true, stats }
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) }
+  }
+}
+
+interface StateProbe {
+  ok: boolean
+  exists?: boolean
+  record?: Record<string, unknown>
+  error?: string
+}
+
+/** Tri-state probe of the agent's per-instance state file. */
+const probeAgentState = (host: string, id: string): StateProbe => {
+  const file = `${AGENT_STATE_DIR}/${id}.json`
+  const result = remote(
+    host,
+    `sudo sh -c 'if [ -f "$1" ]; then echo __PRESENT__; cat "$1"; else echo __ABSENT__; fi' _ '${file}'`
+  )
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      error: `state probe failed (${result.code}): ${result.stderr.trim() || result.stdout.slice(-200)}`,
+    }
+  }
+  const text = result.stdout
+  if (text.startsWith('__ABSENT__')) return { ok: true, exists: false }
+  if (!text.startsWith('__PRESENT__')) {
+    return {
+      ok: false,
+      error: `unexpected state probe output: ${short(text, 120)}`,
+    }
+  }
+  const body = text.slice('__PRESENT__'.length).trim()
+  try {
+    return {
+      ok: true,
+      exists: true,
+      record: JSON.parse(body) as Record<string, unknown>,
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: `unparseable state record: ${errorMessage(error)}`,
+    }
+  }
+}
+
+interface FcProbe {
+  ok: boolean
+  lines?: string[]
+  error?: string
+}
+
+/** `pgrep -a -x firecracker` on the host (pid + argv for every guest). */
+const probeFirecracker = (host: string): FcProbe => {
+  const result = remote(host, 'pgrep -a -x firecracker 2>/dev/null || true')
+  if (result.code !== 0) {
+    return { ok: false, error: `pgrep failed (${result.code})` }
+  }
+  return {
+    ok: true,
+    lines: result.stdout.split('\n').filter(line => line.trim() !== ''),
+  }
+}
+
+/** Firecracker argv contains `--id <instance id>` (jailer passes it through). */
+const fcLineForId = (lines: string[], id: string): string | undefined =>
+  lines.find(line => line.includes(`--id ${id}`))
+
+interface PidProbe {
+  ok: boolean
+  alive?: boolean
+  error?: string
+}
+
+const probePid = (host: string, pid: number): PidProbe => {
+  const result = remote(
+    host,
+    `if [ -d /proc/${pid} ]; then echo __ALIVE__; else echo __GONE__; fi`
+  )
+  if (result.code !== 0) {
+    return { ok: false, error: `pid probe failed (${result.code})` }
+  }
+  const out = result.stdout.trim()
+  if (out === '__ALIVE__') return { ok: true, alive: true }
+  if (out === '__GONE__') return { ok: true, alive: false }
+  return { ok: false, error: `unexpected pid probe output: ${short(out, 120)}` }
+}
+
+/** True/false when definitive; undefined when the probe itself failed. */
+const probeTombstone = (host: string, id: string): boolean | undefined => {
+  const file = `${AGENT_STATE_DIR}/tombstones/${id}.json`
+  const result = remote(
+    host,
+    `sudo sh -c 'if [ -f "$1" ]; then echo __YES__; else echo __NO__; fi' _ '${file}'`
+  )
+  if (result.code !== 0) return undefined
+  const out = result.stdout.trim()
+  if (out === '__YES__') return true
+  if (out === '__NO__') return false
+  return undefined
+}
+
 const agentState = (
   host: string,
   id: string
@@ -354,23 +481,86 @@ const jailIdentity = (
   }
 }
 
+interface HostHttp {
+  ok: boolean
+  body: string
+  code: number
+  /**
+   * `ok` = 2xx, `http` = a definitive non-2xx response, `refused`/`timeout` =
+   * a definitive connection failure, `probe_error` = the observation itself
+   * failed (ssh or an unexpected curl exit). Only the definitive kinds may be
+   * used for a negative assertion.
+   */
+  kind: 'ok' | 'http' | 'refused' | 'timeout' | 'probe_error'
+  curlExit: number
+  detail: string
+}
+
 const httpFromHost = (
   host: string,
   url: string,
   timeoutSeconds = 5
-): { ok: boolean; body: string; code: number } => {
+): HostHttp => {
   const result = remote(
     host,
-    `curl -sS -m ${timeoutSeconds} -w '\\n%{http_code}' ${url}`,
+    `curl -sS -m ${timeoutSeconds} -w '\\n%{http_code}' ${url}; ` +
+      `printf '\\n__MH_CURL_RC__=%s\\n' $?`,
     30_000
   )
-  const raw = result.stdout
-  const split = raw.lastIndexOf('\n')
-  const code = split === -1 ? 0 : Number(raw.slice(split + 1).trim() || '0')
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      body: '',
+      code: 0,
+      kind: 'probe_error',
+      curlExit: -1,
+      detail: `ssh failed (${result.code}): ${short(result.stderr || result.stdout, 160)}`,
+    }
+  }
+  const lines = result.stdout.replace(/\n$/, '').split('\n')
+  const rcLine = (lines.pop() ?? '').trim()
+  const match = /^__MH_CURL_RC__=(\d+)$/.exec(rcLine)
+  if (match === null) {
+    return {
+      ok: false,
+      body: '',
+      code: 0,
+      kind: 'probe_error',
+      curlExit: -1,
+      detail: `unparseable curl exit line: ${short(rcLine, 120)}`,
+    }
+  }
+  const curlExit = Number(match[1])
+  const codeText = (lines.pop() ?? '').trim()
+  const code = Number(codeText)
+  const body = lines.join('\n')
+  if (curlExit === 0) {
+    const numeric = Number.isFinite(code) ? code : 0
+    const ok = numeric >= 200 && numeric < 300
+    return {
+      ok,
+      body,
+      code: numeric,
+      kind: ok ? 'ok' : 'http',
+      curlExit,
+      detail: `HTTP ${codeText}`,
+    }
+  }
+  // 7 = couldn't connect, 6 = couldn't resolve, 52/56 = empty reply / reset,
+  // 28 = operation timeout. Everything else is not a definitive answer.
+  const kind =
+    curlExit === 28
+      ? 'timeout'
+      : [6, 7, 52, 56].includes(curlExit)
+        ? 'refused'
+        : 'probe_error'
   return {
-    ok: result.code === 0 && code >= 200 && code < 300,
-    body: split === -1 ? raw : raw.slice(0, split),
-    code,
+    ok: false,
+    body,
+    code: 0,
+    kind,
+    curlExit,
+    detail: `curl exit ${curlExit}`,
   }
 }
 
@@ -691,13 +881,14 @@ const deleteAllTeams = async (
 let controllerPid: number | undefined
 
 const startController = async (
-  variant: 'normal' | 'badtoken'
+  variant: 'normal' | 'badtoken',
+  yamlPath: string = CONTROLLER_YAML
 ): Promise<void> => {
   const sourceBad = variant === 'badtoken' ? `. ${BADTOKEN_ENV}; ` : ''
   const command =
     `cd /opt/rctf-firecracker && ` +
     `{ set -a; . ${CONTROLLER_ENV}; ${sourceBad}set +a; ` +
-    `exec /usr/local/bin/bun apps/firecracker-instancer/src/controller/index.ts ${CONTROLLER_YAML}; } ` +
+    `exec /usr/local/bin/bun apps/firecracker-instancer/src/controller/index.ts ${yamlPath}; } ` +
     `>>/home/ubuntu/mh-controller/controller-${variant}.log 2>&1 </dev/null & echo $!`
   const pid = Number(remoteOut(A, command, 30_000))
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -746,10 +937,11 @@ const stopController = async (
 
 const restartController = async (
   variant: 'normal' | 'badtoken' = 'normal',
-  signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM'
+  signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM',
+  yamlPath: string = CONTROLLER_YAML
 ): Promise<void> => {
   await stopController(signal)
-  await startController(variant)
+  await startController(variant, yamlPath)
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +1003,62 @@ const waitControllerEmpty = async (timeoutMs = 60_000): Promise<void> => {
     timeoutMs,
     250
   )
+}
+
+interface DestroyedProbe {
+  ok: boolean
+  destroyedAt?: number
+  detail: string
+}
+
+/**
+ * Wait until the agent has definitively destroyed an instance: the agent
+ * listing no longer contains it, its state file is absent, no Firecracker
+ * process carries its id and the recorded pid is gone. Every component is a
+ * fail-closed probe: a failed ssh/HTTP observation never counts as absence.
+ */
+const waitDestroyed = async (
+  host: string,
+  id: string,
+  pid: number,
+  timeoutMs = 60_000
+): Promise<DestroyedProbe> => {
+  const deadline = Date.now() + timeoutMs
+  let detail = 'not sampled yet'
+  while (Date.now() < deadline) {
+    const stats = probeHostStats(host)
+    const state = probeAgentState(host, id)
+    const fc = probeFirecracker(host)
+    const proc = probePid(host, pid)
+    if (!stats.ok || !state.ok || !fc.ok || !proc.ok) {
+      detail = `probe error (stats=${stats.error ?? 'ok'} state=${state.error ?? 'ok'} fc=${fc.error ?? 'ok'} pid=${proc.error ?? 'ok'})`
+      await sleep(500)
+      continue
+    }
+    const stillListed = stats.stats!.instances!.some(
+      instance => instance.id === id
+    )
+    const fcLine = fcLineForId(fc.lines!, id)
+    if (
+      !stillListed &&
+      state.exists === false &&
+      fcLine === undefined &&
+      proc.alive === false
+    ) {
+      return {
+        ok: true,
+        destroyedAt: Date.now(),
+        detail:
+          'listing, state file, Firecracker process and pid are all absent',
+      }
+    }
+    detail = `listed=${stillListed} stateFile=${state.exists} fc=${fcLine !== undefined} pidAlive=${proc.alive}`
+    await sleep(500)
+  }
+  return {
+    ok: false,
+    detail: `timed out after ${timeoutMs}ms; last: ${detail}`,
+  }
 }
 
 const globalCleanup = async (): Promise<void> => {
@@ -962,11 +1210,11 @@ const scenarioHosts = async (): Promise<void> => {
 const scenarioSpread = async (): Promise<void> => {
   await report.group(
     '2',
-    'placement spreads across both hosts and every instance is pinned to its host',
+    "placement follows the scheduler's most-free-memory policy and every instance is pinned to its host",
     async () => {
       const teams = ['spread-1', 'spread-2', 'spread-3', 'spread-4']
       const created: Array<{ team: string; id: string; host: string }> = []
-      const expected = [A, B, A, B] // most-free-memory first, ties by host id
+      const expected = [A, B, A, B] // most free memory; equal budgets tie-break by host id
       for (const [index, team] of teams.entries()) {
         const result = await create(team, CHAL)
         report.check(
@@ -983,7 +1231,7 @@ const scenarioSpread = async (): Promise<void> => {
         })
         report.check(
           `2.${index + 1}b`,
-          `${team} lands on the host the scheduler's spread policy predicts`,
+          `${team} lands where the scheduler's most-free-memory policy predicts (equal budgets: host-id tie-break alternates)`,
           running.row.host_id === expected[index],
           `host=${running.row.host_id} expected=${expected[index]}`
         )
@@ -1076,12 +1324,17 @@ const scenarioSpread = async (): Promise<void> => {
           guestFlag(B, before.guestIp) === flagFor(onB.team, CHAL),
         `host-a gone=${goneA} host-b kept=${stillB}`
       )
+      const deletedProbe = httpFromHost(
+        A,
+        `http://${identityA.guestIp}:8080/flag.txt`,
+        3
+      )
       report.check(
         '2.11',
-        'the deleted host-a guest is no longer reachable, and the host-b guest serves only its own flag',
-        !httpFromHost(A, `http://${identityA.guestIp}:8080/flag.txt`, 3).ok &&
+        'the deleted host-a guest is definitively unreachable (connection refused/timeout, not a probe error), and the host-b guest serves only its own flag',
+        (deletedProbe.kind === 'refused' || deletedProbe.kind === 'timeout') &&
           guestFlag(B, before.guestIp) === flagFor(onB.team, CHAL),
-        `deletedGuest=${identityA.guestIp} survivorGuest=${before.guestIp}`
+        `deletedGuest=${identityA.guestIp} probe=${deletedProbe.kind}/${deletedProbe.curlExit} survivorGuest=${before.guestIp}`
       )
       await deleteAllTeams(
         created
@@ -1090,6 +1343,61 @@ const scenarioSpread = async (): Promise<void> => {
       )
       await waitControllerEmpty()
       await waitAgentsClean()
+
+      // The equal-budget order above (a,b,a,b) is the host-id tie-break, not a
+      // deliberate spread: the scheduler picks the healthy host with the most
+      // free memory (effective capacity - reservations). Skew the configured
+      // memory budget of host-b to prove the placement really follows memory.
+      const skewYaml = '/home/ubuntu/mh-controller/controller-mem-skew.yaml'
+      remoteOut(
+        A,
+        `awk '/^  - id: host-b$/ { inb=1 } inb && !done && /memMiB: 4096/ { sub(/memMiB: 4096/, "memMiB: 2048"); done=1 } { print }' ${CONTROLLER_YAML} > ${skewYaml}`
+      )
+      const skewA = remoteOut(
+        A,
+        `awk '/^  - id: host-a$/ { ina=1 } ina && !done && /memMiB:/ { print; done=1 }' ${skewYaml}`
+      )
+      const skewB = remoteOut(
+        A,
+        `awk '/^  - id: host-b$/ { inb=1 } inb && !done && /memMiB:/ { print; done=1 }' ${skewYaml}`
+      )
+      report.check(
+        '2.12',
+        'the skew config gives host-a 4096 MiB and host-b 2048 MiB of configured memory',
+        /memMiB: 4096/.test(skewA) && /memMiB: 2048/.test(skewB),
+        `a=${short(skewA, 80)} b=${short(skewB, 80)}`
+      )
+      await restartController('normal', 'SIGTERM', skewYaml)
+      await waitHostsHealthy(90_000)
+      const skewTeams = ['mem-1', 'mem-2', 'mem-3', 'mem-4']
+      const skewExpected = [A, A, B, B]
+      const skewPlaced: Array<{ team: string; host: string }> = []
+      for (const [index, team] of skewTeams.entries()) {
+        const result = await create(team, CHAL)
+        const running = await waitRunning(team, CHAL)
+        skewPlaced.push({ team, host: running.row.host_id })
+        report.check(
+          `2.13-${team}`,
+          `${team} follows the most-free-memory policy with skewed budgets (expected ${skewExpected[index]})`,
+          isDetails(result) && running.row.host_id === skewExpected[index],
+          `host=${running.row.host_id} expected=${skewExpected[index]}`
+        )
+      }
+      const skewHosts = await listHosts()
+      report.check(
+        '2.14',
+        'the larger host absorbed two creates before the smaller one was used (packing by free memory, not alternation)',
+        JSON.stringify(skewPlaced.map(entry => entry.host)) ===
+          JSON.stringify(skewExpected) &&
+          skewHosts.find(host => host.id === A)?.reserved.instances === 2 &&
+          skewHosts.find(host => host.id === B)?.reserved.instances === 2,
+        short(skewPlaced)
+      )
+      await deleteAllTeams(skewTeams.map(team => ({ team, chal: CHAL })))
+      await waitControllerEmpty()
+      await waitAgentsClean()
+      await restartController('normal', 'SIGTERM')
+      await waitHostsHealthy(90_000)
     }
   )
 }
@@ -1237,14 +1545,37 @@ const scenarioCapacity = async (): Promise<void> => {
       await waitControllerEmpty()
       await waitAgentsClean()
 
-      // Atomic reservation: 20 concurrent creates, distinct teams.
+      // Atomic reservation: 20 concurrent creates, distinct teams. Sample the
+      // controller's reservation view *during* the race: the outcome alone
+      // (4 accepted) cannot prove no host was transiently oversubscribed.
       const raceTeams = Array.from(
         { length: 20 },
         (_, index) => `race-${index + 1}`
       )
-      const results = await Promise.all(
-        raceTeams.map(team => create(team, CHAL))
-      )
+      const raceSamples: Array<{ a: number; b: number; at: number }> = []
+      let sampling = true
+      const sampler = (async (): Promise<void> => {
+        while (sampling) {
+          try {
+            const snapshot = await listHosts()
+            raceSamples.push({
+              a: snapshot.find(host => host.id === A)?.reserved.instances ?? -1,
+              b: snapshot.find(host => host.id === B)?.reserved.instances ?? -1,
+              at: Date.now(),
+            })
+          } catch {
+            // A transient probe failure is not a sample; keep sampling.
+          }
+          await sleep(50)
+        }
+      })()
+      let results: Array<Details | Failure>
+      try {
+        results = await Promise.all(raceTeams.map(team => create(team, CHAL)))
+      } finally {
+        sampling = false
+        await sampler
+      }
       const successes = results.filter(isDetails)
       const failures = results.filter(isFailure)
       report.check(
@@ -1267,16 +1598,25 @@ const scenarioCapacity = async (): Promise<void> => {
       const statsA = hostStats(A)
       const statsB = hostStats(B)
       const hosts = await listHosts()
+      const oversubscribed = raceSamples.filter(
+        sample => sample.a > 2 || sample.b > 2
+      )
+      const maxA = Math.max(...raceSamples.map(sample => sample.a))
+      const maxB = Math.max(...raceSamples.map(sample => sample.b))
       report.check(
         '3.7',
-        'the race never oversubscribed a host (agent listings and controller reservations <= 2 each)',
-        hosts.every(host => host.reserved.instances <= 2) &&
-          (statsA.instances?.length ?? 0) <= 2 &&
-          (statsB.instances?.length ?? 0) <= 2 &&
+        'reservations sampled every 50ms during the race never exceeded 2 per host (the sampler observed both hosts fully reserved)',
+        raceSamples.length > 0 &&
+          oversubscribed.length === 0 &&
+          maxA === 2 &&
+          maxB === 2 &&
+          hosts.every(host => host.reserved.instances <= 2) &&
+          (statsA.instances?.length ?? -1) <= 2 &&
+          (statsB.instances?.length ?? -1) <= 2 &&
           statsA.firecrackerProcs <= 2 &&
           statsB.firecrackerProcs <= 2 &&
           statsA.firecrackerProcs + statsB.firecrackerProcs === 4,
-        `reserved=${hosts
+        `samples=${raceSamples.length} maxReserved=${maxA}/${maxB} over=${oversubscribed.length} reserved=${hosts
           .map(host => `${host.id}:${host.reserved.instances}`)
           .join(
             ','
@@ -1415,12 +1755,12 @@ const scenarioIsolation = async (): Promise<void> => {
       )
       report.check(
         '8.6',
-        "the other host's port is not reachable at this host's address (no port crossover)",
-        !crossPort1.ok &&
-          !crossPort2.ok &&
+        "the other host's port is definitively closed at this host's address (connection refused/timeout, not a probe error)",
+        (crossPort1.kind === 'refused' || crossPort1.kind === 'timeout') &&
+          (crossPort2.kind === 'refused' || crossPort2.kind === 'timeout') &&
           crossPort1.body !== aFlag &&
           crossPort2.body !== bFlag,
-        `a->b:${aEntry.endpointPort} HTTP ${crossPort1.code}; b->a:${bEntry.endpointPort} HTTP ${crossPort2.code}`
+        `a->b:${aEntry.endpointPort} ${crossPort1.kind}/${crossPort1.curlExit}; b->a:${bEntry.endpointPort} ${crossPort2.kind}/${crossPort2.curlExit}`
       )
       const allFlags = new Set(
         placed.map(entry => flagFor(entry.team, entry.chal))
@@ -1564,7 +1904,6 @@ const scenarioPartition = async (): Promise<void> => {
         longRun.row.host_id === B,
         longRun.row.host_id
       )
-      const shortCreatedAt = Date.now()
       const shortCreate = await create('part-short', CHAL, {
         timeoutMs: 15_000,
       })
@@ -1576,6 +1915,31 @@ const scenarioPartition = async (): Promise<void> => {
         'the short-lived instance is also placed on host-b',
         shortRun.row.host_id === B,
         shortRun.row.host_id
+      )
+      // Capture the *agent's* deadline and the live Firecracker pid before the
+      // partition. The controller-side row's expires_at_ms is a translated
+      // estimate; only the agent state proves when its dead-man timer expires.
+      const shortState = probeAgentState(B, shortRun.row.id)
+      const shortPid = Number(
+        (shortState.record?.vm as { pid?: number } | undefined)?.pid ?? 0
+      )
+      const shortFcBefore = probeFirecracker(B)
+      const shortPidLine =
+        shortFcBefore.ok && shortState.ok
+          ? fcLineForId(shortFcBefore.lines!, shortRun.row.id)
+          : undefined
+      const shortExpiresAt = Number(shortState.record?.expiresAtMs)
+      report.check(
+        '6.2b',
+        'the agent state records the live Firecracker pid and the real expiresAtMs for the short instance',
+        shortState.ok &&
+          shortState.exists === true &&
+          shortPid > 0 &&
+          shortPidLine !== undefined &&
+          shortPidLine.startsWith(`${shortPid} `) &&
+          Number.isFinite(shortExpiresAt) &&
+          shortExpiresAt > 0,
+        `pid=${shortPid} line=${short(shortPidLine, 100)} expiresAtMs=${shortExpiresAt}`
       )
       const longIdentity = requireIdentity(B, longRun.row.id)
       await adminRequest('POST', `/v1/hosts/${A}/undrain`)
@@ -1622,46 +1986,61 @@ const scenarioPartition = async (): Promise<void> => {
         `new=${duringRun.row.host_id} long=${rowsFor('part-long', CHAL)[0]?.host_id} short=${rowsFor('part-short', CHAL)[0]?.host_id}`
       )
       const longDuring = await get('part-long', CHAL)
+      const longRowsDuring = rowsFor('part-long', CHAL)
       report.check(
         '6.7',
-        "the partitioned host's instance is not silently rescheduled: it reports errored and its row stays pinned to host-b",
+        "the partitioned host's instance is not rescheduled: exactly one row exists, reports errored, stays pinned to host-b, and no host-a agent record for that id exists",
         isDetails(longDuring) &&
           longDuring.status === 'errored' &&
-          rowsFor('part-long', CHAL)[0]?.host_id === B &&
-          (await agentList(B)).some(instance => instance.id === longRun.row.id),
-        `get=${short(longDuring)} rowHost=${rowsFor('part-long', CHAL)[0]?.host_id}`
+          longRowsDuring.length === 1 &&
+          longRowsDuring[0]?.id === longRun.row.id &&
+          longRowsDuring[0]?.host_id === B &&
+          (await agentList(B)).some(
+            instance => instance.id === longRun.row.id
+          ) &&
+          (await agentList(A)).every(
+            instance => instance.id !== longRun.row.id
+          ),
+        `get=${short(longDuring)} rows=${short(longRowsDuring.map(row => `${row.id}@${row.host_id}:${row.state}`))}`
       )
-      const shortRowDuring = rowsFor('part-short', CHAL)[0]
+      const shortRowsDuring = rowsFor('part-short', CHAL)
+      const shortRowDuring = shortRowsDuring[0]
       report.check(
         '6.8',
-        "the short instance's row is never moved off host-b either",
-        shortRowDuring === undefined || shortRowDuring.host_id === B,
-        `rowHost=${shortRowDuring?.host_id} state=${shortRowDuring?.state}`
+        "the short instance still has exactly one row pinned to host-b during the partition (running, or deleting after the controller's own expiry claim; an absent row fails this check)",
+        shortRowsDuring.length === 1 &&
+          shortRowDuring !== undefined &&
+          shortRowDuring.id === shortRun.row.id &&
+          shortRowDuring.host_id === B &&
+          (shortRowDuring.state === 'running' ||
+            shortRowDuring.state === 'deleting') &&
+          (await agentList(A)).every(
+            instance => instance.id !== shortRun.row.id
+          ),
+        `rows=${short(shortRowsDuring.map(row => `${row.id}@${row.host_id}:${row.state}`))}`
       )
 
-      // Dead-man: the agent must destroy the guest itself at expiresAt+10s,
-      // with the controller unable to reach it.
-      const shortDeadline = shortCreatedAt + 15_000 + 10_000
-      await waitForTrue(
-        'agent host-b dead-man destroyed the expired instance',
-        () => {
-          const stats = hostStats(B)
-          return (
-            (stats.instances ?? []).every(
-              instance => instance.id !== shortRun.row.id
-            ) && agentState(B, shortRun.row.id) === undefined
-          )
-        },
-        60_000,
-        1_000
+      // Dead-man: the agent tears the guest down at
+      // expiresAtMs + expiryGraceSeconds (10s in provision-host.sh) on its own,
+      // while the controller cannot reach it. The agent sweep runs every 1s
+      // (`sweepIntervalMs` in agent/manager.ts), so destruction is expected
+      // within ~1s of that deadline plus teardown time; the band is tight.
+      const expiryGraceMs = 10_000
+      const shortDeadline = shortExpiresAt + expiryGraceMs
+      const destroyed = await waitDestroyed(
+        B,
+        shortRun.row.id,
+        shortPid,
+        60_000
       )
-      const destroyedAt = Date.now()
       report.check(
         '6.9',
-        'host-b destroys the expired guest on its own dead-man deadline while partitioned',
-        destroyedAt >= shortDeadline - 3_000 &&
-          destroyedAt <= shortDeadline + 25_000,
-        `deadline=${shortDeadline} destroyed=${destroyedAt} delta=${destroyedAt - shortDeadline}ms`
+        'host-b destroys the expired guest on its own dead-man deadline (expiresAtMs + 10s grace; 1s agent sweep) while partitioned',
+        destroyed.ok &&
+          destroyed.destroyedAt !== undefined &&
+          destroyed.destroyedAt >= shortDeadline - 1_000 &&
+          destroyed.destroyedAt <= shortDeadline + 8_000,
+        `expiresAtMs=${shortExpiresAt} deadline=${shortDeadline} destroyed=${destroyed.destroyedAt ?? 'never'} delta=${destroyed.destroyedAt === undefined ? 'n/a' : destroyed.destroyedAt - shortDeadline}ms ${destroyed.detail}`
       )
       report.check(
         '6.10',
@@ -1781,14 +2160,20 @@ const scenarioHostLoss = async (): Promise<void> => {
       )
       await waitRunning('loss-new', CHAL)
       const lostDuring = await get('loss', CHAL)
+      const lossRowsDuring = rowsFor('loss', CHAL)
       report.check(
         '5.5',
-        'the instance on the dead host is not rescheduled; it reports errored and its row stays pinned to host-b',
+        'the instance on the dead host is not rescheduled: exactly one row exists, reports errored, stays pinned to host-b, and host-a has no agent record for that id',
         isDetails(lostDuring) &&
           lostDuring.status === 'errored' &&
-          rowsFor('loss', CHAL)[0]?.host_id === B &&
-          rowsFor('loss', CHAL)[0]?.state === 'running',
-        `get=${short(lostDuring)} row=${short(rowsFor('loss', CHAL)[0])}`
+          lossRowsDuring.length === 1 &&
+          lossRowsDuring[0]?.id === running.row.id &&
+          lossRowsDuring[0]?.host_id === B &&
+          lossRowsDuring[0]?.state === 'running' &&
+          (await agentList(A)).every(
+            instance => instance.id !== running.row.id
+          ),
+        `get=${short(lostDuring)} rows=${short(lossRowsDuring.map(row => `${row.id}@${row.host_id}:${row.state}`))}`
       )
       const removed = await adminRequest('DELETE', `/v1/hosts/${B}`)
       const lostRow = rowsFor('loss', CHAL)[0]
@@ -2044,6 +2429,7 @@ const scenarioTokenMismatch = async (): Promise<void> => {
     '10',
     "one host's agent token wrong: rejected by that agent and surfaced as unhealthy",
     async () => {
+      const beforeSeen = (await dbHost(B))?.last_seen_ms
       await restartController('badtoken', 'SIGTERM')
       const unhealthyMs = await waitHostHealth(B, 'unhealthy', 30_000)
       report.check(
@@ -2054,12 +2440,28 @@ const scenarioTokenMismatch = async (): Promise<void> => {
           (await hostSummary(B))?.health === 'unhealthy',
         `unhealthy after ~${unhealthyMs}ms hostA=${(await hostSummary(A))?.health}`
       )
-      const dbB = await dbHost(B)
+      // "No successful heartbeat" must mean the timestamp stopped advancing,
+      // not merely that health is unhealthy: capture it twice while the wrong
+      // token is in use and compare with the pre-restart value.
+      const dbB1 = await dbHost(B)
+      await sleep(3_000)
+      const dbB2 = await dbHost(B)
+      const seen1 = dbB1?.last_seen_ms ?? null
+      const seen2 = dbB2?.last_seen_ms ?? null
       report.check(
         '10.2',
-        'the controller never records a successful heartbeat for the mismatched host',
-        dbB !== undefined && dbB.health === 'unhealthy',
-        `health=${dbB?.health}`
+        'the controller never records a successful heartbeat for the mismatched host (last_seen_ms is frozen while the wrong token is in use)',
+        dbB2 !== undefined &&
+          dbB2.health === 'unhealthy' &&
+          seen1 !== null &&
+          seen2 !== null &&
+          seen1 === seen2 &&
+          // The old controller may have written one last heartbeat between the
+          // capture and SIGTERM; the bad-token controller must not add any.
+          (beforeSeen === null ||
+            beforeSeen === undefined ||
+            seen2 - beforeSeen <= 3_000),
+        `health=${dbB2?.health} before=${beforeSeen ?? 'null'} first=${seen1 ?? 'null'} second=${seen2 ?? 'null'} advance=${seen1 === null || seen2 === null ? 'n/a' : seen2 - seen1}`
       )
       const directB = await agentInfo(B)
       report.check(
@@ -2105,6 +2507,469 @@ const scenarioTokenMismatch = async (): Promise<void> => {
 }
 
 // ---------------------------------------------------------------------------
+// Ambiguous creates: fencing and adoption through an in-guest fault proxy
+// ---------------------------------------------------------------------------
+
+const FAULT_DIR = '/home/ubuntu/mh-controller'
+const FAULT_PROXY = 'deploy/firecracker/multihost/faultproxy.ts'
+
+interface CapturedCreate {
+  id: string
+  method: string
+  target: string
+  headers: Record<string, string>
+  bodyBase64: string
+}
+
+const startFaultProxy = async (): Promise<number> => {
+  remoteOut(A, `rm -f ${FAULT_DIR}/faultproxy.*`)
+  const out = remoteOut(
+    A,
+    `cd /opt/rctf-firecracker && ` +
+      `{ setsid /usr/local/bin/bun ${FAULT_PROXY} ${B_IP} 7001 ${FAULT_DIR} ` +
+      `</dev/null >>${FAULT_DIR}/faultproxy.log 2>&1 & } ; ` +
+      `for i in $(seq 1 150); do [ -s ${FAULT_DIR}/faultproxy.port ] && break; sleep 0.1; done; ` +
+      `cat ${FAULT_DIR}/faultproxy.port 2>/dev/null || true`,
+    60_000
+  )
+  const port = Number(out.trim())
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error(
+      `fault proxy did not start: ${short(out)}; log: ${short(
+        remoteOut(
+          A,
+          `tail -20 ${FAULT_DIR}/faultproxy.log 2>/dev/null || true`
+        ),
+        600
+      )}`
+    )
+  }
+  return port
+}
+
+const stopFaultProxy = async (): Promise<void> => {
+  try {
+    remoteOut(
+      A,
+      `if [ -f ${FAULT_DIR}/faultproxy.pid ]; then kill "$(cat ${FAULT_DIR}/faultproxy.pid)" 2>/dev/null || true; fi`
+    )
+    await sleep(300)
+  } finally {
+    remoteOut(A, `rm -f ${FAULT_DIR}/faultproxy.mode`)
+  }
+}
+
+const armFault = async (
+  fault: 'hold-request' | 'drop-response'
+): Promise<void> => {
+  remoteOut(A, `printf '%s' ${fault} > ${FAULT_DIR}/faultproxy.mode`)
+  // The proxy polls the mode file every 50ms; let it arm before the create.
+  await sleep(250)
+}
+
+const readCaptured = (): CapturedCreate[] => {
+  try {
+    const text = remoteOut(
+      A,
+      `cat ${FAULT_DIR}/faultproxy.captured.json 2>/dev/null || true`
+    )
+    if (text.trim() === '') return []
+    return JSON.parse(text) as CapturedCreate[]
+  } catch {
+    return []
+  }
+}
+
+const readForwarded = (): string[] => {
+  try {
+    const text = remoteOut(
+      A,
+      `cat ${FAULT_DIR}/faultproxy.forwarded.json 2>/dev/null || true`
+    )
+    if (text.trim() === '') return []
+    return JSON.parse(text) as string[]
+  } catch {
+    return []
+  }
+}
+
+/** Replay the captured create straight to host-b's agent (not the proxy). */
+const replayCapturedCreate = (captured: CapturedCreate): number => {
+  const out = remoteOut(
+    A,
+    `set -a; . ${CONTROLLER_ENV}; set +a; ` +
+      `curl -sS -m 10 -X ${captured.method} ` +
+      `-H "Authorization: Bearer $FIRECRACKER_HOST_TOKEN_HOST_B" ` +
+      `-H 'Content-Type: application/json' ` +
+      `--data-binary @${FAULT_DIR}/faultproxy.replay.body ` +
+      `-w '\\n%{http_code}' http://${B_IP}:7001${captured.target}`,
+    30_000
+  )
+  const lines = out.trimEnd().split('\n')
+  return Number(lines[lines.length - 1]?.trim() ?? 0)
+}
+
+const scenarioAmbiguousCreate = async (): Promise<void> => {
+  await report.group(
+    '11',
+    'ambiguous create: a held create is fenced and a response-swallowed create is adopted',
+    async () => {
+      let proxyStarted = false
+      let controllerOnProxy = false
+      try {
+        await adminRequest('POST', `/v1/hosts/${A}/undrain`)
+        await adminRequest('POST', `/v1/hosts/${B}/undrain`)
+        await waitHostsHealthy(90_000)
+        await waitControllerEmpty()
+        await waitAgentsClean()
+
+        const port = await startFaultProxy()
+        proxyStarted = true
+        const proxyYaml = `${FAULT_DIR}/controller-proxy.yaml`
+        remoteOut(
+          A,
+          `sed 's#url: http://${B_IP}:7001#url: http://127.0.0.1:${port}#' ${CONTROLLER_YAML} > ${proxyYaml}`
+        )
+        const rewritten = Number(
+          remoteOut(
+            A,
+            `grep -c 'url: http://127.0.0.1:${port}' ${proxyYaml} || true`
+          )
+        )
+        await restartController('normal', 'SIGTERM', proxyYaml)
+        controllerOnProxy = true
+        await waitHostsHealthy(90_000)
+        report.check(
+          '11.1',
+          'the controller reaches host-b only through the in-guest fault proxy and both hosts are healthy',
+          rewritten === 1 && (await hostSummary(B))?.health === 'healthy',
+          `rewritten=${rewritten} proxyPort=${port}`
+        )
+
+        // --- hold-request: nothing reaches the agent; the fence must fire.
+        await adminRequest('POST', `/v1/hosts/${A}/drain`)
+        await armFault('hold-request')
+        const held = await create('fence-hold', CHAL)
+        const heldRows = rowsFor('fence-hold', CHAL)
+        const heldRow = heldRows[0]
+        report.check(
+          '11.2',
+          'the held create is ambiguous: the controller keeps exactly one creating row pinned to host-b and answers starting',
+          heldRows.length === 1 &&
+            heldRow !== undefined &&
+            heldRow.state === 'creating' &&
+            heldRow.host_id === B &&
+            isDetails(held) &&
+            held.status === 'starting',
+          `response=${short(held)} rows=${short(
+            heldRows.map(row => `${row.id}@${row.host_id}:${row.state}`)
+          )}`
+        )
+        if (heldRow === undefined) {
+          throw new Error('no creating row for fence-hold')
+        }
+        const captured = await waitFor(
+          'the held create request is captured',
+          () => readCaptured(),
+          requests => requests.length === 1,
+          20_000,
+          200
+        )
+        const heldId = heldRow.id
+        report.check(
+          '11.3',
+          'the create request was captured instead of delivered: no agent record or VM for the id on either host',
+          captured[0]?.id === heldId &&
+            (await agentList(B)).every(instance => instance.id !== heldId) &&
+            (await agentList(A)).every(instance => instance.id !== heldId) &&
+            probeAgentState(B, heldId).exists === false,
+          `captured=${captured[0]?.id} row=${heldId}`
+        )
+        const fenced = await waitForTrue(
+          'the reconciler fences the ambiguous create',
+          () => rowsFor('fence-hold', CHAL).length === 0,
+          45_000,
+          500
+        )
+          .then(() => true)
+          .catch(() => false)
+        report.check(
+          '11.4',
+          'after createFenceSeconds the reconciler fences the id and removes the row (the key is freed)',
+          fenced,
+          `rows=${rowsFor('fence-hold', CHAL).length}`
+        )
+        const tombstoned = probeTombstone(B, heldId)
+        report.check(
+          '11.5',
+          'the agent durably tombstoned the fenced id',
+          tombstoned === true,
+          `tombstone=${tombstoned === undefined ? 'probe error' : tombstoned}`
+        )
+        const replayCode = replayCapturedCreate(captured[0]!)
+        await sleep(1_500)
+        const replayStats = probeHostStats(B)
+        report.check(
+          '11.6',
+          'replaying the captured PUT is rejected by the tombstone (HTTP 409) and creates no VM on either host',
+          replayCode === 409 &&
+            replayStats.ok &&
+            replayStats.stats!.instances!.every(
+              instance => instance.id !== heldId
+            ) &&
+            probeAgentState(B, heldId).exists === false &&
+            (await agentList(A)).every(instance => instance.id !== heldId),
+          `replayHTTP=${replayCode} agentB=${short(
+            replayStats.stats?.instances?.map(instance => instance.id) ??
+              replayStats.error
+          )}`
+        )
+        const recreated = await create('fence-hold', CHAL)
+        const recreatedRun = await waitRunning('fence-hold', CHAL)
+        report.check(
+          '11.7',
+          'fencing freed the key: the same team gets a fresh instance with a different id on host-b',
+          isDetails(recreated) &&
+            recreatedRun.row.id !== heldId &&
+            recreatedRun.row.host_id === B,
+          `old=${heldId} new=${recreatedRun.row.id} host=${recreatedRun.row.host_id}`
+        )
+        await deleteAndWait('fence-hold', CHAL)
+
+        // --- drop-response: the VM exists but the response is swallowed.
+        await armFault('drop-response')
+        const adoptedCreate = await create('fence-adopt', CHAL)
+        const adoptRows = rowsFor('fence-adopt', CHAL)
+        const adoptRow = adoptRows[0]
+        const forwarded = await waitFor(
+          'the create was forwarded upstream',
+          () => readForwarded(),
+          ids => ids.length === 1,
+          20_000,
+          200
+        )
+        report.check(
+          '11.8',
+          'the response-swallowed create is ambiguous: the controller answered starting, the VM exists on host-b, and the id matches the forwarded request',
+          isDetails(adoptedCreate) &&
+            adoptedCreate.status === 'starting' &&
+            adoptRows.length === 1 &&
+            adoptRow !== undefined &&
+            adoptRow.host_id === B &&
+            forwarded[0] === adoptRow.id &&
+            (await agentList(B)).some(instance => instance.id === adoptRow.id),
+          `response=${short(adoptedCreate)} row=${adoptRow?.id} forwarded=${short(
+            forwarded
+          )}`
+        )
+        if (adoptRow === undefined) {
+          throw new Error('no creating row for fence-adopt')
+        }
+        const adopted = await waitRunning('fence-adopt', CHAL, 60_000)
+        const adoptedIdentity = requireIdentity(B, adopted.row.id)
+        report.check(
+          '11.9',
+          'the reconciler adopts the existing VM: same id, running, pinned to host-b, one row and no duplicate on host-a',
+          adopted.row.id === adoptRow.id &&
+            adopted.row.host_id === B &&
+            (await agentList(B)).filter(instance => instance.id === adoptRow.id)
+              .length === 1 &&
+            (await agentList(A)).every(
+              instance => instance.id !== adoptRow.id
+            ) &&
+            rowsFor('fence-adopt', CHAL).length === 1,
+          `id=${adopted.row.id} host=${adopted.row.host_id}`
+        )
+        report.check(
+          '11.10',
+          'the adopted instance serves its flag from host-b',
+          guestFlag(B, adoptedIdentity.guestIp) ===
+            flagFor('fence-adopt', CHAL),
+          `guest=${adoptedIdentity.guestIp}`
+        )
+        await deleteAndWait('fence-adopt', CHAL)
+      } finally {
+        try {
+          if (proxyStarted) await stopFaultProxy()
+        } catch {
+          // best effort
+        }
+        try {
+          if (controllerOnProxy) {
+            await restartController('normal', 'SIGTERM')
+            await waitHostsHealthy(90_000)
+          }
+        } catch {
+          // best effort
+        }
+        try {
+          await adminRequest('POST', `/v1/hosts/${A}/undrain`)
+        } catch {
+          // best effort
+        }
+      }
+    }
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Agent restart with a live VM: systemctl restart, then kill -9
+// ---------------------------------------------------------------------------
+
+const scenarioAgentRestart = async (): Promise<void> => {
+  await report.group(
+    '12',
+    'agent restart with a live VM: re-adoption keeps the same Firecracker pid and host pinning',
+    async () => {
+      await adminRequest('POST', `/v1/hosts/${A}/undrain`)
+      await adminRequest('POST', `/v1/hosts/${B}/undrain`)
+      await waitHostsHealthy(90_000)
+      await waitControllerEmpty()
+      await waitAgentsClean()
+
+      const created = await create('agent-rst', CHAL)
+      if (!isDetails(created)) throw new Error(`create: ${short(created)}`)
+      const running = await waitRunning('agent-rst', CHAL)
+      const identity = requireIdentity(running.row.host_id, running.row.id)
+      const rowHost = running.row.host_id
+      report.check(
+        '12.1',
+        'the live instance is placed on host-a before the agent restarts',
+        rowHost === A,
+        rowHost
+      )
+
+      const waitAgentBack = async (): Promise<void> => {
+        await waitForTrue(
+          'the restarted agent re-adopts the live instance',
+          async () => {
+            try {
+              const info = await agentInfo(rowHost)
+              return (
+                info.accepting === true &&
+                info.checks?.recovered === true &&
+                (await agentList(rowHost)).some(
+                  instance => instance.id === running.row.id
+                )
+              )
+            } catch {
+              return false
+            }
+          },
+          180_000,
+          500
+        )
+        await waitHostHealth(rowHost, 'healthy', 90_000)
+      }
+
+      remoteOut(rowHost, 'sudo systemctl restart rctf-firecracker-agent')
+      await waitAgentBack()
+      const afterRestart = probeAgentState(rowHost, running.row.id)
+      const pidAfterRestart = Number(
+        (afterRestart.record?.vm as { pid?: number } | undefined)?.pid ?? 0
+      )
+      const fcAfterRestart = probeFirecracker(rowHost)
+      report.check(
+        '12.2',
+        'systemctl restart re-adopts the same VM (same Firecracker pid, same instance id)',
+        afterRestart.ok &&
+          afterRestart.exists === true &&
+          pidAfterRestart === identity.pid &&
+          fcAfterRestart.ok &&
+          fcLineForId(fcAfterRestart.lines!, running.row.id) !== undefined,
+        `pidBefore=${identity.pid} pidAfter=${pidAfterRestart} state=${short(
+          afterRestart.error ?? afterRestart.exists
+        )}`
+      )
+      report.check(
+        '12.3',
+        'after systemctl restart the guest still serves its flag and the controller keeps exactly one row pinned to host-a',
+        guestFlag(rowHost, identity.guestIp) === flagFor('agent-rst', CHAL) &&
+          rowsFor('agent-rst', CHAL).length === 1 &&
+          rowsFor('agent-rst', CHAL)[0]?.host_id === rowHost &&
+          rowsFor('agent-rst', CHAL)[0]?.id === running.row.id,
+        `rows=${short(rowsFor('agent-rst', CHAL).map(row => `${row.id}@${row.host_id}:${row.state}`))}`
+      )
+
+      const mainPid = Number(
+        remoteOut(
+          rowHost,
+          'systemctl show -p MainPID --value rctf-firecracker-agent'
+        )
+      )
+      report.check(
+        '12.4a',
+        'the agent main pid was readable before kill -9',
+        Number.isInteger(mainPid) && mainPid > 0,
+        `mainPid=${mainPid}`
+      )
+      remoteOut(rowHost, `sudo kill -9 ${mainPid}`)
+      await waitForTrue(
+        'systemd restarted the agent after kill -9',
+        async () => {
+          try {
+            const pid = Number(
+              remoteOut(
+                rowHost,
+                'systemctl show -p MainPID --value rctf-firecracker-agent'
+              )
+            )
+            if (pid <= 0 || pid === mainPid) return false
+            const info = await agentInfo(rowHost)
+            return info.accepting === true && info.checks?.recovered === true
+          } catch {
+            return false
+          }
+        },
+        180_000,
+        500
+      )
+      await waitHostHealth(rowHost, 'healthy', 90_000)
+      const afterKill = probeAgentState(rowHost, running.row.id)
+      const pidAfterKill = Number(
+        (afterKill.record?.vm as { pid?: number } | undefined)?.pid ?? 0
+      )
+      report.check(
+        '12.4b',
+        'after kill -9 systemd restarts the agent and it re-adopts the same Firecracker pid',
+        afterKill.ok &&
+          afterKill.exists === true &&
+          pidAfterKill === identity.pid,
+        `pidBefore=${identity.pid} pidAfter=${pidAfterKill} state=${short(
+          afterKill.error ?? afterKill.exists
+        )}`
+      )
+      report.check(
+        '12.5',
+        'after the kill the guest still serves and the controller still has exactly one row pinned to host-a',
+        guestFlag(rowHost, identity.guestIp) === flagFor('agent-rst', CHAL) &&
+          rowsFor('agent-rst', CHAL).length === 1 &&
+          rowsFor('agent-rst', CHAL)[0]?.host_id === rowHost &&
+          rowsFor('agent-rst', CHAL)[0]?.id === running.row.id,
+        `rows=${short(rowsFor('agent-rst', CHAL).map(row => `${row.id}@${row.host_id}:${row.state}`))}`
+      )
+
+      const other = await create('agent-rst-2', CHAL)
+      const otherRun = await waitRunning('agent-rst-2', CHAL)
+      report.check(
+        '12.6',
+        'a new create after both restarts still spreads to host-b; the existing instance stays pinned to host-a',
+        isDetails(other) &&
+          otherRun.row.host_id === B &&
+          rowsFor('agent-rst', CHAL)[0]?.host_id === A,
+        `new=${otherRun.row.host_id} existing=${rowsFor('agent-rst', CHAL)[0]?.host_id}`
+      )
+      await deleteAllTeams([
+        { team: 'agent-rst', chal: CHAL },
+        { team: 'agent-rst-2', chal: CHAL },
+      ])
+      await waitControllerEmpty()
+      await waitAgentsClean()
+    }
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Leftovers
 // ---------------------------------------------------------------------------
 
@@ -2115,6 +2980,7 @@ const leftovers = async (): Promise<void> => {
   let statsA: HostStats | undefined
   let statsB: HostStats | undefined
   let allRows: DbRow[] = []
+  let rowsProbeError: string | undefined
   try {
     await globalCleanup()
   } catch (error) {
@@ -2134,8 +3000,8 @@ const leftovers = async (): Promise<void> => {
   }
   try {
     allRows = rows()
-  } catch {
-    allRows = []
+  } catch (error) {
+    rowsProbeError = errorMessage(error)
   }
   report.line(
     `controller rows: ${allRows.length === 0 ? 'none' : allRows.map(row => `${row.team_id}/${row.challenge_integration_id}@${row.host_id}:${row.state}`).join(',')}`
@@ -2158,9 +3024,11 @@ const leftovers = async (): Promise<void> => {
   }
   report.check(
     'L.1',
-    'no controller instance rows remain',
-    allRows.length === 0,
-    `${allRows.length} rows`
+    'no controller instance rows remain (the SQLite dump succeeded)',
+    rowsProbeError === undefined && allRows.length === 0,
+    rowsProbeError === undefined
+      ? `${allRows.length} rows`
+      : `row dump failed: ${short(rowsProbeError, 200)}`
   )
   report.check(
     'L.2',
@@ -2264,6 +3132,8 @@ const main = async (): Promise<void> => {
   await scenarioHostLoss()
   await scenarioClockSkew()
   await scenarioTokenMismatch()
+  await scenarioAmbiguousCreate()
+  await scenarioAgentRestart()
 }
 
 try {
