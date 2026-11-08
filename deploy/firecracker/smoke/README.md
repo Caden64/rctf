@@ -5,8 +5,36 @@ manager, without root. It exists because most of the repository's automated test
 edges; this is the check that the pieces work against the real programs.
 
 ```sh
-./fetch-artifacts.sh   # downloads Firecracker (sha256-verified), a CI kernel, busybox, jq; builds the guest rootfs
+./fetch-artifacts.sh   # downloads the pinned Firecracker, CI kernel, busybox and jq (all sha256-verified); builds the guest rootfs
 ./run.sh               # needs bun, nft, ip, curl, python3, /dev/kvm access, unprivileged user namespaces
+```
+
+## Pinned artifacts
+
+`fetch-artifacts.sh` pins exact versions and embeds sha256 digests; cached files are re-hashed
+before every use and a mismatch is fatal. Downloads go to a `.part` file and are verified
+before being renamed into place.
+
+| Artifact            | Version                                  | sha256                                                             | Provenance                                                                |
+| ------------------- | ---------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| Firecracker tarball | `v1.17.0` x86_64                         | `06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558` | official release `.sha256.txt`                                            |
+| Firecracker binary  | `v1.17.0`                                | `99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5` | extracted from the verified tarball and re-hashed                         |
+| jq                  | `1.8.2` (`jq-linux-amd64`)               | `b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f` | official release `sha256sum.txt`                                          |
+| kernel              | `vmlinux-6.1.155` (Firecracker CI v1.15) | `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2` | **trust-on-first-use**: the publisher has no checksum next to this object |
+| busybox             | `1.35.0` static x86_64                   | `6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348` | **trust-on-first-use**: no publisher checksum in the binaries directory   |
+
+The kernel and busybox digests were computed from the fetched bytes because the publisher
+does not offer an independent checksum for those files. They are still pinned: a changed
+upstream file or a corrupted cache fails the fetch instead of being silently used. If you
+intentionally change a URL or version, update the digest and the provenance row here.
+
+To exercise the whole path against a fresh cache without touching the shared one (both
+commands must use the same directory):
+
+```sh
+export SMOKE_ARTIFACTS=$(mktemp -d ~/.cache/rctf-fc-smoke-verify/run-XXXXXX)
+./fetch-artifacts.sh
+./run.sh
 ```
 
 ## How it stays unprivileged and safe
@@ -40,8 +68,8 @@ and is short on purpose: Firecracker rejects unix socket paths longer than 107 b
   and **systemd hardening**.
 - The controller, scheduler, multi-host behaviour and the rCTF provider. Those are covered by the unit and
   end-to-end tests in `tests/server/tests/unit/firecracker-*.test.ts` with fake agents, not by this script.
-- Behaviour on other kernels, guests, or Firecracker versions than the ones fetched (Firecracker v1.17.0,
-  kernel 6.1.155 from the Firecracker CI bucket, busybox 1.35.0, latest jq).
+- Behaviour on other kernels, guests, or Firecracker versions than the pinned ones (Firecracker
+  v1.17.0, kernel 6.1.155 from the Firecracker CI bucket, busybox 1.35.0, jq 1.8.2).
 
 Run these on a real root host before an event: `host/README.md` lists the checks, and
 `FC_REAL=1 sudo bun test apps/firecracker-instancer/test/net` runs the privileged network tests.

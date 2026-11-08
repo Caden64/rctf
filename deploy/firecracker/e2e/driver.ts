@@ -34,6 +34,7 @@ import {
   readControllerRows,
   readJson,
   readProcCmdline,
+  readProcCmdlineIfAlive,
   scanFilesContaining,
   shell,
   short,
@@ -489,7 +490,10 @@ const fcProcessesForRun = (): number[] => pidsMatching(`${AGENT_RUN}/`)
  */
 const harnessPids = (): number[] =>
   pidsMatching(RUN).filter(pid => {
-    const cmdline = readProcCmdline(pid)
+    // A pid may exit between pgrep and this read; that is not a harness
+    // process and is safe to skip. Any other read error propagates.
+    const cmdline = readProcCmdlineIfAlive(pid)
+    if (cmdline === undefined) return false
     return (
       cmdline.includes('agent.yaml') ||
       cmdline.includes('controller.yaml') ||
@@ -986,7 +990,11 @@ const scenarioLifecycle = async (): Promise<void> => {
         rootfs.ok &&
           identity.ok &&
           Object.values(perArea).every(count => count === 0) &&
-          unreadable.length === 0,
+          unreadable.length === 0 &&
+          // A scan that read nothing proves nothing. scanFilesContaining now
+          // throws on a missing/unreadable root, and this requires that at
+          // least one file was actually read.
+          scanned > 0,
         JSON.stringify({
           ...perArea,
           scannedFiles: scanned,
@@ -995,11 +1003,24 @@ const scenarioLifecycle = async (): Promise<void> => {
           unreadable,
         })
       )
+      // The command line must have been read successfully and be non-empty;
+      // otherwise `!cmdline.includes(FLAG)` would pass without observing it.
+      let firecrackerCmdline: string | undefined
+      let cmdlineFailure: string | undefined
+      try {
+        firecrackerCmdline = readProcCmdline(pid)
+      } catch (error) {
+        cmdlineFailure = errorMessage(error)
+      }
       report.check(
         '1.7',
-        'the flag is absent from the firecracker process command line',
-        !readProcCmdline(pid).includes(FLAG),
-        `pid=${pid}`
+        'the flag is absent from the firecracker process command line (and the command line was actually read)',
+        cmdlineFailure === undefined &&
+          (firecrackerCmdline ?? '').trim().length > 0 &&
+          !(firecrackerCmdline ?? '').includes(FLAG),
+        cmdlineFailure === undefined
+          ? `pid=${pid} cmdlineChars=${(firecrackerCmdline ?? '').length}`
+          : `pid=${pid} READ FAILED: ${cmdlineFailure}`
       )
       report.check(
         '1.8',

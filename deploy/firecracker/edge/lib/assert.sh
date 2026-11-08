@@ -8,8 +8,36 @@
 # run them against deliberately broken inputs and prove that they fail.
 
 # --- conntrack -------------------------------------------------------------
+# The binary is overridable only so the selftest can inject a broken one; the
+# phases always use the real `conntrack` from PATH.
+CONNTRACK_BIN=${CONNTRACK_BIN:-conntrack}
+
+# Print a conntrack listing. Fails when the command fails OR when a successful
+# command prints output that is not a conntrack listing (a broken wrapper that
+# exits 0 and prints an error must never look like an empty table).
+conntrack_list() {
+  local out lines
+  out=$("$CONNTRACK_BIN" -L 2>&1) || return 1
+  lines=$(printf '%s\n' "$out" | sed '/^$/d')
+  if [ -n "$lines" ] &&
+    printf '%s\n' "$lines" |
+      grep -qvE '^((tcp|udp|icmp|icmpv6|sctp|dccp)[[:space:]]+[0-9]+[[:space:]]|conntrack v[0-9])'; then
+    return 1
+  fi
+  printf '%s\n' "$lines"
+}
+
+# Presence is fail-closed: a failed listing prints nothing, so grep fails.
 conntrack_has_ip() { # guestIp
-  conntrack -L 2>/dev/null | grep -q -- "$1"
+  conntrack_list | grep -q -- "$1"
+}
+
+# Absence is only meaningful when the listing itself succeeded. Never write
+# `! conntrack_has_ip`: a failed `conntrack -L` would then pass as "absent".
+conntrack_ip_absent() { # guestIp
+  local out
+  out=$(conntrack_list) || return 1
+  ! printf '%s\n' "$out" | grep -q -- "$1"
 }
 
 flush_guest_conntrack() { # guestIp -> the repository's real flushConntrack
@@ -61,4 +89,28 @@ port_connects() { # host port
 assert_port_closed() { # host publishedPort closedPort
   port_connects "$1" "$2" || return 1
   ! port_connects "$1" "$3"
+}
+
+# --- nmap greppable (-oG) reports -----------------------------------------
+# A "no open ports" result is only meaningful when nmap exited 0 AND produced a
+# complete, parseable report for exactly the ports we asked about. A timeout,
+# crash or truncated output must never be read as "closed".
+nmap_report_complete() { # exit-code greppable-output "port,port,..."
+  local rc=$1 out=$2 ports=$3 port portsline
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s\n' "$out" | grep -q 'Status: Up' || return 1
+  portsline=$(printf '%s\n' "$out" | grep 'Ports: ' | head -n 1)
+  [ -n "$portsline" ] || return 1
+  local IFS=,
+  for port in $ports; do
+    printf '%s\n' "$portsline" |
+      grep -Eq "(^|[ ,])${port}/(open|closed|filtered|unfiltered|open\\|filtered|closed\\|filtered)/tcp" ||
+      return 1
+  done
+  return 0
+}
+
+nmap_scan_blocked() { # exit-code greppable-output "port,port,..."
+  nmap_report_complete "$@" || return 1
+  ! printf '%s\n' "$2" | grep -Eq '/(open|open\|filtered)/'
 }

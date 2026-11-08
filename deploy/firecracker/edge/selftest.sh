@@ -121,5 +121,89 @@ else
   st_pass 3b "mutation caught: when the published probe does not connect, the closed-port assertion fails"
 fi
 
+# ===========================================================================
+# 4. nmap: a non-zero exit, a truncated report or a missing requested port must
+#    never be accepted as "no open ports". Mutation: break each condition.
+# ===========================================================================
+NMAP_CLOSED='Host: 10.200.0.6 ()	Status: Up
+Host: 10.200.0.6 ()	Ports: 8080/closed/tcp//http///, 9000/closed/tcp/////, 22/closed/tcp//ssh///'
+NMAP_OPEN='Host: 10.200.0.6 ()	Status: Up
+Host: 10.200.0.6 ()	Ports: 8080/open/tcp//http///, 9000/closed/tcp/////, 22/closed/tcp//ssh///'
+NMAP_TRUNCATED='Host: 10.200.0.6 ()	Status: Up'
+NMAP_PORTS=8080,9000,22
+if nmap_scan_blocked 0 "$NMAP_CLOSED" "$NMAP_PORTS"; then
+  st_pass 4 "complete exit-0 closed report is accepted as no open ports (assertion passes when it should)"
+else
+  st_fail 4 "a complete closed nmap report was rejected"
+fi
+if nmap_scan_blocked 1 "$NMAP_CLOSED" "$NMAP_PORTS"; then
+  st_fail 4b "mutation not caught: a non-zero nmap exit was accepted as no open ports"
+else
+  st_pass 4b "mutation caught: a non-zero nmap exit is not accepted as no open ports"
+fi
+if nmap_scan_blocked 0 "$NMAP_TRUNCATED" "$NMAP_PORTS"; then
+  st_fail 4c "mutation not caught: a truncated nmap report (no Ports line) was accepted as no open ports"
+else
+  st_pass 4c "mutation caught: a truncated/unparseable nmap report is not accepted as no open ports"
+fi
+if nmap_scan_blocked 0 "$NMAP_CLOSED" "8080,9000,22,1234"; then
+  st_fail 4d "mutation not caught: a report missing a requested port was accepted as complete"
+else
+  st_pass 4d "mutation caught: a report that omits a requested port is not accepted as complete"
+fi
+if nmap_scan_blocked 0 "$NMAP_OPEN" "$NMAP_PORTS"; then
+  st_fail 4e "mutation not caught: an open port was accepted as 'no open ports'"
+else
+  st_pass 4e "mutation caught: a report with an open port is not accepted as no open ports"
+fi
+
+# ===========================================================================
+# 5. conntrack negative probe: a failed or unparseable `conntrack -L` must not
+#    prove "no inherited state". Mutation: broken conntrack binaries.
+# ===========================================================================
+mk_fake_conntrack() { # dir exit-code body
+  mkdir -p "$1"
+  {
+    printf '#!/bin/sh\n'
+    if [ "$2" -ne 0 ]; then
+      printf 'exit %s\n' "$2"
+    else
+      printf "printf '%%s\\\\n' %q\n" "$3"
+    fi
+  } >"$1/conntrack"
+  chmod +x "$1/conntrack"
+}
+mk_fake_conntrack "$ST/ct-fail" 1 ''
+mk_fake_conntrack "$ST/ct-empty" 0 ''
+mk_fake_conntrack "$ST/ct-garbage" 0 'conntrack: netlink socket failed'
+mk_fake_conntrack "$ST/ct-present" 0 \
+  'tcp 6 431999 ESTABLISHED src=10.99.99.99 dst=10.99.99.1 sport=40000 dport=18080 [ASSURED] mark=0 use=1'
+
+if CONNTRACK_BIN="$ST/ct-fail/conntrack" conntrack_ip_absent 10.99.99.99; then
+  st_fail 5 "mutation not caught: a failing conntrack -L was accepted as 'no inherited state'"
+else
+  st_pass 5 "mutation caught: a failing conntrack -L cannot prove absence"
+fi
+if CONNTRACK_BIN="$ST/ct-garbage/conntrack" conntrack_ip_absent 10.99.99.99; then
+  st_fail 5b "mutation not caught: exit-0 garbage from conntrack was accepted as an empty listing"
+else
+  st_pass 5b "mutation caught: exit-0 unparseable conntrack output is not an empty listing"
+fi
+if CONNTRACK_BIN="$ST/ct-empty/conntrack" conntrack_ip_absent 10.99.99.99; then
+  st_pass 5c "a successful empty conntrack listing proves absence (assertion passes when it should)"
+else
+  st_fail 5c "a successful empty conntrack listing was rejected"
+fi
+if CONNTRACK_BIN="$ST/ct-present/conntrack" conntrack_ip_absent 10.99.99.99; then
+  st_fail 5d "mutation not caught: a listing that contains the IP was accepted as absent"
+else
+  st_pass 5d "mutation caught: a listing containing the IP is not absent"
+fi
+if CONNTRACK_BIN="$ST/ct-present/conntrack" conntrack_has_ip 10.99.99.99; then
+  st_pass 5e "presence is still detected in a valid listing"
+else
+  st_fail 5e "presence was not detected in a valid listing"
+fi
+
 printf 'RESULT selftest: %d passed, %d failed\n' "$passes" "$failures"
 [ "$failures" -eq 0 ]

@@ -9,6 +9,11 @@ cross-guest probe control, a published-port control, a full-scan nmap proof, fai
 probe/listener parsing, repo-pinned Traefik hashes, and a mutation selftest). The check
 counts therefore differ from the earlier 55-check log.
 
+A later revision (also 2026-11-08) additionally makes the *negative* probes fail closed: a
+timed-out/incomplete guest nmap is no longer read as "no open ports", and a failed
+`conntrack -L` is no longer read as "no inherited state". Its run is recorded in the last
+section.
+
 ## Environment / pinned programs
 
 | Program | Version | Provenance |
@@ -226,3 +231,42 @@ table, conntrack entry and Traefik process with it. The three `KEEP_RUN=1` run d
 were inspected and removed after the runs. No Firecracker, Traefik, `unshare`, `nsenter` or
 Python helper process from this work was left running, and no host nftables/conntrack state
 was created (all of it lives in the private namespaces).
+
+## Fail-closed negative probes (2026-11-08, run 4)
+
+A review found two negative probes that could pass when their command failed:
+
+1. `phase-veth` 7.2 ran `nmap ... || true` and only grepped for `/open/`. A timeout or crash
+   produced an empty result and was reported as "no open ports".
+2. `phase-veth` 5.9 (and the conntrack listings in `phase-agent` 5.1/5.2/5.7) used
+   `conntrack -L ... || true`; a failed listing was read as "no inherited conntrack state".
+
+`assert.sh` now provides `conntrack_list` (exit 0 + parseable listing, including the
+conntrack-tools summary line), `conntrack_ip_absent` (absence only when the listing
+succeeded), `nmap_report_complete` (exit 0, `Status: Up`, a `Ports:` line and every requested
+port present) and `nmap_scan_blocked`. The selftest grew from 6 to 16 mutation checks
+(5 nmap, 5 conntrack). Full run after the change:
+
+| | |
+| --- | --- |
+| Date | 2026-11-08 (America/Denver) |
+| Command | `SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
+| Run dir | `/run/user/1000/fce1794169078239579` |
+| phase agent | **30 pass / 0 fail**, exit 0 |
+| phase veth | **19 pass / 0 fail**, exit 0 |
+| phase lifecycle | **9 pass / 0 fail**, exit 0 |
+| CHECK total | **58 passed, 0 failed** |
+| SELFTEST | **16 passed, 0 failed** |
+| Exit code | **0** |
+
+```
+ CHECK 7.2 PASS nmap from guest A shows no open ports on guest B (exit 0, all 3 ports reported; cross-tap forwarding dropped)
+ CHECK 7.3 PASS control: with inet rules flushed the same nmap scan finds guest B's 8080 (exit 0, complete report)
+ CHECK 5.9 PASS reused /30 has no inherited conntrack state before the new instance is contacted (conntrack -L exit 0)
+ CHECK 5.11 PASS the new flow through the reused /30 is a fresh conntrack entry (conntrack -L exit 0)
+RESULT: 58 passed, 0 failed
+SELFTEST RESULT: 16 passed, 0 failed
+```
+
+This is one post-change run; the earlier three-run table above is kept as the historical
+baseline. The `KEEP_RUN=1` directory was inspected and is listed under Leftovers above.

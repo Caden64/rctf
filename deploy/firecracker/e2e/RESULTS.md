@@ -429,3 +429,43 @@ No other product bugs were found: every requested invariant held against the rea
   not inspected.
 - The `RESULTS.md` run dir is on tmpfs and will not survive a reboot; the assertions are reproduced
   by re-running `run.sh`.
+
+## Flag-absence probes fail closed (2026-11-08, re-verification)
+
+A review found that the flag-absence checks could pass when the observation itself failed:
+`scanFilesContaining` swallowed a missing root (returning `{hits:[],unreadable:[],scanned:0}`),
+`walkFiles` swallowed `readdir`/`stat` errors, and `readProcCmdline` returned `''` on a read
+failure, which satisfies `!cmdline.includes(FLAG)`. The fixes and their mutation proofs:
+
+1. `walkFiles` now throws on a failed directory enumeration or `stat`; `scanFilesContaining`
+   throws when a scan root cannot be `stat`ed or is neither a file nor a directory. The
+   driver's 1.6 additionally requires `scanned > 0`, so a scan that read nothing fails.
+2. `readProcCmdline` throws on any read failure; `processAlive` tolerates only `ENOENT`/`ESRCH`
+   (a process that really exited) and propagates other errors. 1.7 requires a successfully
+   read, non-empty command line before asserting the flag is absent.
+3. `selftest.sh` grew from 6 to 11 checks: nonexistent scan root, dangling-symlink root
+   (`stat` failure), nonexistent pid for `readProcCmdline`, `processAlive` false for a
+   nonexistent pid, and a positive real scan (`scanned=10`, `hits=5`).
+
+One full run after the change:
+
+|                  |                                                                            |
+| ---------------- | -------------------------------------------------------------------------- |
+| Date             | 2026-11-08 (America/Denver)                                                |
+| Command          | `SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke deploy/firecracker/e2e/run.sh` |
+| Run dir          | `/run/user/1000/fce-vzUdmi`                                                |
+| Result           | **128 passed, 0 failed, 128 assertions**                                   |
+| Driver exit code | **0**                                                                      |
+| Selftest         | **11 passed, 0 failed**                                                    |
+
+```
+PASS [1.6] the flag appears nowhere in controller sqlite, agent state, logs or the guest disk image (and every scanned file was readable) -- {"agent state":0,"agent traefik dir":0,"per-instance disk/run dir":0,"per-instance rootfs.ext4 (explicit)":0,"per-instance vm-identity.json":0,"controller sqlite":0,"logs":0,"whole run tree (configs, driver output, everything)":0,"scannedFiles":26,"rootfs":"readable","identity":"readable","unreadable":[]}
+PASS [1.7] the flag is absent from the firecracker process command line (and the command line was actually read) -- pid=231154 cmdlineChars=158
+RESULT: 128 passed, 0 failed, 128 assertions
+driver exit code: 0
+```
+
+The rest of the run (groups 2–12 and the leftovers) was unchanged from the 128-assertion
+baseline above; the full log is `/tmp/opencode/e2e-run.log` on the run host. This is one
+post-change run, not four: it is reported as such rather than as a repetition of the earlier
+four-run result.

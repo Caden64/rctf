@@ -255,8 +255,13 @@ export const walkFiles = (root: string): string[] => {
     let entries
     try {
       entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return
+    } catch (error) {
+      // A vanished/unreadable directory must not silently truncate the scan:
+      // that would make "the flag is absent" vacuous. Propagate instead.
+      throw new Error(
+        `cannot enumerate directory ${dir}: ${errorMessage(error)}`,
+        { cause: error }
+      )
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name)
@@ -265,8 +270,12 @@ export const walkFiles = (root: string): string[] => {
       } else if (entry.isFile()) {
         try {
           if (statSync(full).isFile()) files.push(full)
-        } catch {
-          // raced with a delete
+        } catch (error) {
+          // A file that disappeared between readdir and stat cannot be
+          // inspected; fail the scan rather than under-report it.
+          throw new Error(`cannot stat ${full}: ${errorMessage(error)}`, {
+            cause: error,
+          })
         }
       }
     }
@@ -288,6 +297,10 @@ export interface FileScan {
  * Scan one or more files/directories for `needle`, reporting unreadable files
  * instead of silently skipping them. Callers must treat `unreadable` as a
  * failure: otherwise a permission error makes "the flag is absent" vacuous.
+ *
+ * Enumeration/stat failures THROW. A missing or unreadable root means the scan
+ * did not happen, so returning an empty result would make every absence
+ * assertion vacuous; callers must only scan roots they expect to exist.
  */
 export const scanFilesContaining = (
   roots: readonly string[],
@@ -296,16 +309,22 @@ export const scanFilesContaining = (
   const bytes = Buffer.from(needle, 'utf8')
   const files: string[] = []
   for (const root of roots) {
+    let stat
     try {
-      const stat = statSync(root)
-      if (stat.isFile()) {
-        files.push(root)
-      } else if (stat.isDirectory()) {
-        files.push(...walkFiles(root))
-      }
-    } catch {
-      // A missing root is reported by the caller's own existence assertions;
-      // it is not an unreadable file.
+      stat = statSync(root)
+    } catch (error) {
+      throw new Error(`cannot stat scan root ${root}: ${errorMessage(error)}`, {
+        cause: error,
+      })
+    }
+    if (stat.isFile()) {
+      files.push(root)
+    } else if (stat.isDirectory()) {
+      files.push(...walkFiles(root))
+    } else {
+      throw new Error(
+        `scan root ${root} is neither a regular file nor a directory`
+      )
     }
   }
   const hits: string[] = []
@@ -339,19 +358,48 @@ export const readableFile = (
   }
 }
 
+const fsErrorCode = (error: unknown): string | undefined =>
+  typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : undefined
+
+/**
+ * The full argv of `pid` as one string. Throws when it cannot be read: an
+ * empty string would make `!cmdline.includes(FLAG)` pass even though no
+ * command line was ever observed.
+ */
 export const readProcCmdline = (pid: number): string => {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, 'latin1').replaceAll('\0', ' ')
-  } catch {
-    return ''
+  } catch (error) {
+    const code = fsErrorCode(error)
+    throw new Error(
+      `cannot read /proc/${pid}/cmdline${code === undefined ? '' : ` (${code})`}: ${errorMessage(error)}`,
+      { cause: error }
+    )
+  }
+}
+
+/**
+ * Like `readProcCmdline`, but a process that no longer exists yields
+ * `undefined` (a normal race). Any other read error still throws.
+ */
+export const readProcCmdlineIfAlive = (pid: number): string | undefined => {
+  try {
+    return readProcCmdline(pid)
+  } catch (error) {
+    const code = fsErrorCode((error as Error).cause)
+    if (code === 'ENOENT' || code === 'ESRCH') return undefined
+    throw error
   }
 }
 
 /** True when the pid exists AND still looks like the process we recorded. */
 export const processAlive = (pid: number, marker?: string): boolean => {
-  if (!existsSync(`/proc/${pid}`)) return false
+  const cmdline = readProcCmdlineIfAlive(pid)
+  if (cmdline === undefined) return false
   if (marker === undefined) return true
-  return readProcCmdline(pid).includes(marker)
+  return cmdline.includes(marker)
 }
 
 export const tailFile = (file: string, lines = 30): string => {

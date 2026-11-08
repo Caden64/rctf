@@ -505,9 +505,12 @@ for i in $(seq 1 30); do
   sleep 0.3
 done
 sleep 0.5
-CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_GUEST" && echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
-  pass 5.1 "long-lived DNAT flow to $A_GUEST:$A_HOLD plus an unrelated flow to port $A_HOLD are tracked"
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.1 "conntrack -L failed (exit $CT_RC); the DNAT flow is not proven"
+elif echo "$CT" | grep -q "$A_GUEST" && echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
+  pass 5.1 "long-lived DNAT flow to $A_GUEST:$A_HOLD plus an unrelated flow to port $A_HOLD are tracked (conntrack -L exit 0)"
 else
   fail 5.1 "expected conntrack entries missing: $(echo "$CT" | grep "$A_GUEST" | head -2)"
 fi
@@ -540,13 +543,18 @@ if [ "$A_CODE" = 404 ] && [ "$B_CODE" = 200 ]; then
 else
   fail 2.2 "after delete: A=$A_CODE B=$B_CODE (want 404/200)"
 fi
-CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_GUEST"; then
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.2 "conntrack -L failed after release (exit $CT_RC); absence of $A_GUEST is not proven"
+elif echo "$CT" | grep -q "$A_GUEST"; then
   fail 5.2 "conntrack still contains $A_GUEST after release: $(echo "$CT" | grep "$A_GUEST" | head -2)"
 else
-  pass 5.2 "real release flushed every conntrack entry of $A_GUEST before freeing the address"
+  pass 5.2 "real release flushed every conntrack entry of $A_GUEST before freeing the address (conntrack -L exit 0)"
 fi
-if echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.3 "conntrack -L failed (exit $CT_RC); survival of the unrelated flow is not proven"
+elif echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
   pass 5.3 "the unrelated flow with the same destination port $A_HOLD survived (address-scoped, not port-only)"
 else
   fail 5.3 "release also deleted the unrelated flow to port $A_HOLD (port-only deletion regression)"
@@ -604,12 +612,15 @@ if [ "$st" = running ] && [ "$C_TAP" != "$A_TAP" ] && [ "$C_GUEST" != "$A_GUEST"
 else
   fail 5.6 "quarantine violated: C state=$st tap=$C_TAP guest=$C_GUEST port=$C_PUB"
 fi
-CT=$(conntrack -L 2>/dev/null || true)
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
 # C holds a DIFFERENT /30 (5.6), so this is not a reuse assertion. It only
 # proves the released flow tuple is gone. The real reuse-without-inheritance
 # path (same /30 + public port handed to a new guest, quarantine 0) is executed
 # in phase-veth 5.9-5.12; the 120 s quarantine here deliberately prevents it.
-if echo "$CT" | grep -q "sport=55555"; then
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.7 "conntrack -L failed (exit $CT_RC); absence of the old tuple is not proven"
+elif echo "$CT" | grep -q "sport=55555"; then
   fail 5.7 "the old released flow tuple (client port 55555) still exists: $(echo "$CT" | grep "sport=55555" | head -2)"
 else
   pass 5.7 "old released flow tuple (client port 55555) is gone after release; C holds a different /30, so real reuse is phase-veth 5.9-5.12"

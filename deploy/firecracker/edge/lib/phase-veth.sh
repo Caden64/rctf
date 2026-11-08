@@ -360,19 +360,26 @@ apply_full
 # 7.2 nmap from inside guest A against guest B
 # ===========================================================================
 note "-- 7.2 nmap from guest A against guest B ($B_IP)"
+NMAP_PORTS=8080,9000,22
+NMAP_RC=0
 NMAP_BLOCKED=$(nsenter -t "$GA_PID" -n timeout 40 nmap -sT -Pn -n -T4 \
-  -p 8080,9000,22 "$B_IP" -oG - 2>/dev/null || true)
-if echo "$NMAP_BLOCKED" | grep -q '/open/'; then
-  fail 7.2 "guest A can reach guest B: $(echo "$NMAP_BLOCKED" | grep -o '[0-9]*/open' | tr '\n' ' ')"
+  -p "$NMAP_PORTS" "$B_IP" -oG - 2>"$RUN/out/nmap-blocked.err") || NMAP_RC=$?
+if ! nmap_report_complete "$NMAP_RC" "$NMAP_BLOCKED" "$NMAP_PORTS"; then
+  fail 7.2 "nmap failed or produced an incomplete/unparseable report (exit $NMAP_RC); 'no open ports' is not proven: $(printf '%s' "$NMAP_BLOCKED" | tr '\n' ' ') $(tr '\n' ' ' <"$RUN/out/nmap-blocked.err")"
+elif printf '%s\n' "$NMAP_BLOCKED" | grep -Eq '/(open|open\|filtered)/'; then
+  fail 7.2 "guest A can reach guest B: $(printf '%s\n' "$NMAP_BLOCKED" | grep -o '[0-9]*/open' | tr '\n' ' ')"
 else
-  pass 7.2 "nmap from guest A shows no open ports on guest B (cross-tap forwarding dropped)"
+  pass 7.2 "nmap from guest A shows no open ports on guest B (exit 0, all 3 ports reported; cross-tap forwarding dropped)"
 fi
 # Control: without the inet rules the same scan must find guest B's server.
 flush_inet
+NMAP_RC=0
 NMAP_CONTROL=$(nsenter -t "$GA_PID" -n timeout 40 nmap -sT -Pn -n -T4 \
-  -p 8080,9000,22 "$B_IP" -oG - 2>/dev/null || true)
-if echo "$NMAP_CONTROL" | grep -q '8080/open'; then
-  pass 7.3 "control: with inet rules flushed the same nmap scan finds guest B's 8080"
+  -p "$NMAP_PORTS" "$B_IP" -oG - 2>"$RUN/out/nmap-control.err") || NMAP_RC=$?
+if ! nmap_report_complete "$NMAP_RC" "$NMAP_CONTROL" "$NMAP_PORTS"; then
+  fail 7.3 "control nmap failed or produced an incomplete/unparseable report (exit $NMAP_RC): $(printf '%s' "$NMAP_CONTROL" | tr '\n' ' ') $(tr '\n' ' ' <"$RUN/out/nmap-control.err")"
+elif printf '%s\n' "$NMAP_CONTROL" | grep -q '8080/open'; then
+  pass 7.3 "control: with inet rules flushed the same nmap scan finds guest B's 8080 (exit 0, complete report)"
 else
   fail 7.3 "control failed: nmap cannot see guest B even with rules flushed"
 fi
@@ -390,9 +397,12 @@ nsenter -t "$OUT_PID" -n python3 "$EDGE/lib/hold_client.py" 203.0.114.3 "$A_HOLD
   >"$RUN/out/hold-unrelated.log" 2>&1 & HOLD_U=$!
 PIDS+=("$HOLD_U")
 sleep 1
-CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_IP" && echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
-  pass 5.6 "DNAT flow ($A_IP) and unrelated flow to port $A_HOLD tracked in conntrack"
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.6 "conntrack -L failed (exit $CT_RC); the DNAT flow is not proven; hold logs: $(cat "$RUN/out/hold-a.log" "$RUN/out/hold-unrelated.log" | tr '\n' ' ')"
+elif echo "$CT" | grep -q "$A_IP" && echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
+  pass 5.6 "DNAT flow ($A_IP) and unrelated flow to port $A_HOLD tracked in conntrack (conntrack -L exit 0)"
 else
   fail 5.6 "expected conntrack entries missing; hold logs: $(cat "$RUN/out/hold-a.log" "$RUN/out/hold-unrelated.log" | tr '\n' ' '); ct: $(echo "$CT" | head -3 | tr '\n' ' ')"
 fi
@@ -415,15 +425,20 @@ fi
 FLUSH_RC=0
 bun "$EDGE/lib/net-tools.ts" flush "$A_IP" >"$RUN/out/flush-a.log" 2>&1 || FLUSH_RC=$?
 sleep 0.3
-CT=$(conntrack -L 2>/dev/null || true)
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
 if [ "$FLUSH_RC" -ne 0 ]; then
   fail 5.7 "real flushConntrack exited $FLUSH_RC (must be 0): $(cat "$RUN/out/flush-a.log" | tr '\n' ' ')"
+elif [ "$CT_RC" -ne 0 ]; then
+  fail 5.7 "conntrack -L failed after the flush (exit $CT_RC); absence of $A_IP is not proven"
 elif echo "$CT" | grep -q "$A_IP"; then
   fail 5.7 "conntrack still has $A_IP after the real flush: $(echo "$CT" | grep "$A_IP")"
 else
-  pass 5.7 "real flushConntrack (exit 0) removed every entry for $A_IP"
+  pass 5.7 "real flushConntrack (exit 0) removed every entry for $A_IP (conntrack -L exit 0)"
 fi
-if echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.8 "conntrack -L failed (exit $CT_RC); survival of the unrelated flow is not proven"
+elif echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
   pass 5.8 "unrelated flow with the SAME destination port $A_HOLD survived (no port-only deletion)"
 else
   fail 5.8 "address-scoped flush also removed the unrelated flow to port $A_HOLD"
@@ -462,11 +477,14 @@ sleep 0.7
   printf ']}'
 } >"$RUN/out/veth-reuse-spec.json"
 bun "$EDGE/lib/net-tools.ts" render "$RUN/out/veth-reuse-spec.json" | nft -f -
-CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_IP"; then
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.9 "conntrack -L failed (exit $CT_RC); the absence of inherited state on the reused /30 is not proven"
+elif echo "$CT" | grep -q "$A_IP"; then
   fail 5.9 "reused /30 inherited a conntrack entry before any new flow: $(echo "$CT" | grep "$A_IP")"
 else
-  pass 5.9 "reused /30 has no inherited conntrack state before the new instance is contacted"
+  pass 5.9 "reused /30 has no inherited conntrack state before the new instance is contacted (conntrack -L exit 0)"
 fi
 BODY=$(nsenter -t "$OUT_PID" -n curl -sS -m 5 "http://203.0.113.1:$A_PUB/id.txt" 2>/dev/null || true)
 if [ "$BODY" = A2 ]; then
@@ -474,13 +492,18 @@ if [ "$BODY" = A2 ]; then
 else
   fail 5.10 "reused port reached '$BODY' instead of the new guest A2"
 fi
-CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_IP"; then
-  pass 5.11 "the new flow through the reused /30 is a fresh conntrack entry"
+CT_RC=0
+CT=$(conntrack_list) || CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.11 "conntrack -L failed (exit $CT_RC); the new flow is not proven"
+elif echo "$CT" | grep -q "$A_IP"; then
+  pass 5.11 "the new flow through the reused /30 is a fresh conntrack entry (conntrack -L exit 0)"
 else
   fail 5.11 "no conntrack entry for the new guest after a successful request"
 fi
-if echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
+if [ "$CT_RC" -ne 0 ]; then
+  fail 5.12 "conntrack -L failed (exit $CT_RC); survival of the unrelated flow is not proven"
+elif echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
   pass 5.12 "the unrelated flow is still alive after the whole reuse sequence"
 else
   fail 5.12 "the unrelated flow was lost during the reuse sequence"

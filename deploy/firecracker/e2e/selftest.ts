@@ -5,7 +5,14 @@
  *
  * Exit code 0 means every probe failed in the way the harness relies on.
  */
-import { shell, type ShellResult } from './harness'
+import { symlinkSync, unlinkSync } from 'node:fs'
+import {
+  processAlive,
+  readProcCmdline,
+  scanFilesContaining,
+  shell,
+  type ShellResult,
+} from './harness'
 import { inspectLease, nftText, tapsInNetns } from './probes'
 
 const failures: string[] = []
@@ -117,6 +124,53 @@ if (okVisible.ok) {
   pass('calibration passes when the lease tap and IP are visible')
 } else {
   fail(`calibration rejected a visible lease: ${okVisible.problems.join('; ')}`)
+}
+
+// ---------------------------------------------------------------------------
+// Flag-absence probes must fail closed when the observation itself fails.
+// A missing scan root used to return {hits:[],unreadable:[],scanned:0} and a
+// missing /proc/<pid>/cmdline used to return '' -- both made
+// "the flag is absent" vacuously true.
+// ---------------------------------------------------------------------------
+expectThrow('scanFilesContaining rejects a nonexistent root', () =>
+  scanFilesContaining(
+    [`${import.meta.dir}/missing-${crypto.randomUUID()}`],
+    'needle'
+  )
+)
+expectThrow(
+  'scanFilesContaining rejects a dangling-symlink root (stat fails)',
+  () => {
+    const link = `/tmp/e2e-selftest-dangling-${crypto.randomUUID()}`
+    symlinkSync('/nonexistent/scan-target', link)
+    try {
+      scanFilesContaining([link], 'needle')
+    } finally {
+      unlinkSync(link)
+    }
+  }
+)
+expectThrow('readProcCmdline rejects a nonexistent pid', () =>
+  readProcCmdline(2_147_483_600)
+)
+if (processAlive(2_147_483_600)) {
+  fail('processAlive reports a nonexistent pid as alive')
+} else {
+  pass('processAlive returns false for a nonexistent pid')
+}
+const liveScan = scanFilesContaining([import.meta.dir], 'scanFilesContaining')
+if (
+  liveScan.scanned > 0 &&
+  liveScan.hits.length > 0 &&
+  liveScan.unreadable.length === 0
+) {
+  pass(
+    `a real scan reads files and finds the needle (scanned=${liveScan.scanned}, hits=${liveScan.hits.length})`
+  )
+} else {
+  fail(
+    `a real scan did not behave (scanned=${liveScan.scanned}, hits=${liveScan.hits.length}, unreadable=${liveScan.unreadable.length})`
+  )
 }
 
 // Keep `shell` referenced so the import documents that the real probe path is

@@ -48,7 +48,11 @@ deploy/firecracker/e2e/selftest.sh
 `selftest.sh` runs `selftest.ts` inside `unshare -Urn`. It checks that the tap probe
 throws on a non-zero `ip` exit, the nft probe throws on a non-zero `nft` exit and on
 missing base tables, live calibration fails in a netns with no taps, and calibration
-passes for a visible lease. It needs no KVM and writes nothing.
+passes for a visible lease. It also proves the flag-absence probes fail closed: a
+nonexistent scan root (and a dangling-symlink root, i.e. a `stat` failure) makes
+`scanFilesContaining` throw, a nonexistent pid makes `readProcCmdline` throw while
+`processAlive` returns false, and a real scan reads files and finds the needle. It needs
+no KVM and writes only a short-lived symlink under `/tmp` (removed in a `finally`).
 
 Useful knobs:
 
@@ -150,9 +154,15 @@ which makes “row is still `creating`” and “the fence ran” deterministic 
 - Absence probes are strict: `tapsInNetns` throws when `ip` fails; `nftText` throws when `nft`
   fails or either base table is missing. Every run calibrates them while a VM is live (tap
   listed and nft text references the lease tap + guest IP) before trusting "nothing was left".
-- `scanFilesContaining` reports unreadable files instead of skipping them; assertion 1.6 fails if
-  any file in the scanned trees (including the per-instance `rootfs.ext4` and
-  `vm-identity.json`) cannot be read.
+- `scanFilesContaining` reports unreadable files instead of skipping them **and throws when a
+  scan root cannot be stat'ed or a directory cannot be enumerated or a file cannot be stat'ed**.
+  Assertion 1.6 fails if any file in the scanned trees (including the per-instance
+  `rootfs.ext4` and `vm-identity.json`) cannot be read, and also requires `scanned > 0`, so a
+  scan that never happened cannot pass.
+- `readProcCmdline` throws when `/proc/<pid>/cmdline` cannot be read (it no longer returns
+  `''`); `processAlive` treats only `ENOENT`/`ESRCH` as "gone" and propagates other errors.
+  Assertion 1.7 requires a successfully read, non-empty command line before concluding the flag
+  is absent from it.
 
 ## Files
 

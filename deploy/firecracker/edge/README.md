@@ -103,9 +103,11 @@ acts as the player; the upstream netns is the egress destination.
   open through the flush. The held connection is reset, every conntrack entry for the guest
   IP disappears, the unrelated flow survives (the flush is address-scoped, not port-only),
   the released `/30` and ports appear in the durable quarantine file with future deadlines,
-  and a new instance gets a different `/30` and ports. **5.7** only proves the old released
-  tuple is gone; the real same-`/30`/same-port reuse path is phase `veth` 5.9–5.12, because
-  the 120 s quarantine deliberately prevents reuse here.
+  and a new instance gets a different `/30` and ports. Every `conntrack -L` used for a
+  presence/absence assertion must exit 0 and produce a parseable listing; a failed listing is
+  never read as "the tuple is gone". **5.7** only proves the old released tuple is gone; the
+  real same-`/30`/same-port reuse path is phase `veth` 5.9–5.12, because the 120 s quarantine
+  deliberately prevents reuse here.
 - **7.1** `nmap -sT -p-` from outside against the host address sees **only** the published
   ports; nmap must exit 0 and its XML `scaninfo` must report `numservices="65535"
   services="1-65535"`, so a timed-out partial scan cannot pass. **7.2** a busybox `nc`
@@ -135,16 +137,19 @@ still crosses the real kernel forwarding hooks with the real rules. Checks:
   Every `spoof.py` injection and `sniff.py` capture in 6.x must exit 0; a failed probe fails
   the check instead of looking like a drop.
 - **7.2/7.3** `nmap` from guest A finds no open ports on guest B; after flushing the inet
-  table the same scan finds guest B's `:8080` (control).
+  table the same scan finds guest B's `:8080` (control). Both scans must exit 0 and produce a
+  complete greppable report containing every requested port (`8080/9000/22`); a timeout,
+  crash or truncated report fails the check instead of looking like "no open ports".
 - **5.6–5.12** the dangerous reuse path: long-lived DNAT flow + unrelated flow on the same
   destination port, then the real release steps (fenced ruleset, interface removal, real
   `flushConntrack`), then a **new lease reusing the exact same `/30`, MAC-independent guest
   address, public port and client source port**. The guest flow must still be tracked after
   the fence and tap removal and immediately before the flush (**5.6a**); the flush must exit
-  0; only then is the old tuple asserted gone (**5.7**). The unrelated flow survives, and the
-  new guest is reached. Quarantine is 0 in this phase *on purpose* so the path that quarantine
-  protects can be executed; the real 120 s quarantine is covered by phase `agent` and
-  `lifecycle`.
+  0; only then is the old tuple asserted gone (**5.7**). Every `conntrack -L` here must exit 0
+  and parse as a listing — in particular **5.9** cannot treat a failed command as "no
+  inherited state". The unrelated flow survives, and the new guest is reached. Quarantine is 0
+  in this phase *on purpose* so the path that quarantine protects can be executed; the real
+  120 s quarantine is covered by phase `agent` and `lifecycle`.
 
 ### `phase-lifecycle` — real NetworkManager at scale (check 8)
 
@@ -183,9 +188,15 @@ correct case to PASS):
 - **3** `assert_port_closed` passes only when the published port connects from the same
   netns; a dead published probe makes it fail instead of reporting the unpublished port
   closed.
+- **4** `nmap_scan_blocked` accepts only an exit-0 report that contains a `Ports:` line with
+  all three requested ports; a non-zero exit, a truncated report, a missing requested port and
+  an open port are each rejected as "no open ports".
+- **5** `conntrack_ip_absent` accepts only a successful, parseable `conntrack -L`: a failing
+  command, exit-0 garbage, and a listing that contains the IP are each rejected; a successful
+  empty listing proves absence.
 
 The selftest emits `SELFTEST <id> PASS/FAIL` lines (counted separately from `CHECK`) and makes
-`run.sh` exit non-zero on any failure.
+`run.sh` exit non-zero on any failure. It now has 16 checks.
 
 ## What is real vs simulated
 
@@ -235,7 +246,7 @@ The real guest performs the same scan with busybox `nc` (7.2).
 run.sh                     outer launcher: checks, short RUN dir, `unshare -Urn`
 fetch-traefik.sh           repo-pinned tarball+binary sha256; re-hashes the cache every run
 inner.sh                   builds the guest image, runs the mutation selftest + three phases
-selftest.sh                mutation proofs for the conntrack/probe/closed-port assertions
+selftest.sh                mutation proofs for the conntrack/probe/closed-port/nmap assertions
 lib/phase-agent.sh         checks 1-5, 7.1/7.2 with real Firecracker + agent + Traefik
 lib/phase-veth.sh          checks 5.6-5.12, 6.x, 7.2/7.3 with raw frames
 lib/phase-lifecycle.sh     check 8: real NetworkManager, 10 concurrent leases
