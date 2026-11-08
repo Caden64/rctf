@@ -3,8 +3,9 @@
 This directory verifies the **network edge** of the Firecracker instancer against real
 programs, without root and without touching the machine's network:
 
-- **real Traefik 3.7.15** (sha256-verified release binary) loading the agent's file-provider
-  routes and proxying to real backends;
+- **real Traefik 3.7.15** (the release-tarball and extracted-binary sha256 are pinned in
+  `fetch-traefik.sh` and the cached binary is re-hashed on every run) loading the agent's
+  file-provider routes and proxying to real backends;
 - **real nftables** `inet rctf_fc` / `arp rctf_fc_arp` rules rendered by the repository's own
   `renderRuleset` and applied with `nft -f -`;
 - **real conntrack** (`conntrack -L` / the repository's `flushConntrack`);
@@ -20,10 +21,17 @@ needed (or available).
 ## Run
 
 ```sh
-./fetch-traefik.sh     # once: download + verify Traefik into ~/.cache/rctf-edge
-./run.sh               # all phases; exit 0 iff every CHECK passes
+./fetch-traefik.sh     # verify the cached binary against the repo-pinned sha256, or download + verify
+./run.sh               # all phases + mutation selftest; exit 0 iff every CHECK and SELFTEST passes
 KEEP_RUN=1 ./run.sh    # keep the run dir and logs
 ```
+
+`fetch-traefik.sh` embeds the pinned sha256 of both the release tarball and the extracted
+binary. The tarball pin was taken from the official `traefik_v3.7.15_checksums.txt` and
+cross-checked against the GitHub API release-asset digest; the published checksums file is
+still downloaded as a second source and a disagreement is fatal. `run.sh` calls
+`fetch-traefik.sh --verify` before every run, so a modified or corrupted cached binary stops
+the harness instead of being used.
 
 Prerequisites: `bun` on `PATH`, `/dev/kvm` readable/writable, unprivileged user namespaces,
 `nft`, `conntrack`, `nmap`, `python3`, `curl`, `ip`, and the artifacts from
@@ -76,21 +84,33 @@ acts as the player; the upstream netns is the egress destination.
 - **2.3/2.4** a malformed YAML file and a valid-but-partial router (missing service) in the
   watched directory do not break the live routes.
 - **3.x** from the outside netns: host public ports DNAT to exactly their own guest (verified
-  per port in nft and by the guest's `/id.txt`); an unpublished port is closed; the guest
-  address cannot be reached directly, bypassing DNAT.
+  per port in nft and by the guest's `/id.txt`); an unpublished port is closed only after the
+  published port is proven to connect from the same netns (**3.5**); the guest address cannot
+  be reached directly, bypassing DNAT (**3.6**), and a temporary accept rule proves the same
+  probe reaches the guest when allowed (**3.7**).
 - **4.x** measured **inside the real guests**: `egress:false` cannot reach upstream,
   `egress:true` can; `egress:true` still cannot reach the host side of its own tap or the
-  other guest; the probe loop itself is validated by flushing the rules (**4.5**), after
-  which the same probe reaches the host tap side.
+  other guest. While both guests are alive the rules are flushed and the same probe must
+  reach the host tap side (**4.5**) and at least one guest must report cross-guest
+  `scan=REACHED` (**4.6**), then the exact ruleset is restored. A guest that reports
+  `scan=error` (nc missing or an unexpected exit) is never accepted as `blocked`, and an
+  empty/unparseable `probe.txt` fails closed.
 - **5.x** a long-lived connection through DNAT (guest `:9000`) plus an unrelated connection
   **to the same destination port on a different address** are tracked by `conntrack -L`.
-  `DELETE` releases the instance: the held connection is reset, every conntrack entry for the
-  guest IP disappears, the unrelated flow survives (the flush is address-scoped, not
-  port-only), the released `/30` and ports appear in the durable quarantine file with future
-  deadlines, and a new instance gets a different `/30` and ports.
+  `DELETE` releases the instance. The guest flow must still be tracked after the fenced
+  ruleset and tap removal and immediately **before** the real flush, the flush must exit 0
+  (no `|| true`), and only then is absence asserted (**5.6a/5.7**); the held socket stays
+  open through the flush. The held connection is reset, every conntrack entry for the guest
+  IP disappears, the unrelated flow survives (the flush is address-scoped, not port-only),
+  the released `/30` and ports appear in the durable quarantine file with future deadlines,
+  and a new instance gets a different `/30` and ports. **5.7** only proves the old released
+  tuple is gone; the real same-`/30`/same-port reuse path is phase `veth` 5.9–5.12, because
+  the 120 s quarantine deliberately prevents reuse here.
 - **7.1** `nmap -sT -p-` from outside against the host address sees **only** the published
-  ports (Traefik HTTP + one port per tcp/raw expose). **7.2** a busybox `nc` connect from
-  inside real guest A to guest B's address is blocked.
+  ports; nmap must exit 0 and its XML `scaninfo` must report `numservices="65535"
+  services="1-65535"`, so a timed-out partial scan cannot pass. **7.2** a busybox `nc`
+  connect from inside real guest A to guest B's address is blocked; the 4.6 control shows the
+  same probe reports `scan=REACHED` when the rules are flushed, so a dead probe cannot pass.
 
 ### `phase-veth` — frame injection with the real ruleset (checks 5.6–5.12, 6.x, 7.2/7.3)
 
@@ -112,15 +132,19 @@ still crosses the real kernel forwarding hooks with the real rules. Checks:
   only, `10.200.0.0/24` is temporarily added to `fctap0`, because Linux ignores ARP senders
   that are off-link for the receiving interface *before* any nftables rule runs; the secondary
   prefix makes the sender on-link so an unfiltered kernel demonstrably answers.
+  Every `spoof.py` injection and `sniff.py` capture in 6.x must exit 0; a failed probe fails
+  the check instead of looking like a drop.
 - **7.2/7.3** `nmap` from guest A finds no open ports on guest B; after flushing the inet
   table the same scan finds guest B's `:8080` (control).
 - **5.6–5.12** the dangerous reuse path: long-lived DNAT flow + unrelated flow on the same
   destination port, then the real release steps (fenced ruleset, interface removal, real
   `flushConntrack`), then a **new lease reusing the exact same `/30`, MAC-independent guest
-  address, public port and client source port**. The old tuple is gone, the unrelated flow
-  survives, and the new guest is reached. Quarantine is 0 in this phase *on purpose* so the
-  path that quarantine protects can be executed; the real 120 s quarantine is covered by
-  phase `agent` and `lifecycle`.
+  address, public port and client source port**. The guest flow must still be tracked after
+  the fence and tap removal and immediately before the flush (**5.6a**); the flush must exit
+  0; only then is the old tuple asserted gone (**5.7**). The unrelated flow survives, and the
+  new guest is reached. Quarantine is 0 in this phase *on purpose* so the path that quarantine
+  protects can be executed; the real 120 s quarantine is covered by phase `agent` and
+  `lifecycle`.
 
 ### `phase-lifecycle` — real NetworkManager at scale (check 8)
 
@@ -138,6 +162,30 @@ entries exist before release.
 - **8.8** ten `/30` indexes and ten ports in the durable quarantine with future deadlines.
 - **8.9** a restart-like `restore([])` followed by allocation does **not** hand back any
   quarantined index or port.
+
+Every `nft`, `conntrack` and `ip` listing in this phase must exit 0; after teardown the only
+accepted non-zero is a genuinely missing table (named in the check text as
+`absent (expected after teardown)`). A failed listing can therefore never be read as a clean
+host.
+
+### `selftest` — mutation proofs for the hardened assertions
+
+`inner.sh` runs `selftest.sh` in its own network namespace before the phases. It deliberately
+breaks each condition and requires the **same** helper the phases use to FAIL (and the
+correct case to PASS):
+
+- **1** a `flushConntrack` of the *wrong* address exits 0 but leaves the tuple, so
+  "present immediately before the flush, absent after" cannot pass falsely; flushing the
+  right address removes it.
+- **2** the guest probe maps `nc` success to `REACHED`, a refusal to `blocked`, and
+  `nc` exit 127 / missing `nc` to `error`; `probe_scan_blocked` rejects empty,
+  unparseable and `scan=error` lines.
+- **3** `assert_port_closed` passes only when the published port connects from the same
+  netns; a dead published probe makes it fail instead of reporting the unpublished port
+  closed.
+
+The selftest emits `SELFTEST <id> PASS/FAIL` lines (counted separately from `CHECK`) and makes
+`run.sh` exit non-zero on any failure.
 
 ## What is real vs simulated
 
@@ -174,7 +222,10 @@ The real guest performs the same scan with busybox `nc` (7.2).
   the interface prefix (documented above) so the check proves the *rule*, not the kernel
   default.
 - The `phase-agent` egress/scan probe uses the guest's own `/probe.txt` loop, so results are
-  sampled (bounded polling); it is not a per-packet assertion.
+  sampled (bounded polling); it is not a per-packet assertion. The guest distinguishes
+  `blocked` from `error` (missing/unusable `nc`), empty or unparseable `probe.txt` fails
+  closed, and **4.6** proves the same probe reports `scan=REACHED` when the rules are
+  flushed, so a `blocked` result is not a dead probe.
 - Timings are wall-clock bounded (image build, VM boot, Traefik watch, probe loops); on a very
   loaded machine increase `EDGE_TIMEOUT` and the per-phase limits in `inner.sh`.
 
@@ -182,14 +233,17 @@ The real guest performs the same scan with busybox `nc` (7.2).
 
 ```
 run.sh                     outer launcher: checks, short RUN dir, `unshare -Urn`
-fetch-traefik.sh           pinned download + published sha256 verification
-inner.sh                   builds the guest image, runs the three phases, counts CHECKs
+fetch-traefik.sh           repo-pinned tarball+binary sha256; re-hashes the cache every run
+inner.sh                   builds the guest image, runs the mutation selftest + three phases
+selftest.sh                mutation proofs for the conntrack/probe/closed-port assertions
 lib/phase-agent.sh         checks 1-5, 7.1/7.2 with real Firecracker + agent + Traefik
 lib/phase-veth.sh          checks 5.6-5.12, 6.x, 7.2/7.3 with raw frames
 lib/phase-lifecycle.sh     check 8: real NetworkManager, 10 concurrent leases
+lib/assert.sh              shared fail-closed conntrack/probe/port assertions
 lib/lifecycle.ts           the NetworkManager assertions (imports the real modules)
 lib/net-tools.ts           render the real ruleset / run the real conntrack flush
 lib/guest-start            guest service: identity HTTP, hold listener, probe loop
+                           (`scan=blocked` vs `scan=error`, EDGE_PROBE_ONCE for selftest)
 lib/upstream.py            upstream HTTP + hold servers
 lib/hold_client.py         long-lived TCP flow with a fixed source port
 lib/connect_once.py        single SYN (creates a DNAT conntrack entry)

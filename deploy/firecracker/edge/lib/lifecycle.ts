@@ -57,9 +57,37 @@ const check = (id: string, ok: boolean, detail: string): void => {
     console.log(`CHECK ${id} FAIL ${detail}`)
   }
 }
-const text = async (argv: string[]): Promise<string> => {
+interface CmdText {
+  code: number
+  out: string
+  ok: boolean
+  error: string
+}
+/**
+ * Run a read-only command and keep its exit status.
+ *
+ * A non-zero status is never swallowed: `ok` is false unless the caller
+ * explicitly allows the one expected "table is already gone" case after
+ * teardown. Every check below fails on !ok, so a failed nft/conntrack listing
+ * cannot look like a clean host.
+ */
+const text = async (
+  argv: string[],
+  options: { allowMissingTable?: boolean } = {}
+): Promise<CmdText> => {
   const result = await run(argv, { timeoutMs: 20_000 })
-  return `${result.stdout}\n${result.stderr}`
+  const out = `${result.stdout}\n${result.stderr}`
+  const missingTable = /No such file or directory|does not exist/i.test(out)
+  const ok =
+    result.code === 0 ||
+    (options.allowMissingTable === true && result.code === 1 && missingTable)
+  const first = out.trim().split('\n')[0] ?? ''
+  return {
+    code: result.code,
+    out,
+    ok,
+    error: ok ? '' : `exit ${result.code}: ${first}`,
+  }
 }
 
 const manager = createNetworkManager(config as never, {
@@ -114,11 +142,13 @@ for (const lease of leases) {
     'dev',
     lease.tapName,
   ])
-  const isTap = /\btun\s+type\s+tap\b/.test(link)
-  const alias = /\balias\s+(rctf-fc:rctf-fc)\b/.test(link)
+  const isTap = link.ok && /\btun\s+type\s+tap\b/.test(link.out)
+  const alias = link.ok && /\balias\s+(rctf-fc:rctf-fc)\b/.test(link.out)
   if (!isTap || !alias) tapsOk = false
   tapDetail.push(
-    `${lease.tapName}:${isTap ? 'tap' : 'NOT-TAP'}${alias ? '+alias' : '-NO-ALIAS'}`
+    `${lease.tapName}:${isTap ? 'tap' : 'NOT-TAP'}${alias ? '+alias' : '-NO-ALIAS'}${
+      link.ok ? '' : ` (${link.error})`
+    }`
   )
 }
 check(
@@ -135,11 +165,11 @@ const tcpCount = requests.reduce(
   (sum, req) => sum + req.expose.filter(e => e.kind === 'tcp').length,
   0
 )
-const dnatLines = inet.split('\n').filter(line => line.includes('dnat ip to'))
+const dnatLines = inet.out.split('\n').filter(line => line.includes('dnat ip to'))
 const allGuests = leases.every(lease =>
-  inet.includes(`ip saddr != ${lease.guestIp} drop`)
+  inet.out.includes(`ip saddr != ${lease.guestIp} drop`)
 )
-const allArp = leases.every(lease => arp.includes(`iifname "${lease.tapName}"`))
+const allArp = leases.every(lease => arp.out.includes(`iifname "${lease.tapName}"`))
 const allPorts = leases.every(lease =>
   Object.values(lease.publicPorts).every(port =>
     dnatLines.some(line => line.includes(`tcp dport ${port} dnat`))
@@ -147,8 +177,15 @@ const allPorts = leases.every(lease =>
 )
 check(
   '8.3',
-  dnatLines.length === tcpCount && allGuests && allArp && allPorts,
-  `${dnatLines.length}/${tcpCount} DNAT rules, anti-spoof for all 10, ARP rules for all 10 taps`
+  inet.ok &&
+    arp.ok &&
+    dnatLines.length === tcpCount &&
+    allGuests &&
+    allArp &&
+    allPorts,
+  `${dnatLines.length}/${tcpCount} DNAT rules, anti-spoof for all 10, ARP rules for all 10 taps` +
+    (inet.ok ? '' : `; nft inet failed (${inet.error})`) +
+    (arp.ok ? '' : `; nft arp failed (${arp.error})`)
 )
 
 const traefikFile = `${traefikDir}/rctf-fc-${ids[0]}.yml`
@@ -190,31 +227,45 @@ for (const lease of leases) {
 await Promise.all(synPromises)
 await Bun.sleep(500)
 const beforeRelease = await text(['conntrack', '-L'])
-const entriesBefore = leases.filter(lease =>
-  beforeRelease.includes(lease.guestIp)
-).length
+const entriesBefore = beforeRelease.ok
+  ? leases.filter(lease => beforeRelease.out.includes(lease.guestIp)).length
+  : -1
 check(
   '8.5',
-  entriesBefore === N,
-  `conntrack saw ${entriesBefore}/${N} DNAT flows before release (real mappings)`
+  beforeRelease.ok && entriesBefore === N,
+  beforeRelease.ok
+    ? `conntrack saw ${entriesBefore}/${N} DNAT flows before release (real mappings)`
+    : `conntrack -L failed: ${beforeRelease.error}`
 )
 
 for (const lease of leases) await manager.release(lease.instanceId)
 
 const linksAfter = await text(['ip', '-o', 'link', 'show'])
-const tapsAfter = linksAfter
+const tapsAfter = linksAfter.out
   .split('\n')
   .filter(line => /: fctap\d+[:,]/.test(line))
-const inetAfter = await text(['nft', 'list', 'table', 'inet', 'rctf_fc'])
-const arpAfter = await text(['nft', 'list', 'table', 'arp', 'rctf_fc_arp'])
+// After teardown a missing table is acceptable (and reported); any other
+// non-zero nft status is a failure, not a "clean" host.
+const inetAfter = await text(['nft', 'list', 'table', 'inet', 'rctf_fc'], {
+  allowMissingTable: true,
+})
+const arpAfter = await text(['nft', 'list', 'table', 'arp', 'rctf_fc_arp'], {
+  allowMissingTable: true,
+})
 const leftovers =
-  inetAfter.includes('dnat') ||
-  inetAfter.includes('masquerade') ||
+  inetAfter.out.includes('dnat') ||
+  inetAfter.out.includes('masquerade') ||
   leases.some(
     lease =>
-      inetAfter.includes(lease.guestIp) || inetAfter.includes(lease.tapName)
+      inetAfter.out.includes(lease.guestIp) ||
+      inetAfter.out.includes(lease.tapName)
   ) ||
-  leases.some(lease => arpAfter.includes(lease.tapName))
+  leases.some(lease => arpAfter.out.includes(lease.tapName))
+const tableDetail = `inet=${
+  inetAfter.code === 0 ? 'present' : 'absent (expected after teardown)'
+} arp=${
+  arpAfter.code === 0 ? 'present' : 'absent (expected after teardown)'
+}`
 const traefikAfter = (() => {
   try {
     return readdirSync(traefikDir)
@@ -224,16 +275,29 @@ const traefikAfter = (() => {
 })()
 check(
   '8.6',
-  tapsAfter.length === 0 && !leftovers && traefikAfter.length === 0,
-  `after release: ${tapsAfter.length} taps left, rules clean=${!leftovers}, traefik entries=${traefikAfter.length}`
+  linksAfter.ok &&
+    inetAfter.ok &&
+    arpAfter.ok &&
+    tapsAfter.length === 0 &&
+    !leftovers &&
+    traefikAfter.length === 0,
+  `after release: ${tapsAfter.length} taps left${
+    linksAfter.ok ? '' : ` (ip failed: ${linksAfter.error})`
+  }, rules clean=${!leftovers}, traefik entries=${traefikAfter.length}; ${tableDetail}` +
+    (inetAfter.ok ? '' : `; nft inet failed (${inetAfter.error})`) +
+    (arpAfter.ok ? '' : `; nft arp failed (${arpAfter.error})`)
 )
 
 const afterRelease = await text(['conntrack', '-L'])
-const stale = leases.filter(lease => afterRelease.includes(lease.guestIp))
+const stale = afterRelease.ok
+  ? leases.filter(lease => afterRelease.out.includes(lease.guestIp))
+  : leases
 check(
   '8.7',
-  stale.length === 0,
-  `release flushed every conntrack entry (${stale.length} guest addresses still present)`
+  afterRelease.ok && stale.length === 0,
+  afterRelease.ok
+    ? `release flushed every conntrack entry (${stale.length} guest addresses still present)`
+    : `conntrack -L failed: ${afterRelease.error}`
 )
 
 let quarantineOk = false

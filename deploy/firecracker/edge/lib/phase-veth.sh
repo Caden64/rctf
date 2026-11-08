@@ -10,6 +10,7 @@
 # instance (real flushConntrack, same source tuple).
 set -u
 : "${RUN:?}" "${EDGE:?}" "${REPO:?}"
+. "$EDGE/lib/assert.sh"
 PIDS=()
 cleanup() {
   set +e
@@ -205,21 +206,31 @@ note "-- 6.1 spoofed source IP from guest A (claims guest B's address)"
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
   "$RUN/out/sniff-ip-blocked.json" --dport 9998 >/dev/null 2>&1 & SN=$!
 sleep 0.3
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP >/dev/null
-wait $SN || true
-if [ -s "$RUN/out/sniff-ip-blocked.json" ]; then
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.1 "spoofed-IP injection failed (exit $SPOOF_RC); the drop is not proven"
+elif [ "$SN_RC" -ne 0 ]; then
+  fail 6.1 "upstream sniffer failed (exit $SN_RC); the drop is not proven"
+elif [ -s "$RUN/out/sniff-ip-blocked.json" ]; then
   fail 6.1 "spoofed IP packet reached upstream: $(cat "$RUN/out/sniff-ip-blocked.json")"
 else
-  pass 6.1 "packet with saddr $B_IP from guest A was dropped (upstream saw none)"
+  pass 6.1 "packet with saddr $B_IP from guest A was dropped (upstream saw none; probe exit 0)"
 fi
 
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 3 \
   "$RUN/out/sniff-ip-control.json" --dport 9998 >/dev/null 2>&1 & SN=$!
 sleep 0.3
 flush_inet
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP-CONTROL >/dev/null
-wait $SN || true
-if grep -q '"ip_src": "10.200.0.6"' "$RUN/out/sniff-ip-control.json" 2>/dev/null; then
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" ip eth0 "$B_IP" 203.0.114.3 9998 SPOOF-IP-CONTROL >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+  fail 6.2 "control probe failed (spoof=$SPOOF_RC sniff=$SN_RC)"
+elif grep -q '"ip_src": "10.200.0.6"' "$RUN/out/sniff-ip-control.json" 2>/dev/null; then
   pass 6.2 "control: with inet rules flushed the same spoofed-IP packet is forwarded and observed"
 else
   fail 6.2 "control failed: spoofed-IP packet not observable even with rules flushed"
@@ -230,23 +241,33 @@ note "-- 6.3 spoofed source MAC from guest A (claims guest B's MAC)"
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 2.5 \
   "$RUN/out/sniff-mac-blocked.json" --dport 9999 >/dev/null 2>&1 & SN=$!
 sleep 0.3
+SPOOF_RC=0
 nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" eth eth0 "$B_MAC" "$OUT_MAC" \
-  "$A_IP" 203.0.114.3 9999 SPOOF-MAC >/dev/null
-wait $SN || true
-if [ -s "$RUN/out/sniff-mac-blocked.json" ]; then
+  "$A_IP" 203.0.114.3 9999 SPOOF-MAC >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.3 "spoofed-MAC injection failed (exit $SPOOF_RC); the drop is not proven"
+elif [ "$SN_RC" -ne 0 ]; then
+  fail 6.3 "upstream sniffer failed (exit $SN_RC); the drop is not proven"
+elif [ -s "$RUN/out/sniff-mac-blocked.json" ]; then
   fail 6.3 "frame with ether saddr $B_MAC reached upstream: $(cat "$RUN/out/sniff-mac-blocked.json")"
 else
-  pass 6.3 "frame with ether saddr $B_MAC from guest A was dropped"
+  pass 6.3 "frame with ether saddr $B_MAC from guest A was dropped (probe exit 0)"
 fi
 
 nsenter -t "$UP_PID" -n python3 "$EDGE/lib/sniff.py" eth0 udp 3 \
   "$RUN/out/sniff-mac-control.json" --dport 9999 >/dev/null 2>&1 & SN=$!
 sleep 0.3
 flush_inet
+SPOOF_RC=0
 nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" eth eth0 "$B_MAC" "$OUT_MAC" \
-  "$A_IP" 203.0.114.3 9999 SPOOF-MAC-CONTROL >/dev/null
-wait $SN || true
-if grep -q "\"payload\": \"SPOOF-MAC-CONTROL\"" "$RUN/out/sniff-mac-control.json" 2>/dev/null; then
+  "$A_IP" 203.0.114.3 9999 SPOOF-MAC-CONTROL >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+  fail 6.4 "control probe failed (spoof=$SPOOF_RC sniff=$SN_RC)"
+elif grep -q "\"payload\": \"SPOOF-MAC-CONTROL\"" "$RUN/out/sniff-mac-control.json" 2>/dev/null; then
   pass 6.4 "control: with inet rules flushed the spoofed-MAC frame is forwarded and observed"
 else
   fail 6.4 "control failed: spoofed-MAC frame not observable even with rules flushed"
@@ -256,19 +277,25 @@ apply_full
 note "-- 6.5 ARP: reply from guest A with guest B's MAC (same guest IP)"
 ip neigh replace "$A_IP" lladdr "$A_MAC" nud stale dev fctap0 2>/dev/null || true
 sleep 1.2
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 2 "$B_MAC" "$A_IP" "$OUT_MAC" 10.200.0.1 >/dev/null
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 2 "$B_MAC" "$A_IP" "$OUT_MAC" 10.200.0.1 >/dev/null || SPOOF_RC=$?
 sleep 0.3
-if ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $B_MAC"; then
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.5 "ARP spoof injection failed (exit $SPOOF_RC); the drop is not proven"
+elif ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $B_MAC"; then
   fail 6.5 "host accepted ARP $A_IP -> $B_MAC from guest A (ARP ether-saddr spoof)"
 else
-  pass 6.5 "ARP reply with ether saddr $B_MAC from guest A was dropped (host kept $A_MAC)"
+  pass 6.5 "ARP reply with ether saddr $B_MAC from guest A was dropped (host kept $A_MAC; probe exit 0)"
 fi
 ip neigh replace "$A_IP" lladdr "$A_MAC" nud stale dev fctap0 2>/dev/null || true
 sleep 1.2
 flush_arp
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 2 "$B_MAC" "$A_IP" "$OUT_MAC" 10.200.0.1 >/dev/null
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 2 "$B_MAC" "$A_IP" "$OUT_MAC" 10.200.0.1 >/dev/null || SPOOF_RC=$?
 sleep 0.3
-if ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $B_MAC"; then
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.6 "control probe failed (spoof exit $SPOOF_RC)"
+elif ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $B_MAC"; then
   pass 6.6 "control: with the ARP table flushed the spoofed reply updates the neighbour (probe is sensitive)"
 else
   fail 6.6 "control failed: spoofed ARP reply not observable with ARP rules flushed"
@@ -278,9 +305,12 @@ apply_full
 note "-- 6.7 ARP: spoofed sender IP (claims guest B's address) and the host reply"
 ip neigh flush dev fctap0 2>/dev/null || true
 # Positive control: a legit request is answered with the rules installed.
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$A_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$A_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null || SPOOF_RC=$?
 sleep 0.3
-if ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $A_MAC"; then
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.7 "positive control probe failed (spoof exit $SPOOF_RC)"
+elif ip neigh show dev fctap0 | grep -q "^$A_IP .*lladdr $A_MAC"; then
   pass 6.7 "legit ARP request from guest A is accepted with the ARP rules installed (positive control)"
 else
   fail 6.7 "positive control failed: legit ARP request from guest A was not learned"
@@ -295,20 +325,30 @@ ip neigh flush dev fctap0 2>/dev/null || true
 nsenter -t "$GA_PID" -n python3 "$EDGE/lib/sniff.py" eth0 arp 2.5 \
   "$RUN/out/sniff-arp-blocked.json" >/dev/null 2>&1 & SN=$!
 sleep 0.3
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$B_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null
-wait $SN || true
-if grep -q '"target_ip": "10.200.0.6"' "$RUN/out/sniff-arp-blocked.json" 2>/dev/null; then
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$B_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ]; then
+  fail 6.8 "ARP spoof injection failed (exit $SPOOF_RC); the drop is not proven"
+elif [ "$SN_RC" -ne 0 ]; then
+  fail 6.8 "guest-side sniffer failed (exit $SN_RC); the drop is not proven"
+elif grep -q '"target_ip": "10.200.0.6"' "$RUN/out/sniff-arp-blocked.json" 2>/dev/null; then
   fail 6.8 "host answered the ARP request whose sender was spoofed as $B_IP"
 else
-  pass 6.8 "ARP request with spoofed sender $B_IP from guest A was dropped (no host reply)"
+  pass 6.8 "ARP request with spoofed sender $B_IP from guest A was dropped (no host reply; probe exit 0)"
 fi
 nsenter -t "$GA_PID" -n python3 "$EDGE/lib/sniff.py" eth0 arp 3 \
   "$RUN/out/sniff-arp-control.json" >/dev/null 2>&1 & SN=$!
 sleep 0.3
 flush_arp
-nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$B_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null
-wait $SN || true
-if grep -q '"target_ip": "10.200.0.6"' "$RUN/out/sniff-arp-control.json" 2>/dev/null; then
+SPOOF_RC=0
+nsenter -t "$GA_PID" -n python3 "$EDGE/lib/spoof.py" arp eth0 1 "$A_MAC" "$B_IP" ff:ff:ff:ff:ff:ff 10.200.0.1 >/dev/null || SPOOF_RC=$?
+SN_RC=0
+wait $SN || SN_RC=$?
+if [ "$SPOOF_RC" -ne 0 ] || [ "$SN_RC" -ne 0 ]; then
+  fail 6.9 "control probe failed (spoof=$SPOOF_RC sniff=$SN_RC)"
+elif grep -q '"target_ip": "10.200.0.6"' "$RUN/out/sniff-arp-control.json" 2>/dev/null; then
   pass 6.9 "control: with the ARP table flushed the host answers the spoofed-sender request"
 else
   fail 6.9 "control failed: spoofed ARP request not observable with ARP rules flushed"
@@ -360,20 +400,35 @@ fi
 # Release step (a): fence, then drop the interface, then the REAL flush.
 render_apply "$A_ID" | nft -f -
 ip link del fctap0 2>/dev/null || true
-kill "$HOLD_A" 2>/dev/null || true
-bun "$EDGE/lib/net-tools.ts" flush "$A_IP" >"$RUN/out/flush-a.log" 2>&1 || true
+# Keep the hold socket OPEN through the fence/tap-removal/flush: it is the only
+# thing that keeps the exact 5-tuple alive. Asserting the tuple is still there
+# immediately BEFORE the flush is what makes the flush (not an RST or the link
+# deletion) responsible for its disappearance.
+HOLD_STATE=$(cat "$RUN/out/hold-a.log" 2>/dev/null | tr '\n' ' ')
+if ! conntrack_has_ip "$A_IP"; then
+  fail 5.6a "the guest flow vanished after fence/tap removal, before the flush (hold='$HOLD_STATE'); the flush is not proven"
+elif ! echo "$HOLD_STATE" | grep -q connected; then
+  fail 5.6a "hold socket was not connected before the flush (hold='$HOLD_STATE')"
+else
+  pass 5.6a "the guest flow is still tracked after the fenced ruleset and tap removal, immediately before the flush (hold socket open)"
+fi
+FLUSH_RC=0
+bun "$EDGE/lib/net-tools.ts" flush "$A_IP" >"$RUN/out/flush-a.log" 2>&1 || FLUSH_RC=$?
 sleep 0.3
 CT=$(conntrack -L 2>/dev/null || true)
-if echo "$CT" | grep -q "$A_IP"; then
+if [ "$FLUSH_RC" -ne 0 ]; then
+  fail 5.7 "real flushConntrack exited $FLUSH_RC (must be 0): $(cat "$RUN/out/flush-a.log" | tr '\n' ' ')"
+elif echo "$CT" | grep -q "$A_IP"; then
   fail 5.7 "conntrack still has $A_IP after the real flush: $(echo "$CT" | grep "$A_IP")"
 else
-  pass 5.7 "real flushConntrack removed every entry for $A_IP"
+  pass 5.7 "real flushConntrack (exit 0) removed every entry for $A_IP"
 fi
 if echo "$CT" | grep -q "dst=203.0.114.3.*dport=$A_HOLD"; then
   pass 5.8 "unrelated flow with the SAME destination port $A_HOLD survived (no port-only deletion)"
 else
   fail 5.8 "address-scoped flush also removed the unrelated flow to port $A_HOLD"
 fi
+kill "$HOLD_A" 2>/dev/null || true
 
 # Reuse the exact /30 and public port for a NEW instance (quarantine 0 here on
 # purpose: this is the dangerous path the production quarantine protects).
