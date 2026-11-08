@@ -18,8 +18,8 @@ HERE=$(cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(cd -- "$HERE/../../.." && pwd)
 CACHE=${SMOKE_ARTIFACTS:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-fc-smoke}
 export VM_DIR=${VM_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-vmtest}
-export VM_SSH_PORT=${VM_SSH_PORT:-2222}
-export VM_SEED_PORT=${VM_SEED_PORT:-8001}
+export VM_SSH_PORT=${VM_SSH_PORT:-2422}
+export VM_SEED_PORT=${VM_SEED_PORT:-8201}
 export VM_MEM=${VM_MEM:-4096}
 export VM_SMP=${VM_SMP:-4}
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -27,11 +27,16 @@ LOGDIR=$VM_DIR/logs
 LOG=$LOGDIR/run-$STAMP.log
 mkdir -p "$LOGDIR"
 
+# Per-run scratch space: /tmp is shared with other harness copies on the same
+# host, so never use fixed paths for the repo/artifact tarballs.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/fc-vmtest-run.XXXXXX")
+
 say() { printf '%s\n' "$*" | tee -a "$LOG" >&2; }
 vm_ssh() { "$HERE/vm.sh" ssh "$@"; }
 
 cleanup() {
   local rc=$?
+  rm -rf "$WORK"
   if [ "${KEEP_VM:-0}" != 1 ]; then
     say "==> stopping VM"
     "$HERE/vm.sh" stop >>"$LOG" 2>&1 || true
@@ -79,13 +84,13 @@ say "==> creating/booting VM"
 "$HERE/vm.sh" status | tee -a "$LOG"
 
 say "==> copying checkout and artifacts into the VM"
-tar czf /tmp/fc-vmtest-repo.tgz -C "$REPO" \
+tar czf "$WORK/repo.tgz" -C "$REPO" \
   --exclude=.git --exclude=node_modules --exclude='deploy/firecracker/vmtest/checks/.cache' .
 vm_ssh 'rm -rf /tmp/fc-vmtest-repo && mkdir -p /tmp/fc-vmtest-repo && tar xzf - -C /tmp/fc-vmtest-repo' \
-  </tmp/fc-vmtest-repo.tgz || { say "checkout copy failed"; exit 2; }
-rm -f /tmp/fc-vmtest-repo.tgz
+  <"$WORK/repo.tgz" || { say "checkout copy failed"; exit 2; }
+rm -f "$WORK/repo.tgz"
 
-STAGE=/tmp/fc-vmtest-stage
+STAGE=$WORK/stage
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp "$CACHE/firecracker" "$STAGE/firecracker"
@@ -95,10 +100,10 @@ cp "$CACHE/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
 cp -a "$CACHE/dl/rootdir" "$STAGE/rootdir"
 cp "$CACHE/dl/jq" "$STAGE/jq"
 chmod 0755 "$STAGE/firecracker" "$STAGE/jailer" "$STAGE/jq"
-tar czf /tmp/fc-vmtest-artifacts.tgz -C "$STAGE" .
+tar czf "$WORK/artifacts.tgz" -C "$STAGE" .
 vm_ssh 'rm -rf /tmp/fc-vmtest/artifacts && mkdir -p /tmp/fc-vmtest/artifacts && tar xzf - -C /tmp/fc-vmtest/artifacts' \
-  </tmp/fc-vmtest-artifacts.tgz || { say "artifact copy failed"; exit 2; }
-rm -rf /tmp/fc-vmtest-artifacts.tgz "$STAGE"
+  <"$WORK/artifacts.tgz" || { say "artifact copy failed"; exit 2; }
+rm -rf "$WORK/artifacts.tgz" "$STAGE"
 
 say "==> provisioning the VM (packages, bun, checkout, guest image)"
 if ! timeout 1800 "$HERE/vm.sh" ssh 'sudo REPO_SRC=/tmp/fc-vmtest-repo bash /tmp/fc-vmtest-repo/deploy/firecracker/vmtest/provision.sh' >>"$LOG" 2>&1; then

@@ -1,42 +1,113 @@
-# vmtest results — 2026-11-08
+# vmtest results — 2026-11-08 (assertion-hardening rerun)
 
 Real execution as root inside a throwaway QEMU VM. **Nothing privileged was run
 on the developer machine.** The host only ran `qemu-system-x86_64` as the login
 user; every root operation happened inside the VM.
 
 - Host: Linux 7.2.14-arch1-1, AMD SVM, `kvm_amd.nested=1`, `/dev/kvm` 0666.
-- VM: Ubuntu 24.04 cloud image (noble), kernel 6.8.0-147-generic, systemd
+  This run used `VM_DIR=~/.cache/rctf-vmtest-t3-21cbbd46`,
+  `VM_SSH_PORT=2422`, `VM_SEED_PORT=8201` so another worker's VMs and ports were
+  not touched.
+- VM: Ubuntu 24.04 cloud image from the **dated** `noble/20261017/` directory
+  (pinned SHA256 `04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94`;
+  cached image re-hashed before boot), kernel 6.8.0-147-generic, systemd
   `255.4-1ubuntu8.18`, nftables 1.0.9, conntrack-tools 1.4.8, nmap 7.94SVN,
   Python 3.12.
 - Guest runtime: Firecracker/jailer v1.17.0, kernel 6.1.155 (Firecracker CI
-  bucket), busybox 1.35.0, Bun 1.4.4.
+  bucket), busybox 1.35.0, Bun 1.4.4 (`bun-linux-x64.zip` verified against the
+  release `SHASUMS256.txt` and the pinned digest
+  `bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c`).
 - Command: `deploy/firecracker/vmtest/run.sh` (full run, shipped unit with no
   drop-in, shipped `host-setup.sh` with no version wrapper).
-- Transcript: `~/.cache/rctf-vmtest/logs/run-20261108-120034.log`.
+- Transcript: `~/.cache/rctf-vmtest-t3-21cbbd46/logs/run-20261108-122237.log`.
 - VM stopped (`vm.sh status` → `stopped`); the qcow2 overlay is kept for fast
-  reruns (`vm.sh destroy` removes it). No qemu/seed processes left on the host.
+  reruns (`vm.sh destroy` removes it). No qemu/seed processes from this run
+  remain on the host.
 
-## Summary
+## Summary (this run)
 
-All checks pass. Two product bugs found by the previous run of this harness
-(B1, B2) and one harness-only failure (item 3) are fixed in this change; the
-numbered assertions below were re-run against the fixed tree.
+All checks pass. This assertion-hardening pass raised the total from 151 to
+**180** assertions without weakening a check. The first run of the tightened
+harness exposed three harness bugs (not product bugs); they were fixed and the
+full run was repeated (see "What changed in this pass"). No new product bug was
+found.
 
-| Check                               | Assertions       | Verdict                                                                                                                                                                 |
-| ----------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0 (extra `exit_code=0` line ignored), creates the dirs/modes, applies sysctl, idempotent.                |
-| `10-agent-systemd.sh` (b)           | 31 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent, `KillMode=process`, preflight `accepting:true`, `CAP_SETUID`+`CAP_SETGID` effective and ambient. |
-| `20-jailer-instance.sh` (c)         | 35 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, no host flag, full teardown, fencing.                                  |
-| `30-restart-survival.sh` (d)        | 17 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, is re-adopted; CAP_SYS_PTRACE is genuinely required.                                                          |
-| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                   |
-| `50-conntrack-quarantine.sh` (f)    | 17 pass / 0 fail | **PASS** — real DNAT flow tracked, flushed on delete, /30 + port quarantined, not reused.                                                                               |
-| `60-egress-dnat-isolation.sh` (g,h) | 21 pass / 0 fail | **PASS** — egress masquerade, egress deny, public DNAT, team isolation with a positive control, nmap only published ports.                                              |
+| Check                               | Assertions       | Verdict                                                                                                                                                                                                 |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                                        |
+| `10-agent-systemd.sh` (b)           | 31 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent, `KillMode=process`, preflight `accepting:true`, `CAP_SETUID`+`CAP_SETGID` effective and ambient.                                  |
+| `20-jailer-instance.sh` (c)         | 39 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown, fencing.                     |
+| `30-restart-survival.sh` (d)        | 33 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` stays the original PID, `vm-identity.json` matches live `/proc`; CAP_SYS_PTRACE safe-failure outcome asserted.                       |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                                                    |
+| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                                       |
+| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports, plus explicit 22/7001 probes.                                   |
 
-Total: **151 passed, 0 failed**. Before the fixes the same harness reported
-140 passed / 2 failed (B1 in check 00, B2 in check 10) plus one non-FC_REAL
-namespace test failing on Bun's stdin socketpair. No assertion was weakened:
-the workarounds (a version-filter wrapper and an ambient-capability drop-in)
-were removed, and the checks now assert the shipped files directly.
+Total: **180 passed, 0 failed**.
+
+## What changed in this pass (2026-11-08, assertion hardening)
+
+1. **Verified Ubuntu image.** `vm.sh` now uses the dated
+   `noble/20261017/` directory, pins the image SHA256, checks the published
+   `SHA256SUMS`, and GPG-verifies `SHA256SUMS.gpg` with the pinned Ubuntu cloud
+   image signing fingerprint `D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81`
+   (GPG verification succeeded in this environment). The cached image is
+   re-hashed against the pinned digest before every boot and the digest is
+   recorded in `noble-base.img.sha256` / `.meta`. Missing GPG/key infrastructure
+   is reported honestly and still fails closed on the pinned SHA256.
+2. **Verified Bun zip.** `provision.sh` downloads the release `SHASUMS256.txt`
+   for pinned Bun 1.4.4, requires the `bun-linux-x64.zip` entry to equal a
+   pinned digest, and verifies the downloaded zip before installing.
+3. **Conntrack check fails closed.** `50-conntrack-quarantine.sh` now requires
+   `conntrack -L` exit 0 before and after `DELETE`; it seeds a real DNAT flow
+   (guest in the reply-source tuple) and a real masqueraded egress flow (guest
+   in the original-source tuple), asserts both entries carry both tuples, and
+   asserts both are gone afterwards. The "four directions" wording was replaced
+   with exactly what is proven.
+4. **Flag-absence probes fail closed with controls.** `20-jailer-instance.sh`
+   requires four searchable roots, counts and prints the files scanned (>0),
+   distinguishes grep's "not found" (1) from a probe error (2), `test -f`s the
+   per-instance rootfs before `grep -a`, and requires planted-canary positive
+   controls to be found by the same tree, journal and binary scans. The journal
+   scan now covers the whole journal, not just one unit.
+5. **Inode identity cannot compare empty strings.** `20-jailer-instance.sh`
+   requires non-empty `stat` results for `/proc/<pid>/exe` and `/proc/<pid>/root`,
+   never silences `stat`, and aborts the inode/host-identity checks if
+   `kill -0` failed.
+6. **Re-adoption is asserted, not implied.** `30-restart-survival.sh` checks
+   agent-reported `.vm.pid` equals the original PID after both `systemctl
+   restart` and `kill -9`, and compares `vm-identity.json` (`jailRoot` device+
+   inode, `exePath`, exe dev+inode, uid) against live `/proc/<pid>/{exe,root,
+   status}`.
+7. **CAP_SYS_PTRACE outcome is a hard assertion.** The check records the live
+   PID starttime and requires the documented safe outcome when the capability
+   is removed: process alive and unsignalled (same starttime) with `errored`
+   state and a `vm died`/authentication message. A killed VM or a still-running
+   record now fails. After restoring the cap it requires process, jail, tap and
+   process-record cleanup.
+8. **Wider nmap range.** `60-egress-dnat-isolation.sh` scans `1-10000` plus the
+   configured `tcpPortRange`, and runs a targeted `22,7001` scan because the
+   wide scan suppresses its closed-port lines. The visible open set must be
+   exactly the two published ports.
+9. **Port ownership and cleanup.** `vm.sh` defaults to ssh 2422 / seed 8201,
+   refuses to boot when either port is bound by a process it did not record,
+   and `stop`/`destroy` reap the seed server by recorded PID. `run.sh` uses a
+   per-run scratch directory so concurrent harness copies cannot collide on
+   `/tmp` tarball names.
+
+Harness bugs found by the first run of this pass (all fixed before the passing
+run): (i) `/proc/<pid>/root` `readlink` is `/` for a chrooted process, so the
+jail-root comparison must use device+inode; (ii) the egress flow matcher matched
+the DNAT reply tuple too and must inspect the original tuple only; (iii) nmap
+does not print individual `closed` lines when the scan has many closed ports,
+so 22/7001 need a targeted scan.
+
+## Previous run (2026-11-08, before this hardening)
+
+The earlier full run reported **151 passed, 0 failed** and documented two
+product fixes (B1 version parsing, B2 systemd capabilities) plus a harness-only
+Bun-stdin finding. Those fixes are still in the tree; the detailed sections
+below are updated with this run's counts and evidence.
+
 
 ## a) host-setup.sh on a fresh Ubuntu 24.04 (18 assertions)
 
@@ -104,61 +175,88 @@ was `CapEff=00000000082c316b`, `CapBnd=00000000082c31eb` (CAP_SETUID missing
 from effective) and the jailer failed with
 `Failed to exec into Firecracker: Operation not permitted (os error 1)`.
 
-## c) jailer-mode create (35 assertions)
+## c) jailer-mode create (39 assertions)
 
-This check now starts by asserting the installed unit is byte-identical and
-that no drop-in exists, then creates over the agent API (`PUT
-/v1/instances/:id`) with `mode: jailer`:
+This check starts by asserting the installed unit is byte-identical and that no
+drop-in exists, then creates over the agent API (`PUT /v1/instances/:id`) with
+`mode: jailer`:
 
 ```text
 PASS [01]: installed unit is byte-identical to the repository unit
 PASS [02]: no systemd drop-in installed (shipped unit alone)
 create: HTTP 200 {"state":"starting", ... "endpoints":[{"host":"192.0.2.1","port":30000}]}
 PASS [06]: jailer launched Firecracker under the shipped unit (no drop-in)
-pid=2843 guest=10.200.0.2 host=10.200.0.1 tap=fctap0 public=30000
-jail=/srv/jailer/firecracker/vmtest1794164443j1/root
+pid=2278 guest=10.200.0.2 host=10.200.0.1 tap=fctap0 public=30000
+jail=/srv/jailer/firecracker/vmtest1794165789j1/root
 ```
 
 Verified: process alive, uid `10000`, jailed executable (`/proc/<pid>/exe` is
 `/firecracker` and its device+inode equals the jail copy), `/proc/<pid>/root`
-device+inode equals the jail root, `--id` on the cmdline exactly once,
-per-instance cgroup `/sys/fs/cgroup/firecracker/<id>` with `pids.max=512` and
-the pid as member, real `tun type tap` with alias `rctf-fc:rctf-fc` and the
-host /30 address.
+device+inode equals the jail root (with non-empty `stat` results and an abort if
+the process is dead), `--id` on the cmdline exactly once, per-instance cgroup
+`/sys/fs/cgroup/firecracker/<id>` with `pids.max=512` and the pid as member,
+real `tun type tap` with alias `rctf-fc:rctf-fc` and the host /30 address.
 
 Flag delivered via MMDS v2 and served byte-exactly:
 
 ```text
-guest served: rctf{vmtest-jailer-1794164443-canary}
+guest served: rctf{vmtest-jailer-1794165789-canary}
 guest probe: peer:10.200.0.6=blocked ... outside=REACHED
 ```
 
+The flag-absence probes now fail closed and prove they are sensitive:
+
+```text
+PASS [22]: scanned 7 files under 4 searchable roots
+PASS [23]: flag is absent from agent state, run dir, jail tree and Traefik dir (7 files)
+PASS [24]: positive control: tree scan found the planted canary in its scanned file
+PASS [25]: flag is absent from the journal (2681 lines searched)
+PASS [26]: positive control: journal scan finds the planted canary
+PASS [27]: flag is absent from the firecracker command line
+PASS [28]: flag is absent from the per-instance rootfs disk image
+PASS [29]: flag is absent from all 2 base images (tested non-empty, readable files)
+PASS [30]: positive control: binary (grep -a) scan finds a planted canary
+```
+
 The flag was **absent** from the agent state dir, per-instance run dir, jail
-tree (including `rootfs.ext4`), Traefik dir, agent journal, Firecracker
-cmdline, and both base images. (The test guest keeps its flag on tmpfs; the
-reference smoke guest copies it to `/www` on the rootfs, which is guest
-behaviour, not an agent leak.)
+tree (including `rootfs.ext4`), Traefik dir, whole journal, Firecracker cmdline,
+and both base images. Probe errors (`grep` rc=2, missing/unreadable roots or
+images, empty journal) fail the check instead of passing as "absent". (The test
+guest keeps its flag on tmpfs; the reference smoke guest copies it to `/www` on
+the rootfs, which is guest behaviour, not an agent leak.)
 
 Delete: `HTTP 200 {"state":"stopped", ...}`; process, jail directory,
 per-instance cgroup, tap and both nft rule sets removed; re-create of the
 deleted id fenced with HTTP 409.
 
-## d) restart / `kill -9` / CAP_SYS_PTRACE (17 assertions)
+## d) restart / `kill -9` / CAP_SYS_PTRACE (33 assertions)
 
 ```text
-fc pid=2578 guest=10.200.0.2 tap=fctap0 agent=...
-PASS systemctl restart replaced the agent process (2578 -> 3139)
+fc pid=2561 guest=10.200.0.6 tap=fctap1 agent=1991
+PASS systemctl restart replaced the agent process (1991 -> 2601)
 PASS firecracker survived systemctl restart (KillMode=process)
 PASS guest still serves its flag after restart
 PASS restarted agent re-adopted the instance as running
 PASS tap was preserved across the restart
-sidecar: {"instanceId":"vmtest...r1","uid":10000,
-          "jailRoot":"/srv/jailer/firecracker/vmtest...r1/root",
-          "exePath":".../root/firecracker"}
-PASS systemd restarted the agent after kill -9 (3139 -> 3200)
+PASS agent-reported .vm.pid is the original PID after systemctl restart
+PASS vm-identity instanceId matches vmtest1794165797r1
+PASS vm-identity uid 10000 matches live /proc/<pid>/status and jailUid
+PASS vm-identity jailRoot dev:ino 64769:533023 matches live /proc/<pid>/root
+PASS live executable is /firecracker inside the chroot
+PASS vm-identity exePath is the live jail copy
+PASS vm-identity exe dev:ino 64769:544112 matches live /proc/<pid>/exe
+PASS systemd restarted the agent after kill -9 (2601 -> 2675)
 PASS firecracker survived kill -9 of the agent
 PASS agent re-adopted the VM after kill -9 (strict identity)
+PASS agent-reported .vm.pid is the original PID after kill -9
+PASS vm-identity ... (same six fields re-checked after kill -9)
 ```
+
+The `vm-identity.json` sidecar is compared field-by-field with the live
+process: `instanceId`, `uid`, `jailRoot` (device+inode vs `/proc/<pid>/root`),
+`exePath`, and exe device+inode vs `/proc/<pid>/exe`. `/proc/<pid>/root`
+`readlink` is `/` for a chrooted process, so the path comparison correctly uses
+the inode.
 
 CAP_SYS_PTRACE experiment (a test-only drop-in removes it; the shipped
 `AmbientCapabilities=` stays in effect):
@@ -166,14 +264,23 @@ CAP_SYS_PTRACE experiment (a test-only drop-in removes it; the shipped
 ```text
 PASS drop-in really removed CAP_SYS_PTRACE from the agent's effective set
 state without CAP_SYS_PTRACE: errored
-PASS without CAP_SYS_PTRACE the agent cannot authenticate/re-adopt the running VM
-PASS without CAP_SYS_PTRACE the VM process is left alive (no unverified signal)
+live pid without CAP_SYS_PTRACE: alive=1 start=3821 (was 3821)
 reported state/message: errored (vm died)
+PASS without CAP_SYS_PTRACE the agent cannot authenticate/re-adopt the running VM
+PASS the errored record carries an authentication/verification failure message
+PASS safe outcome: VM left alive and unsignalled (same starttime), record errored
 PASS with CAP_SYS_PTRACE restored the agent reclaimed and destroyed the
      unauthenticated VM
+PASS after restore the instance is no longer running (state=errored)
 PASS jail dir removed after cleanup
 PASS tap removed after cleanup
+PASS no firecracker process for vmtest1794165797r1 remains
 ```
+
+This is now a hard assertion either way: a killed VM, a different PID/starttime,
+a `running` record, or a missing authentication message fails the check. The
+recorded safe outcome is the one documented below; after restoring the cap the
+agent must clean up, and that clean-up is required.
 
 **Conclusion: CAP_SYS_PTRACE is really required.** Without it a live jailed
 Firecracker (uid 10000) is unreadable via `/proc/<pid>/exe` and
@@ -212,14 +319,25 @@ a regular file. The production `bunCommandRunner` already passed stdin as a
 `nft -c -f -` test using that runner passes as root above. Repro of the Bun
 behaviour is kept at `repros/bun-spawn-nft-stdin.sh`.
 
-## f) conntrack flush and reuse quarantine
+## f) conntrack flush and reuse quarantine (24 assertions)
 
 ```text
-guest=10.200.0.10 tap=fctap2 index=2 public=30002
-PASS a real DNAT flow to the public port is tracked in conntrack
+guest=10.200.0.10 tap=fctap2 index=2 public=30002 pid=3490
+PASS egress:true guest produced a real outbound flow through masquerade
+conntrack entries involving 10.200.0.10: 6
+DNAT entry:   tcp 6 431997 ESTABLISHED src=192.0.2.2 dst=192.0.2.1 sport=40058 dport=30002
+              src=10.200.0.10 dst=192.0.2.2 sport=8080 dport=40058 [ASSURED]
+egress entry: tcp 6 117 TIME_WAIT src=10.200.0.10 dst=192.0.2.2 sport=51594 dport=9999
+              src=192.0.2.2 dst=192.0.2.1 sport=9999 dport=51594 [ASSURED]
 PASS conntrack tracks the guest address before release
+PASS DNAT flow tracked with the guest in the reply-source direction
+PASS masqueraded egress flow tracked with the guest in the original-source direction
+PASS DNAT flow entry carries both original and reply tuples
+PASS egress flow entry carries both original and reply tuples
 delete: HTTP 200 {"state":"stopped", ...}
-PASS release flushed every conntrack entry for the guest address (four directions)
+PASS release flushed every conntrack entry for the guest address (original and reply tuples)
+PASS the DNAT reply tuple for the public port was flushed
+PASS the masqueraded egress original tuple was flushed
 PASS no conntrack entry for the released public port remains
 quarantine: {"version":1,
   "indexes":[{"id":0,...},{"id":1,...},{"id":2,...}],
@@ -231,11 +349,14 @@ PASS the quarantined /30 was not handed to the replacement
 PASS the quarantined public port was not handed to the replacement
 ```
 
-The held connection was a real `nc` session from the outside namespace through
-the DNAT port; the conntrack entry existed while it was open and was gone after
-`DELETE`. Teardown (process/jail/cgroup/tap/nft) is asserted in the same check.
+`conntrack -L` must exit 0 before and after `DELETE`; a tool failure is reported
+as a failure, not as "zero entries". The DNAT flow is a real held `nc` session
+from the outside namespace; the egress flow is the guest's real probe to the
+outside HTTP service. Both tuple directions are present before release and both
+are gone afterwards. Teardown (process/jail/cgroup/tap/nft) is asserted in the
+same check.
 
-## g/h) egress, DNAT, isolation, nmap
+## g/h) egress, DNAT, isolation, nmap (23 assertions)
 
 ```text
 A guest=10.200.0.18 tap=fctap4 port=30004   (egress:true)
@@ -251,31 +372,44 @@ PASS control: with the ruleset removed the SAME probe reaches the peer
 PASS control: egress:false guest reaches the outside once the rules are gone
 PASS restored ruleset restores isolation in both directions
 PASS restored ruleset restores the egress deny for the egress:false team
+PASS nmap scan completed over ports 1-10000,30000-30010
+PASS nmap sees exactly the published TCP ports as open
+PASS targeted nmap scan of management ports 22,7001 completed
+PASS management sshd (port 22) is not exposed on the public test interface
+PASS the agent API (port 7001, bound to 127.0.0.1) is not exposed on the public interface
 ```
 
 The control flushes both owned tables (`inet rctf_fc`, `arp rctf_fc_arp`) and
 restores the exact saved ruleset; isolation returns afterwards. This proves the
 "blocked" measurements are sensitive, not a false negative.
 
-nmap from the outside namespace against the host's public test address:
+nmap from the outside namespace against the host's public test address. The
+wide scan covers `1-10000` plus the configured `tcpPortRange` (`30000-30010`):
 
 ```text
-22/tcp    closed   ssh
-7001/tcp  closed   afs3-callback
-30000/tcp closed   ndmps
-30001/tcp closed   pago-services1
-30002/tcp closed   pago-services2
-30003/tcp closed   amicon-fpsu-ra
-30004/tcp open     amicon-fpsu-s
-30005/tcp open     unknown
-30006..30010 closed
+Not shown: 10009 closed tcp ports (reset)
+30004/tcp open  amicon-fpsu-s
+30005/tcp open  unknown
+```
+
+Because nmap suppresses individual `closed` lines in a wide scan, a second
+targeted scan asserts the management ports explicitly:
+
+```text
+22/tcp   closed ssh
+7001/tcp closed afs3-callback
 ```
 
 Only the two published DNAT ports are open. Port 22 is closed because the VM's
 management sshd is bound to the QEMU management address (10.0.2.15) only; the
-agent API is bound to 127.0.0.1 and does not appear.
+agent API is bound to 127.0.0.1 and does not appear. This is the exact range
+scanned, not a claim about all 65535 ports.
 
-## Fixes landed in this change (2026-11-08)
+## Earlier product fixes (previous run; still in the tree)
+
+These were found and fixed before this assertion-hardening pass. The current
+run re-verified them under the tightened checks (00 is still 18/0, 10 is 31/0,
+20 is 39/0 with the added absence controls).
 
 ### B1 — `host-setup.sh` could not parse Firecracker 1.17.0's `--version`
 
@@ -341,8 +475,8 @@ agent API is bound to 127.0.0.1 and does not appear.
   `deploy/firecracker/host/README.md` and
   `apps/docs/src/content/docs/integrations/instancer/firecracker.md` are
   updated.
-- Evidence: check 10 is 31/0 (was 28/1), check 20 is 35/0; `CapEff` was
-  `0x82c31eb` with `CapAmb=0xc0` under the shipped unit alone.
+- Evidence: check 10 is 31/0 (was 28/1), check 20 is 39/0 in this run; `CapEff`
+  was `0x82c31eb` with `CapAmb=0xc0` under the shipped unit alone.
   `repros/systemd-unit-setuid.sh` reproduces the measurement and shows the
   shipped fix.
 
@@ -392,14 +526,18 @@ namespace "fcoutside" failed: Operation not permitted` even for root. The
 ## Leftovers / cleanup
 
 - The VM was stopped by `run.sh`'s trap; the overlay from this run is kept in
-  `~/.cache/rctf-vmtest/` for fast reruns (`vm.sh destroy` removes it), and
-  `vm.sh status` reports `stopped`.
+  `~/.cache/rctf-vmtest-t3-21cbbd46/` for fast reruns (`vm.sh destroy` removes
+  it), and `vm.sh status` reports `stopped`. Only PIDs recorded in that
+  directory were signalled; no other worker's qemu/seed processes were touched.
+- This run used ports 2422 (ssh) and 8201 (seed). `vm.sh` refused to boot if
+  either was bound by a process it did not own.
 - The repros were executed inside the VM on 2026-11-08 (the version,
   capability/setuid and Bun-stdin outputs above are from those runs).
-- No `qemu-system-x86_64`, seed HTTP server or ssh tunnel remains on the host.
+- No `qemu-system-x86_64`, seed HTTP server or ssh tunnel from this run remains
+  on the host.
 - The shared artifact cache (`~/.cache/rctf-fc-smoke`) is untouched; the VM
-  image cache (`~/.cache/rctf-vmtest`) keeps only `noble-base.img`, the
-  overlay and the ssh key.
+  image cache for this run keeps only the verified `noble-base.img` (plus its
+  recorded digest/metadata), the overlay and the ssh key.
 - The throwaway VM's `/srv/jailer`, cgroups, taps and nft rules were removed by
   the checks; nothing privileged ran on the host.
 

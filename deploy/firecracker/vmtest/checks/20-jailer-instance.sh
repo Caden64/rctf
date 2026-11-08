@@ -55,25 +55,57 @@ PUB=$(lease_port "$ID")
 echo "  pid=$PID guest=$GUEST host=$HOSTIP tap=$TAP public=$PUB jail=$JAILROOT"
 
 # --- process identity / jail ----------------------------------------------
-if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then ok "firecracker process $PID is alive"; else
+ALIVE=0
+if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+  ALIVE=1
+  ok "firecracker process $PID is alive"
+else
   bad "firecracker process is not alive"
 fi
-expect_eq "$(ps -o user= -p "$PID" 2>/dev/null | tr -d ' ')" 10000 \
-  "firecracker runs as jailUid 10000"
-EXE=$(readlink "/proc/$PID/exe" 2>/dev/null || true)
-expect_eq "$EXE" /firecracker "chrooted process sees its executable as /firecracker"
-expect_eq "$(stat -Lc '%d:%i' "/proc/$PID/exe" 2>/dev/null)" \
-  "$(stat -Lc '%d:%i' "$JAILROOT/firecracker" 2>/dev/null)" \
-  "process executable inode is the copy inside the jail root (identity anchor)"
-expect_eq "$(stat -Lc '%d:%i' "/proc/$PID/root" 2>/dev/null)" \
-  "$(stat -Lc '%d:%i' "$JAILROOT" 2>/dev/null)" \
-  "process root is the jailer chroot (device+inode)"
-ARGS=$(tr '\0' ' ' <"/proc/$PID/cmdline" 2>/dev/null || true)
-expect_match "$ARGS" "(^| )--id $ID( |$)" "process cmdline carries --id $ID"
-case "$ARGS" in
-  *"--id $ID --id"*) bad "duplicate --id on the firecracker cmdline" ;;
-  *) ok "jailer did not pass a duplicate --id" ;;
-esac
+if [ -z "$JAILROOT" ]; then bad "agent state has no vm.jailRoot for $ID"; fi
+if [ "$ALIVE" = 1 ]; then
+  expect_eq "$(ps -o user= -p "$PID" | tr -d ' ')" 10000 \
+    "firecracker runs as jailUid 10000"
+  EXE=$(readlink "/proc/$PID/exe") || EXE=
+  if [ -n "$EXE" ]; then
+    expect_eq "$EXE" /firecracker "chrooted process sees its executable as /firecracker"
+  else
+    bad "could not readlink /proc/$PID/exe"
+  fi
+  if [ -n "$JAILROOT" ]; then
+    EXE_INO=$(stat -Lc '%d:%i' "/proc/$PID/exe") || EXE_INO=
+    JAIL_INO=$(stat -Lc '%d:%i' "$JAILROOT/firecracker") || JAIL_INO=
+    if [ -n "$EXE_INO" ] && [ -n "$JAIL_INO" ]; then
+      expect_eq "$EXE_INO" "$JAIL_INO" \
+        "process executable inode is the copy inside the jail root (identity anchor)"
+    else
+      bad "could not stat executable identities (proc='$EXE_INO' jail='$JAIL_INO')"
+    fi
+    ROOT_INO=$(stat -Lc '%d:%i' "/proc/$PID/root") || ROOT_INO=
+    JAIL_ROOT_INO=$(stat -Lc '%d:%i' "$JAILROOT") || JAIL_ROOT_INO=
+    if [ -n "$ROOT_INO" ] && [ -n "$JAIL_ROOT_INO" ]; then
+      expect_eq "$ROOT_INO" "$JAIL_ROOT_INO" \
+        "process root is the jailer chroot (device+inode)"
+    else
+      bad "could not stat root identities (proc='$ROOT_INO' jail='$JAIL_ROOT_INO')"
+    fi
+  else
+    bad "skipping executable/root inode identity: jail root unknown"
+  fi
+  ARGS=$(tr '\0' ' ' <"/proc/$PID/cmdline") || ARGS=
+  if [ -n "$ARGS" ]; then
+    expect_match "$ARGS" "(^| )--id $ID( |\$)" "process cmdline carries --id $ID"
+    case "$ARGS" in
+      *"--id $ID --id"*) bad "duplicate --id on the firecracker cmdline" ;;
+      *) ok "jailer did not pass a duplicate --id" ;;
+    esac
+  else
+    bad "could not read the firecracker command line"
+  fi
+else
+  bad "aborting executable/root inode identity checks: process $PID is not alive"
+  ARGS=
+fi
 
 # --- cgroup ----------------------------------------------------------------
 CGROUP=/sys/fs/cgroup/firecracker/$ID
@@ -112,32 +144,158 @@ else
 fi
 
 # --- flag must not be persisted on the host -------------------------------
-HITS=$(grep -ralF "$FLAG" "$STATE" "$RUNDIR" /srv/jailer /etc/traefik/dynamic/rctf-firecracker 2>/dev/null || true)
-if [ -z "$HITS" ]; then
-  ok "flag is absent from agent state, run dir, jail tree and Traefik dir"
+CANARY="rctf{vmtest-scan-canary-$(date +%s)-$RANDOM}"
+SCAN_ERR=/tmp/vmtest-scan-$ID.err
+SCAN_DIRS=()
+for d in "$STATE" "$RUNDIR" /srv/jailer /etc/traefik/dynamic/rctf-firecracker; do
+  if [ ! -d "$d" ]; then
+    bad "flag-absence scan root missing: $d"
+  elif [ ! -r "$d" ]; then
+    bad "flag-absence scan root not readable: $d"
+  else
+    SCAN_DIRS+=("$d")
+  fi
+done
+if [ "${#SCAN_DIRS[@]}" -gt 0 ]; then
+  TREE_LIST=$(find "${SCAN_DIRS[@]}" -type f 2>"$SCAN_ERR")
+  FIND_RC=$?
+  TREE_COUNT=$(printf '%s\n' "$TREE_LIST" | grep -c . || true)
+  if [ "$FIND_RC" -ne 0 ]; then
+    bad "find failed while enumerating the scan tree: $(cat "$SCAN_ERR")"
+  elif [ "$TREE_COUNT" -gt 0 ]; then
+    ok "scanned $TREE_COUNT files under ${#SCAN_DIRS[@]} searchable roots"
+  else
+    bad "flag-absence scan found no regular files to search"
+  fi
 else
+  TREE_COUNT=0
+  bad "no searchable directories for the flag-absence scan"
+fi
+
+scan_tree_for() { # scan_tree_for <needle>; returns 0 found, 1 absent, 2 probe error
+  local needle=$1 out rc
+  out=$(grep -ralF -- "$needle" "${SCAN_DIRS[@]}" 2>"$SCAN_ERR")
+  rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$out"; return 0 ;;
+    1) return 1 ;;
+    *)
+      printf 'grep probe failed (rc=%d): %s\n' "$rc" "$(cat "$SCAN_ERR")" >&2
+      return 2
+      ;;
+  esac
+}
+
+HITS=$(scan_tree_for "$FLAG")
+SCAN_RC=$?
+if [ "$SCAN_RC" -eq 0 ]; then
   bad "flag found on host disk: $HITS"
-fi
-if journalctl -u rctf-firecracker-agent --no-pager 2>/dev/null | grep -qF "$FLAG"; then
-  bad "flag found in the agent journal"
+elif [ "$SCAN_RC" -eq 1 ]; then
+  ok "flag is absent from agent state, run dir, jail tree and Traefik dir ($TREE_COUNT files)"
 else
-  ok "flag is absent from the agent journal"
+  bad "flag-absence tree probe failed (see above)"
 fi
+
+# Positive control: the same scanner must find a planted canary in this tree.
+CANARY_FILE=$RUNDIR/.vmtest-scan-canary-$ID
+if printf '%s\n' "$CANARY" >"$CANARY_FILE"; then
+  HITS=$(scan_tree_for "$CANARY")
+  SCAN_RC=$?
+  rm -f "$CANARY_FILE"
+  if [ "$SCAN_RC" -eq 0 ] && printf '%s\n' "$HITS" | grep -qxF "$CANARY_FILE"; then
+    ok "positive control: tree scan found the planted canary in its scanned file"
+  else
+    bad "positive control failed: tree scan did not find the planted canary (rc=$SCAN_RC, hits='$HITS')"
+  fi
+else
+  bad "could not plant the tree-scan canary at $CANARY_FILE"
+fi
+
+# Journal: fail closed when journalctl itself fails, and prove the journal
+# probe is sensitive with a planted canary.
+JOURNAL=/tmp/vmtest-journal-$ID.txt
+if journalctl --no-pager >"$JOURNAL" 2>"$JOURNAL.err"; then
+  JLINE_COUNT=$(wc -l <"$JOURNAL")
+  if [ "$JLINE_COUNT" -gt 0 ]; then
+    if grep -qF "$FLAG" "$JOURNAL"; then
+      bad "flag found in the journal"
+    else
+      ok "flag is absent from the journal ($JLINE_COUNT lines searched)"
+    fi
+  else
+    bad "journal is empty; cannot prove the flag is absent from it"
+  fi
+  logger -t rctf-vmtest-canary "$CANARY" || bad "logger failed; cannot plant a journal canary"
+  for _ in $(seq 1 25); do
+    journalctl --no-pager 2>/dev/null | grep -qF "$CANARY" && break
+    sleep 0.2
+  done
+  if journalctl --no-pager 2>/dev/null | grep -qF "$CANARY"; then
+    ok "positive control: journal scan finds the planted canary"
+  else
+    bad "positive control failed: journal scan did not find the planted canary"
+  fi
+else
+  bad "journalctl failed; cannot assert the flag is absent from the journal: $(cat "$JOURNAL.err")"
+fi
+
 if printf '%s' "$ARGS" | grep -qF "$FLAG"; then
   bad "flag found on the firecracker command line"
-else
+elif [ -n "$ARGS" ]; then
   ok "flag is absent from the firecracker command line"
-fi
-if grep -qaF "$FLAG" "$RUNDIR/$ID/rootfs.ext4" 2>/dev/null; then
-  bad "flag found in the per-instance rootfs disk image"
 else
-  ok "flag is absent from the per-instance rootfs disk image"
+  bad "firecracker command line was not readable; cannot assert flag absence"
 fi
-if grep -qaF "$FLAG" "$IMAGES"/*/rootfs.ext4 2>/dev/null; then
-  bad "flag found in a base image"
+
+# Explicit rootfs/base-image probes: test -f first, never scan a missing path.
+ROOTFS=$RUNDIR/$ID/rootfs.ext4
+if [ -f "$ROOTFS" ] && [ -r "$ROOTFS" ]; then
+  grep -qaF "$FLAG" "$ROOTFS"
+  rc=$?
+  case "$rc" in
+    0) bad "flag found in the per-instance rootfs disk image" ;;
+    1) ok "flag is absent from the per-instance rootfs disk image" ;;
+    *) bad "could not scan the per-instance rootfs disk image (grep rc=$rc)" ;;
+  esac
 else
-  ok "flag is absent from the base images"
+  bad "per-instance rootfs missing or unreadable: $ROOTFS"
 fi
+
+BASE_ROOTS=()
+while IFS= read -r f; do
+  [ -n "$f" ] && BASE_ROOTS+=("$f")
+done < <(find "$IMAGES" -mindepth 2 -maxdepth 2 -name rootfs.ext4 -type f 2>/dev/null)
+if [ "${#BASE_ROOTS[@]}" -eq 0 ]; then
+  bad "no base image rootfs.ext4 files found under $IMAGES"
+else
+  BASE_BAD=0
+  for f in "${BASE_ROOTS[@]}"; do
+    if [ ! -r "$f" ]; then
+      bad "base image not readable: $f"
+      BASE_BAD=1
+      continue
+    fi
+    grep -qaF "$FLAG" "$f"
+    rc=$?
+    case "$rc" in
+      0) bad "flag found in a base image: $f"; BASE_BAD=1 ;;
+      1) : ;;
+      *) bad "could not scan base image (grep rc=$rc): $f"; BASE_BAD=1 ;;
+    esac
+  done
+  [ "$BASE_BAD" -eq 0 ] &&
+    ok "flag is absent from all ${#BASE_ROOTS[@]} base images (tested non-empty, readable files)"
+fi
+
+# Positive control for the binary scan: grep -a must find a canary in a binary.
+BIN_CANARY=/tmp/vmtest-binary-canary-$ID
+printf '\000\000%s\000\000' "$CANARY" >"$BIN_CANARY"
+if grep -qaF "$CANARY" "$BIN_CANARY"; then
+  ok "positive control: binary (grep -a) scan finds a planted canary"
+else
+  bad "positive control failed: binary (grep -a) scan did not find a planted canary"
+fi
+rm -f "$BIN_CANARY"
 
 # --- delete / teardown -----------------------------------------------------
 CODE=$(api_code DELETE "/v1/instances/$ID")

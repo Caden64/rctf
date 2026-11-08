@@ -17,24 +17,42 @@
 #
 # Environment:
 #   VM_DIR          default $HOME/.cache/rctf-vmtest
-#   VM_SSH_PORT     default 2222
-#   VM_SEED_PORT    default 8001
+#   VM_SSH_PORT     default 2422
+#   VM_SEED_PORT    default 8201
 #   VM_MEM          default 4096 (MiB)
 #   VM_SMP          default 4
 #   VM_DISK         default 40G
+#   UBUNTU_SERIES   default noble
+#   UBUNTU_RELEASE  default 20261017 (dated cloud-image directory, not current/)
 #
 # The cloud-init seed is served over the QEMU user-network gateway
 # (10.0.2.2) and selected with the SMBIOS serial `ds=nocloud;s=...` trick, so
 # no ISO, xorriso, cloud-localds or root are needed.
+#
+# Boot refuses to start when VM_SSH_PORT / VM_SEED_PORT are already bound by a
+# process this vm.sh did not record. Kill only the PIDs in $VM_DIR, never by
+# process name: other harness copies may run on the same machine.
 set -euo pipefail
 
 VM_DIR=${VM_DIR:-$HOME/.cache/rctf-vmtest}
-VM_SSH_PORT=${VM_SSH_PORT:-2222}
-VM_SEED_PORT=${VM_SEED_PORT:-8001}
+VM_SSH_PORT=${VM_SSH_PORT:-2422}
+VM_SEED_PORT=${VM_SEED_PORT:-8201}
 VM_MEM=${VM_MEM:-4096}
 VM_SMP=${VM_SMP:-4}
 VM_DISK=${VM_DISK:-40G}
-BASE_IMAGE_URL=${BASE_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}
+
+UBUNTU_SERIES=${UBUNTU_SERIES:-noble}
+UBUNTU_RELEASE=${UBUNTU_RELEASE:-20261017}
+UBUNTU_IMAGE=${UBUNTU_IMAGE:-noble-server-cloudimg-amd64.img}
+# Digest published in noble/20261017/SHA256SUMS (2026-10-17). Pinned here as
+# well as cross-checked against the published SHA256SUMS on every fresh fetch.
+UBUNTU_IMAGE_SHA256=${UBUNTU_IMAGE_SHA256:-04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}
+UBUNTU_GPG_FINGERPRINT=${UBUNTU_GPG_FINGERPRINT:-D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81}
+UBUNTU_BASE_URL=${UBUNTU_BASE_URL:-https://cloud-images.ubuntu.com/$UBUNTU_SERIES/$UBUNTU_RELEASE}
+BASE_IMAGE_URL=${BASE_IMAGE_URL:-$UBUNTU_BASE_URL/$UBUNTU_IMAGE}
+SHA256SUMS_URL=${SHA256SUMS_URL:-$UBUNTU_BASE_URL/SHA256SUMS}
+SHA256SUMS_GPG_URL=${SHA256SUMS_GPG_URL:-$UBUNTU_BASE_URL/SHA256SUMS.gpg}
+UBUNTU_GPG_KEY_URL=${UBUNTU_GPG_KEY_URL:-https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$UBUNTU_GPG_FINGERPRINT}
 
 BASE_IMAGE=$VM_DIR/noble-base.img
 OVERLAY=$VM_DIR/overlay.qcow2
@@ -76,13 +94,139 @@ stop_seed_server() {
   rm -f "$SEED_PID"
 }
 
+# Print the PID(s) listening on <port>, or "unknown" when ss cannot attribute
+# the socket to a process. Returns 1 when nothing is listening.
+listener_pids() { # listener_pids <port>
+  local port=$1 addr pid pids
+  pids=
+  while IFS= read -r addr; do
+    [ -n "$addr" ] || continue
+    pid=$(ss -ltnp 2>/dev/null |
+      awk -v a="$addr" '$4 == a' |
+      sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+    pids="${pids}${pids:+ }${pid:-unknown}"
+  done <<EOF
+$(ss -ltn 2>/dev/null | awk -v port="$port" '
+  { n = split($4, a, ":"); if (a[n] == port) print $4 }
+')
+EOF
+  [ -n "$pids" ] || return 1
+  printf '%s\n' "$pids"
+}
+
+# Refuse to boot when a port is taken by a process this VM_DIR does not own.
+# The allowed PID is the recorded qemu/seed server for this VM_DIR (empty when
+# this VM_DIR has none).
+check_port_free() { # check_port_free <port> <allowed-pid> <description>
+  local port=$1 allow=$2 what=$3 pids pid comm
+  if ! pids=$(listener_pids "$port"); then return 0; fi
+  for pid in $pids; do
+    if [ "$pid" != unknown ] && [ -n "$allow" ] && [ "$pid" = "$allow" ]; then
+      continue
+    fi
+    if [ "$pid" = unknown ]; then
+      die "$what port $port is already bound by an unidentifiable process; set VM_SSH_PORT/VM_SEED_PORT to free ports (refusing to boot)"
+    fi
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+    die "$what port $port is already bound by pid $pid (${comm:-unknown}); set VM_SSH_PORT/VM_SEED_PORT to free ports (refusing to boot)"
+  done
+}
+
+recorded_pid() { # recorded_pid <pidfile> <expected-command-prefix>
+  local file=$1 want=$2 pid
+  [ -f "$file" ] || return 1
+  pid=$(cat "$file" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  ps -o comm= -p "$pid" 2>/dev/null | grep -q "^$want" || return 1
+  printf '%s\n' "$pid"
+}
+
+check_boot_ports() {
+  local qpid spid
+  qpid=$(recorded_pid "$QEMU_PID" qemu-system-x86 || true)
+  spid=$(recorded_pid "$SEED_PID" python || true)
+  check_port_free "$VM_SSH_PORT" "$qpid" "VM ssh"
+  check_port_free "$VM_SEED_PORT" "$spid" "cloud-init seed"
+}
+
+sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+
+# Verify the pinned image digest and Ubuntu's SHA256SUMS / SHA256SUMS.gpg.
+# Returns 0 with a verified digest; dies on a mismatch. GPG failure caused by
+# unavailable key infrastructure is reported honestly and does not block the
+# pinned SHA256, which is the authoritative check.
+verify_ubuntu_sums() {
+  local dir=$1 pub got rc
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA256SUMS" "$SHA256SUMS_URL" ||
+    die "could not download $SHA256SUMS_URL"
+  pub=$(awk -v f="$UBUNTU_IMAGE" '$2 == f || $2 == "*" f { print $1; exit }' "$dir/SHA256SUMS")
+  [ -n "$pub" ] || die "published SHA256SUMS has no entry for $UBUNTU_IMAGE"
+  [ "$pub" = "$UBUNTU_IMAGE_SHA256" ] ||
+    die "pinned digest $UBUNTU_IMAGE_SHA256 does not match published $pub for $UBUNTU_IMAGE (refusing to use it)"
+
+  if ! command -v gpg >/dev/null 2>&1; then
+    log "WARNING: gpg is not installed; SHA256SUMS.gpg not verified (pinned SHA256 still enforced)"
+    return 0
+  fi
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA256SUMS.gpg" "$SHA256SUMS_GPG_URL" ||
+    die "could not download $SHA256SUMS_GPG_URL"
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/ubuntu-key.asc" "$UBUNTU_GPG_KEY_URL" ||
+    die "could not download the pinned Ubuntu cloud-image signing key from $UBUNTU_GPG_KEY_URL"
+
+  if (
+    export GNUPGHOME=$dir/gnupg
+    mkdir -m 700 "$GNUPGHOME" || exit 2
+    gpg --batch --quiet --import "$dir/ubuntu-key.asc" 2>"$dir/gpg-import.err" || exit 2
+    gpg --batch --with-colons --list-keys "$UBUNTU_GPG_FINGERPRINT" >/dev/null 2>&1 || exit 3
+    gpg --batch --quiet --verify "$dir/SHA256SUMS.gpg" "$dir/SHA256SUMS" 2>"$dir/gpg-verify.err" || exit 4
+    exit 0
+  ); then
+    rc=0
+  else
+    rc=$?
+  fi
+  case "$rc" in
+    0) log "GPG signature on SHA256SUMS verified (key $UBUNTU_GPG_FINGERPRINT)" ;;
+    2) die "could not import the pinned Ubuntu cloud-image signing key" ;;
+    3) die "the fetched key does not have the pinned fingerprint $UBUNTU_GPG_FINGERPRINT" ;;
+    *) cat "$dir/gpg-verify.err" >&2 2>/dev/null || true
+       die "GPG verification of SHA256SUMS FAILED (signature mismatch)" ;;
+  esac
+}
+
 ensure_base_image() {
-  [ -f "$BASE_IMAGE" ] && return 0
+  mkdir -p "$VM_DIR"
+  if [ -f "$BASE_IMAGE" ]; then
+    log "re-hashing cached Ubuntu image $BASE_IMAGE"
+    local got
+    got=$(sha256_of "$BASE_IMAGE")
+    if [ "$got" = "$UBUNTU_IMAGE_SHA256" ]; then
+      printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+      return 0
+    fi
+    log "cached image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256); discarding"
+    rm -f "$BASE_IMAGE" "$BASE_IMAGE.sha256"
+  fi
   command -v curl >/dev/null || die "curl is required"
-  log "downloading Ubuntu 24.04 cloud image (~600 MiB) to $BASE_IMAGE"
-  local tmp=$BASE_IMAGE.part
+  local tmp=$BASE_IMAGE.part dir
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vm-image.XXXXXX")
+  rm -f "$tmp"
+  verify_ubuntu_sums "$dir"
+  log "downloading Ubuntu $UBUNTU_SERIES/$UBUNTU_RELEASE image (~600 MiB) to $BASE_IMAGE"
   curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$BASE_IMAGE_URL"
+  local got
+  got=$(sha256_of "$tmp")
+  if [ "$got" != "$UBUNTU_IMAGE_SHA256" ]; then
+    rm -f "$tmp"
+    rm -rf "$dir"
+    die "downloaded image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256)"
+  fi
   mv "$tmp" "$BASE_IMAGE"
+  printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+  printf 'url=%s\ndigest=%s\ngpg_fingerprint=%s\ndate=%s\n' \
+    "$BASE_IMAGE_URL" "$got" "$UBUNTU_GPG_FINGERPRINT" "$(date -Is)" >"$BASE_IMAGE.meta"
+  rm -rf "$dir"
+  log "Ubuntu image verified ($got)"
 }
 
 ensure_ssh_key() {
@@ -193,14 +337,15 @@ boot() {
   command -v qemu-img >/dev/null || die "qemu-img is required"
   [ -r /dev/kvm ] || die "/dev/kvm is not readable (KVM is required)"
   mkdir -p "$VM_DIR"
-  ensure_base_image
-  ensure_ssh_key
-  write_seed
-  start_seed_server
+  check_boot_ports
   if is_running; then
     log "VM already running (pid $(cat "$QEMU_PID"))"
     return 0
   fi
+  ensure_base_image
+  ensure_ssh_key
+  write_seed
+  start_seed_server
   rm -f "$QEMU_PID" "$CONSOLE"
   if [ ! -f "$OVERLAY" ]; then
     log "creating qcow2 overlay (${VM_DISK})"

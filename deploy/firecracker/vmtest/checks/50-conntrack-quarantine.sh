@@ -10,9 +10,16 @@ SPEC=/tmp/vmtest-spec-$ID.json
 
 section "f) conntrack flush and reuse quarantine"
 net_setup
-outside_http_start || true
+if outside_http_start; then ok "outside HTTP service is running"; else
+  bad "outside HTTP service did not start"
+  finish
+  exit 1
+fi
 
-make_spec "$SPEC" "$ID" vmtest false "$FLAG" "" ""
+# egress:true so the guest also creates a masqueraded outbound flow: its tuple
+# exercises the ORIGINAL direction while the DNAT flow exercises the REPLY
+# direction. Both must be flushed on release.
+make_spec "$SPEC" "$ID" vmtest true "$FLAG" "" "$OUT_PEER_IP:$OUT_HTTP_PORT"
 CODE=$(api_code PUT "/v1/instances/$ID" "$SPEC")
 rm -f "$SPEC"
 echo "  create: HTTP $CODE"
@@ -26,21 +33,72 @@ INDEX=${TAP#fctap}
 PID=$(vm_pid "$ID")
 echo "  guest=$GUEST tap=$TAP index=$INDEX public=$PUB pid=$PID"
 
+if probe_wait_for "$GUEST" 'outside=REACHED' 40; then
+  ok "egress:true guest produced a real outbound flow through masquerade"
+else
+  bad "egress:true guest never reached the outside service (probe: $(probe_text "$GUEST"))"
+fi
+
 # One real TCP connection through DNAT, held open with nc.
 systemctl reset-failed fc-vmtest-hold >/dev/null 2>&1 || true
 systemd-run --unit=fc-vmtest-hold --collect \
   nsenter --net="/run/netns/$OUT_NS" sh -c "sleep 30 | nc $OUT_HOST_IP $PUB >/dev/null" >/dev/null 2>&1 || true
 sleep 2
-CT_MATCHES=$(conntrack -L 2>/dev/null | grep -F "$GUEST" || true)
-echo "  conntrack entries involving $GUEST: $(printf '%s\n' "$CT_MATCHES" | grep -c .)"
-if printf '%s' "$CT_MATCHES" | grep -q "dport=$PUB"; then
-  ok "a real DNAT flow to the public port is tracked in conntrack"
-else
-  bad "no conntrack entry for the DNAT flow (dport=$PUB)"
+
+CT_BEFORE=
+DNAT_LINE=
+EGRESS_LINE=
+# Original tuple only: src=<guest> dst=<outside>. A DNAT reply tuple has the
+# same host pair in the opposite role, so matching anywhere in the line would
+# confuse the two flows.
+ct_original_guest_to() { # ct_original_guest_to <dump> <guest> <dst>
+  printf '%s\n' "$1" | awk -v g="$2" -v o="$3" '
+    {
+      s = 0; d = 0; s1 = ""; d1 = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^src=/) { s++; if (s == 1) s1 = substr($i, 5) }
+        if ($i ~ /^dst=/) { d++; if (d == 1) d1 = substr($i, 5) }
+      }
+      if (s1 == g && d1 == o) { print; exit }
+    }'
+}
+for _ in $(seq 1 20); do
+  CT_BEFORE=$(conntrack -L -f ipv4)
+  CT_RC=$?
+  [ "$CT_RC" -eq 0 ] || break
+  DNAT_LINE=$(printf '%s\n' "$CT_BEFORE" |
+    awk -v g="$GUEST" -v p="dport=$PUB" 'index($0, g) && index($0, p) { print; exit }')
+  EGRESS_LINE=$(ct_original_guest_to "$CT_BEFORE" "$GUEST" "$OUT_PEER_IP")
+  [ -n "$DNAT_LINE" ] && [ -n "$EGRESS_LINE" ] && break
+  sleep 0.5
+done
+if [ "$CT_RC" -ne 0 ]; then
+  bad "conntrack -L failed before release (exit $CT_RC); cannot inspect flows"
 fi
-if [ -n "$CT_MATCHES" ]; then ok "conntrack tracks the guest address before release"; else
+CT_GUEST_BEFORE=$(printf '%s\n' "$CT_BEFORE" | grep -cF "$GUEST" || true)
+echo "  conntrack entries involving $GUEST: $CT_GUEST_BEFORE"
+echo "  DNAT entry:    ${DNAT_LINE:-<none>}"
+echo "  egress entry:  ${EGRESS_LINE:-<none>}"
+if [ "$CT_GUEST_BEFORE" -gt 0 ]; then
+  ok "conntrack tracks the guest address before release"
+else
   bad "conntrack has no entry for the guest before release"
 fi
+if [ -n "$DNAT_LINE" ] && printf '%s\n' "$DNAT_LINE" | grep -qE "(^| )src=$GUEST( |$)"; then
+  ok "DNAT flow tracked with the guest in the reply-source direction"
+else
+  bad "no DNAT conntrack entry with the guest as reply source (dport=$PUB)"
+fi
+if [ -n "$EGRESS_LINE" ] && printf '%s\n' "$EGRESS_LINE" | grep -qE "(^| )src=$GUEST( |$)"; then
+  ok "masqueraded egress flow tracked with the guest in the original-source direction"
+else
+  bad "no masqueraded egress conntrack entry with the guest as original source"
+fi
+for pair in "DNAT:$DNAT_LINE" "egress:$EGRESS_LINE"; do
+  label=${pair%%:*}; line=${pair#*:}
+  n=$(printf '%s\n' "$line" | awk '{ c = 0; for (i = 1; i <= NF; i++) if ($i ~ /^src=/) c++; print c }')
+  expect_eq "$n" 2 "$label flow entry carries both original and reply tuples"
+done
 
 # --- release ---------------------------------------------------------------
 CODE=$(api_code DELETE "/v1/instances/$ID")
@@ -49,12 +107,31 @@ expect_eq "$CODE" 200 "delete accepted"
 expect_eq "$(api_body | jq -r '.state' 2>/dev/null)" stopped "delete reports stopped"
 sleep 1
 
-LEFT=$(conntrack -L 2>/dev/null | grep -cF "$GUEST" || true)
-expect_eq "$LEFT" 0 "release flushed every conntrack entry for the guest address (four directions)"
-if conntrack -L 2>/dev/null | grep -q "dport=$PUB"; then
-  bad "a conntrack entry for the public port survived release"
+# conntrack must be a working probe after release; a tool failure is not a
+# flush. Only exit 0 with zero matching entries proves the flush.
+CT_AFTER=$(conntrack -L -f ipv4)
+CT_RC=$?
+if [ "$CT_RC" -ne 0 ]; then
+  bad "conntrack -L failed after release (exit $CT_RC); cannot verify the flush"
 else
-  ok "no conntrack entry for the released public port remains"
+  LEFT=$(printf '%s\n' "$CT_AFTER" | grep -cF "$GUEST" || true)
+  expect_eq "$LEFT" 0 \
+    "release flushed every conntrack entry for the guest address (original and reply tuples)"
+  if printf '%s\n' "$CT_AFTER" | grep -F "$GUEST" | grep -qF "dport=$PUB"; then
+    bad "the DNAT reply tuple for the public port survived release"
+  else
+    ok "the DNAT reply tuple for the public port was flushed"
+  fi
+  if [ -n "$(ct_original_guest_to "$CT_AFTER" "$GUEST" "$OUT_PEER_IP")" ]; then
+    bad "the masqueraded egress original tuple survived release"
+  else
+    ok "the masqueraded egress original tuple was flushed"
+  fi
+  if printf '%s\n' "$CT_AFTER" | grep -qF "dport=$PUB"; then
+    bad "a conntrack entry for the public port survived release"
+  else
+    ok "no conntrack entry for the released public port remains"
+  fi
 fi
 
 # --- durable reuse quarantine ---------------------------------------------

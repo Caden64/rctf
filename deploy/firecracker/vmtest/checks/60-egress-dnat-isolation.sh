@@ -106,21 +106,50 @@ else
 fi
 
 # --- h. nmap from the outside namespace -----------------------------------
+# Scan all low ports plus the whole configured public tcpPortRange. The claim
+# below is limited to exactly what this scan covers.
+RANGE=$(sed -n 's/.*tcpPortRange: *{ *from: *\([0-9][0-9]*\), *to: *\([0-9][0-9]*\).*/\1-\2/p' \
+  /etc/rctf-firecracker/agent.yaml 2>/dev/null | head -1)
+[ -n "$RANGE" ] || RANGE=30000-30010
+SCAN_PORTS="1-10000,$RANGE"
 SCANLOG=/tmp/vmtest-nmap.log
-outside nmap -Pn --max-retries 1 -p "22,7001,30000-30010" "$OUT_HOST_IP" >"$SCANLOG" 2>&1 || true
+set +e
+outside nmap -Pn -T4 --min-rate 2000 --max-retries 1 -p "$SCAN_PORTS" "$OUT_HOST_IP" >"$SCANLOG" 2>&1
+NMAP_RC=$?
+set +e
 sed 's/^/  | /' "$SCANLOG"
+if [ "$NMAP_RC" -eq 0 ]; then
+  ok "nmap scan completed over ports $SCAN_PORTS"
+else
+  bad "nmap scan failed over ports $SCAN_PORTS (exit $NMAP_RC)"
+fi
 OPEN=$(awk '/^[0-9]+\/tcp/ && $2 == "open" {split($1,a,"/"); print a[1]}' "$SCANLOG" | sort -n | tr '\n' ' ')
 WANT=$(printf '%s\n%s\n' "$PA" "$PB" | sort -n | tr '\n' ' ')
-expect_eq "$OPEN" "$WANT" "nmap sees exactly the published TCP ports as open"
-if awk '/^22\/tcp/ && $2 == "closed"' "$SCANLOG" | grep -q .; then
+expect_eq "$OPEN" "$WANT" \
+  "nmap sees exactly the published TCP ports as open (ports $SCAN_PORTS)"
+# The wide scan suppresses the "closed" lines when there are many ("Not shown:
+# N closed tcp ports"). Probe the two management ports explicitly so their
+# state is asserted, not inferred.
+MGMTLOG=/tmp/vmtest-nmap-mgmt.log
+set +e
+outside nmap -Pn -T4 --max-retries 1 -p 22,7001 "$OUT_HOST_IP" >"$MGMTLOG" 2>&1
+MGMT_RC=$?
+set +e
+sed 's/^/  | /' "$MGMTLOG"
+if [ "$MGMT_RC" -eq 0 ]; then
+  ok "targeted nmap scan of management ports 22,7001 completed"
+else
+  bad "targeted nmap scan of ports 22,7001 failed (exit $MGMT_RC)"
+fi
+if awk '/^22\/tcp/ && $2 == "closed"' "$MGMTLOG" | grep -q .; then
   ok "management sshd (port 22) is not exposed on the public test interface"
 else
-  bad "port 22 is exposed on the public test interface"
+  bad "port 22 is exposed on the public test interface (nmap: $(awk '/^22\/tcp/ {print $2}' "$MGMTLOG"))"
 fi
-if awk '/^7001\/tcp/ && $2 == "closed"' "$SCANLOG" | grep -q .; then
+if awk '/^7001\/tcp/ && $2 == "closed"' "$MGMTLOG" | grep -q .; then
   ok "the agent API (port 7001, bound to 127.0.0.1) is not exposed on the public interface"
 else
-  bad "the agent API is exposed on the public interface"
+  bad "the agent API is exposed on the public interface (nmap: $(awk '/^7001\/tcp/ {print $2}' "$MGMTLOG"))"
 fi
 
 # --- teardown -------------------------------------------------------------

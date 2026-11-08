@@ -15,6 +15,11 @@ ART=${ART:-/tmp/fc-vmtest/artifacts}
 REPO=/opt/rctf-firecracker
 BUN_BIN=${BUN_BIN:-/usr/local/bin/bun}
 BUN_VERSION=${BUN_VERSION:-1.4.4}
+# Official SHA256SUMS256 entry for bun-v1.4.4/bun-linux-x64.zip (pinned again
+# here so a compromised/tampered SHASUMS file cannot redirect the install).
+BUN_SHA256=${BUN_SHA256:-bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c}
+BUN_SHASUMS_URL=${BUN_SHASUMS_URL:-https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/SHASUMS256.txt}
+BUN_ZIP_URL=${BUN_ZIP_URL:-https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip}
 export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '==> %s\n' "$*"; }
@@ -38,11 +43,19 @@ apt-get install -y -q --no-install-recommends \
 log "installing bun $BUN_VERSION at $BUN_BIN"
 if ! "$BUN_BIN" --version 2>/dev/null | grep -qx "$BUN_VERSION"; then
   tmp=$(mktemp -d)
-  curl -fsSL --retry 3 -o "$tmp/bun.zip" \
-    "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"
+  curl -fsSL --retry 3 -o "$tmp/bun.zip" "$BUN_ZIP_URL"
+  curl -fsSL --retry 3 -o "$tmp/SHASUMS256.txt" "$BUN_SHASUMS_URL"
+  WANT_SHA=$(awk '$2 == "bun-linux-x64.zip" || $2 == "*bun-linux-x64.zip" { print $1; exit }' "$tmp/SHASUMS256.txt")
+  [ -n "$WANT_SHA" ] || die "SHASUMS256.txt has no entry for bun-linux-x64.zip"
+  [ "$WANT_SHA" = "$BUN_SHA256" ] ||
+    die "bun SHASUMS256.txt digest $WANT_SHA != pinned $BUN_SHA256 (refusing to install)"
+  GOT_SHA=$(sha256sum "$tmp/bun.zip" | awk '{ print $1 }')
+  [ "$GOT_SHA" = "$BUN_SHA256" ] ||
+    die "downloaded bun zip digest $GOT_SHA != pinned $BUN_SHA256 (refusing to install)"
   unzip -q "$tmp/bun.zip" -d "$tmp"
   install -m 0755 "$tmp/bun-linux-x64/bun" "$BUN_BIN"
   rm -rf "$tmp"
+  log "bun zip verified against SHASUMS256.txt ($GOT_SHA)"
 fi
 "$BUN_BIN" --version
 
