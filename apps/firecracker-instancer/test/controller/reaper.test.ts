@@ -156,6 +156,50 @@ describe('reaper vs extend', () => {
     }
   })
 
+  test('an ambiguous DELETE 404 keeps the row fenced until real confirmation', async () => {
+    const { service, agent, clock, timers } = setup()
+    await service.start()
+    try {
+      await service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 1000 })
+      )
+      const id = [...agent.instances.keys()][0]!
+      agent.forceDrop(id)
+      // A route/proxy 404: no instance-scoped body, no tombstone.
+      agent.deleteMissingMode = 'ambiguous'
+
+      clock.t += 1000
+      await timers.trigger(1)
+      expect(agent.deleteCalls).toContain(id)
+      expect(agent.isTombstoned(id)).toBe(false)
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopping')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(1)
+
+      // The reconciler retries the DELETE; confirmation releases the row.
+      agent.deleteMissingMode = 'ok'
+      await timers.trigger(2)
+      expect(agent.isTombstoned(id)).toBe(true)
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopped')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(0)
+    } finally {
+      await service.stop()
+    }
+  })
+
   test('a DELETE answering 410/expired never frees the reaped row', async () => {
     const { service, agent, clock, timers } = setup()
     await service.start()
@@ -203,7 +247,7 @@ describe('reaper vs extend', () => {
     }
   })
 
-  test('the reaper only claims expired running rows', async () => {
+  test('the reaper claims expired live rows but never before the deadline', async () => {
     const { service, agent, clock, timers } = setup()
     await service.start()
     try {
@@ -219,6 +263,50 @@ describe('reaper vs extend', () => {
       await timers.trigger(1)
       expect(agent.deleteCalls).toHaveLength(1)
       expect(agent.instances.size).toBe(0)
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('an expired creating row is fenced through DELETE and kept until confirmed', async () => {
+    const { service, agent, clock, timers } = setup()
+    await service.start()
+    try {
+      // The create outlives its deadline while it is still booting.
+      agent.createState = 'starting'
+      await service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 1000 })
+      )
+      const id = [...agent.instances.keys()][0]!
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('starting')
+
+      agent.deleteUnreachable = true
+      clock.t += 1000
+      await timers.trigger(1)
+      // Reservation and fence survive an unconfirmed teardown.
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(1)
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopping')
+      expect(agent.isTombstoned(id)).toBe(false)
+
+      agent.deleteUnreachable = false
+      await timers.trigger(2)
+      expect(agent.isTombstoned(id)).toBe(true)
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(0)
+      expect(agent.instances.has(id)).toBe(false)
     } finally {
       await service.stop()
     }

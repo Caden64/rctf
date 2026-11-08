@@ -5,7 +5,7 @@
  * the controller tests.
  */
 import { describe, expect, test } from 'bun:test'
-import { AgentRejectedError } from '../../src/interfaces'
+import { AgentRejectedError, AgentUnreachableError } from '../../src/interfaces'
 import { FakeAgent } from './fake-agent'
 import { FakeClock, HOST_CAPACITY, makeAgentSpec } from './helpers'
 
@@ -33,6 +33,18 @@ describe('FakeAgent contract', () => {
     expect(late).toBeInstanceOf(AgentRejectedError)
     expect((late as AgentRejectedError).code).toBe('conflict')
     expect(agent.instances.has(id)).toBe(false)
+  })
+
+  test('an ambiguous DELETE 404 does not fence the id', async () => {
+    const { agent } = setup()
+    const id = 'f'.repeat(24)
+    agent.deleteMissingMode = 'ambiguous'
+    await expect(agent.delete(id)).rejects.toBeInstanceOf(AgentUnreachableError)
+    expect(agent.isTombstoned(id)).toBe(false)
+    // Once the agent is reachable again, a real DELETE fences it.
+    agent.deleteMissingMode = 'ok'
+    await expect(agent.delete(id)).resolves.toBeUndefined()
+    expect(agent.isTombstoned(id)).toBe(true)
   })
 
   test('records survive a simulated agent restart', async () => {

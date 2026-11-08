@@ -713,12 +713,18 @@ export class Store {
     return rows.map(rowToInstance)
   }
 
-  listExpiredRunning(now: number): InstanceRecord[] {
+  /**
+   * Live rows whose deadline has passed and may be claimed for teardown.
+   * `creating` is included: a create that outlived its deadline (slow boot or
+   * a lost response) must be fenced with a DELETE so a late completion can
+   * never leave a VM behind. The reservation is kept until the agent confirms.
+   */
+  listExpiredClaimable(now: number): InstanceRecord[] {
     this.assertOpen()
     const rows = this.db
       .prepare(
         `SELECT ${INSTANCE_COLUMNS} FROM instances
-         WHERE state = 'running' AND expires_at_ms <= ?`
+         WHERE state IN ('creating', 'running') AND expires_at_ms <= ?`
       )
       .all(now) as InstanceDbRow[]
     return rows.map(rowToInstance)
@@ -854,15 +860,21 @@ export class Store {
     )
   }
 
-  /** Claim an expired running row for deletion; returns false if it was extended first. */
-  claimExpiredRunning(id: string, now: number): boolean {
+  /**
+   * Claim an expired live row (`creating` or `running`) for deletion; returns
+   * false if an extend moved the deadline first. Both operations run inside
+   * `BEGIN IMMEDIATE` and require mutually exclusive deadline/state
+   * conditions, so exactly one wins.
+   */
+  claimExpired(id: string, now: number): boolean {
     this.assertOpen()
     return (
       this.db
         .prepare(
           `UPDATE instances
            SET state = 'deleting', updated_at_ms = ?, revision = revision + 1
-           WHERE id = ? AND state = 'running' AND expires_at_ms <= ?`
+           WHERE id = ? AND state IN ('creating', 'running')
+             AND expires_at_ms <= ?`
         )
         .run(now, id, now).changes > 0
     )
