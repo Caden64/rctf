@@ -103,12 +103,41 @@ describe('store', () => {
     expect(store.updateExpiry('a'.repeat(24), ['running'], 9000, 4000)).toBe(
       true
     )
-    expect(store.claimExpiredRunning('a'.repeat(24), 5000)).toBe(false)
-    expect(store.claimExpiredRunning('a'.repeat(24), 9000)).toBe(true)
+    expect(store.claimExpired('a'.repeat(24), 5000)).toBe(false)
+    expect(store.claimExpired('a'.repeat(24), 9000)).toBe(true)
     expect(store.getInstance('a'.repeat(24))?.state).toBe('deleting')
     expect(store.updateExpiry('a'.repeat(24), ['running'], 12000, 9001)).toBe(
       false
     )
+    store.close()
+  })
+
+  test('an expired creating row is claimable and extend still wins first', () => {
+    const { store } = newStore()
+    store.ensureHost('host-a', 'http://a')
+    store.insertInstance(
+      instance({
+        id: 'b'.repeat(24),
+        state: 'creating',
+        expiresAtMs: 5000,
+      })
+    )
+    expect(store.listExpiredClaimable(4000).map(row => row.id)).toEqual([])
+    expect(store.listExpiredClaimable(5000).map(row => row.id)).toEqual([
+      'b'.repeat(24),
+    ])
+    // An extend just before the deadline moves it, so the claim loses.
+    expect(store.updateExpiry('b'.repeat(24), ['creating'], 9000, 4999)).toBe(
+      true
+    )
+    expect(store.claimExpired('b'.repeat(24), 5000)).toBe(false)
+    expect(store.getInstance('b'.repeat(24))?.state).toBe('creating')
+    // At the new deadline the claim succeeds.
+    expect(store.claimExpired('b'.repeat(24), 9000)).toBe(true)
+    expect(store.getInstance('b'.repeat(24))?.state).toBe('deleting')
+    // A deleting row is no longer claimable and keeps its reservation.
+    expect(store.claimExpired('b'.repeat(24), 20_000)).toBe(false)
+    expect(store.reservedForHost('host-a').instances).toBe(1)
     store.close()
   })
 
