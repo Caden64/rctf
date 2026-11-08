@@ -20,7 +20,7 @@ import {
   readinessSchema,
   type AgentInstanceSpec,
 } from '@rctf/firecracker-protocol'
-import type { NetExposeRequest, NetLease } from '../interfaces'
+import type { Clock, NetExposeRequest, NetLease } from '../interfaces'
 import type { Logger } from '../log'
 
 const RECORD_VERSION = 1
@@ -94,6 +94,18 @@ export const storedInstanceSchema = z.object({
    * `launch` and the handle write). Kept until `vm.destroy(id)` is confirmed.
    */
   vmPendingDestroy: z.optional(z.boolean()),
+  /**
+   * The network may hold resources for this id even though no lease could be
+   * persisted yet (the allocation timed out or the agent crashed mid-call).
+   * Persisted BEFORE `net.allocate`, so teardown always calls `net.release(id)`.
+   */
+  netMayHold: z.optional(z.boolean()),
+  /**
+   * A VM may exist for this id even though no handle could be persisted yet
+   * (the launch timed out or the agent crashed mid-call). Persisted BEFORE
+   * `vm.launch`, so teardown always calls `vm.destroy(id)`.
+   */
+  vmMayHold: z.optional(z.boolean()),
 })
 export type StoredInstance = Omit<
   z.output<typeof storedInstanceSchema>,
@@ -205,10 +217,32 @@ export interface StoreFaults {
   fsyncDir?: (dir: string) => Error | undefined
   /** Return an error to make `readdir` fail. */
   readdir?: (dir: string) => Error | undefined
+  /** Return an error to make reading one persisted file fail (EACCES/EIO...). */
+  readFile?: (fileName: string, dir: string) => Error | undefined
   /** Return an error to make `unlink` fail. */
   unlink?: (fileName: string, dir: string) => Error | undefined
   /** Awaited before unlinking a record (used to interleave prune with DELETE). */
   beforeRemove?: (fileName: string, dir: string) => Promise<void> | void
+}
+
+/**
+ * A persisted file exists but could not be read. This is NOT the same as a
+ * malformed file: quarantining and skipping it could silently forget a
+ * resource or an acknowledged fence, so recovery must fail closed and retry.
+ */
+export class StateReadError extends Error {
+  constructor(readonly fileName: string) {
+    super('failed to read persisted state file')
+    this.name = 'StateReadError'
+  }
+}
+
+export interface StateLoadResult {
+  records: StoredInstance[]
+  /** Ids whose files were malformed; each needs a conservative tombstone. */
+  fences: string[]
+  /** Files that could not be read; recovery must fail closed and retry. */
+  readErrors: number
 }
 
 const UNSUPPORTED_FSYNC_CODES = new Set([
@@ -227,6 +261,27 @@ const errorCode = (err: unknown): string | undefined =>
 const isUnsupportedFsync = (err: unknown): boolean => {
   const code = errorCode(err)
   return code !== undefined && UNSUPPORTED_FSYNC_CODES.has(code)
+}
+
+/**
+ * Read one persisted file. ENOENT (removed between readdir and read) is a
+ * legitimate "absent"; every other failure is a read error that must fail
+ * recovery closed.
+ */
+const readPersistedFile = async (
+  file: string,
+  fileName: string,
+  dir: string,
+  faults?: StoreFaults
+): Promise<string | undefined> => {
+  const injected = faults?.readFile?.(fileName, dir)
+  if (injected) throw injected
+  try {
+    return await fs.readFile(file, 'utf8')
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return undefined
+    throw err
+  }
 }
 
 const fsyncDirectory = async (
@@ -358,8 +413,16 @@ export class StateStore {
     this.initialised = true
   }
 
-  /** All valid records. Corrupt files are quarantined and skipped. */
-  async load(): Promise<StoredInstance[]> {
+  /**
+   * Read every record. Three outcomes are kept distinct:
+   *  - a valid record is returned;
+   *  - a malformed record (or one whose filename/id disagree) is quarantined
+   *    AND its id is reported in `fences`, so the caller can persist a
+   *    conservative tombstone instead of silently allowing the id to be reused;
+   *  - a file that cannot be READ (EACCES/EIO...) is counted in `readErrors`;
+   *    recovery must fail closed rather than treat the id as absent.
+   */
+  async load(): Promise<StateLoadResult> {
     await this.init()
     let entries: Dirent[]
     try {
@@ -367,7 +430,9 @@ export class StateStore {
       if (injected) throw injected
       entries = await fs.readdir(this.dir, { withFileTypes: true })
     } catch (err) {
-      if (errorCode(err) === 'ENOENT') return []
+      if (errorCode(err) === 'ENOENT') {
+        return { records: [], fences: [], readErrors: 0 }
+      }
       this.logger.error(
         { errorType: err instanceof Error ? err.name : typeof err },
         'failed to read state directory'
@@ -376,24 +441,45 @@ export class StateStore {
     }
 
     const records: StoredInstance[] = []
+    const fences = new Set<string>()
+    let readErrors = 0
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue
       const file = path.join(this.dir, entry.name)
       const id = entry.name.slice(0, -'.json'.length)
+      let text: string | undefined
+      try {
+        text = await readPersistedFile(file, entry.name, this.dir, this.faults)
+      } catch (err) {
+        readErrors += 1
+        this.logger.error(
+          {
+            file: entry.name,
+            errorType: err instanceof Error ? err.name : typeof err,
+          },
+          'failed to read instance state file'
+        )
+        continue
+      }
+      if (text === undefined) continue
+      const fence = async (reason: string): Promise<void> => {
+        await quarantineFile(this.logger, file, reason)
+        if (instanceIdSchema.safeParse(id).success) fences.add(id)
+      }
       let raw: unknown
       try {
-        raw = JSON.parse(await fs.readFile(file, 'utf8'))
+        raw = JSON.parse(text)
       } catch {
-        await quarantineFile(this.logger, file, 'unreadable')
+        await fence('unreadable')
         continue
       }
       const parsed = storedInstanceSchema.safeParse(raw)
       if (!parsed.success) {
-        await quarantineFile(this.logger, file, 'invalid record')
+        await fence('invalid record')
         continue
       }
       if (parsed.data.id !== id) {
-        await quarantineFile(this.logger, file, 'id/filename mismatch')
+        await fence('id/filename mismatch')
         continue
       }
       records.push({
@@ -403,7 +489,7 @@ export class StateStore {
         updatedAtMs: parsed.data.updatedAtMs ?? parsed.data.createdAtMs,
       })
     }
-    return records
+    return { records, fences: [...fences], readErrors }
   }
 
   async save(record: StoredInstance): Promise<void> {
@@ -460,7 +546,8 @@ export class TombstoneStore {
   constructor(
     stateDir: string,
     private readonly logger: Logger,
-    private readonly faults?: StoreFaults
+    private readonly faults?: StoreFaults,
+    private readonly now: Clock = Date.now
   ) {
     this.dir = path.join(stateDir, 'tombstones')
   }
@@ -505,19 +592,39 @@ export class TombstoneStore {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue
       const file = path.join(this.dir, entry.name)
       const id = entry.name.slice(0, -'.json'.length)
-      let raw: unknown
+      let text: string | undefined
       try {
-        raw = JSON.parse(await fs.readFile(file, 'utf8'))
+        text = await readPersistedFile(file, entry.name, this.dir, this.faults)
+      } catch (err) {
+        // A fence that exists but cannot be read must never be treated as
+        // absent: fail recovery closed and retry.
+        this.logger.error(
+          {
+            file: entry.name,
+            errorType: err instanceof Error ? err.name : typeof err,
+          },
+          'failed to read tombstone file'
+        )
+        throw new StateReadError(entry.name)
+      }
+      if (text === undefined) continue
+      let raw: unknown
+      let malformed = false
+      try {
+        raw = JSON.parse(text)
       } catch {
-        await quarantineFile(this.logger, file, 'unreadable tombstone')
-        continue
+        malformed = true
       }
-      const parsed = tombstoneSchema.safeParse(raw)
-      if (!parsed.success || parsed.data.id !== id) {
+      const parsed = malformed ? undefined : tombstoneSchema.safeParse(raw)
+      if (!parsed || !parsed.success || parsed.data.id !== id) {
         await quarantineFile(this.logger, file, 'invalid tombstone')
+        // Never silently allow reuse of an id we cannot read a fence for.
+        if (instanceIdSchema.safeParse(id).success) {
+          await this.withId(id, () => this.writeFence(id, this.now()))
+        }
         continue
       }
-      this.records.set(parsed.data.id, parsed.data)
+      this.records.set(id, parsed.data)
     }
     this.loaded = true
     return [...this.records.values()]
@@ -563,6 +670,20 @@ export class TombstoneStore {
     return [...this.records.values()]
   }
 
+  /** Durably write and install one fence. Callers must hold the per-id lock. */
+  private async writeFence(id: string, atMs: number): Promise<void> {
+    const record: StoredTombstone = { id, atMs }
+    this.pending.set(id, record)
+    await writeAtomic(
+      this.dir,
+      `${id}.json`,
+      `${JSON.stringify(record)}\n`,
+      this.faults
+    )
+    this.records.set(id, record)
+    this.pending.delete(id)
+  }
+
   /**
    * Durably fence `id`. The in-memory pending entry is installed before the
    * write (so this process never admits a concurrent PUT) but only a completed
@@ -575,18 +696,7 @@ export class TombstoneStore {
     }
     await this.ensureLoaded()
     await this.init()
-    await this.withId(id, async () => {
-      const record: StoredTombstone = { id, atMs }
-      this.pending.set(id, record)
-      await writeAtomic(
-        this.dir,
-        `${id}.json`,
-        `${JSON.stringify(record)}\n`,
-        this.faults
-      )
-      this.records.set(id, record)
-      this.pending.delete(id)
-    })
+    await this.withId(id, () => this.writeFence(id, atMs))
   }
 
   async remove(id: string): Promise<void> {

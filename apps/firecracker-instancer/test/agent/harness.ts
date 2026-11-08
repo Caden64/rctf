@@ -21,6 +21,7 @@ interface SpawnOptions {
   tombstoneTtlMs?: number
   operationTimeoutMs?: number
   sweepConcurrency?: number
+  orphanScanSweeps?: number
   store?: StateStore
   tombstones?: TombstoneStore
 }
@@ -46,6 +47,7 @@ export const createHarness = async (opts?: {
   tombstoneTtlMs?: number
   operationTimeoutMs?: number
   sweepConcurrency?: number
+  orphanScanSweeps?: number
   clock?: TestClock
   vm?: FakeVmDriver
   net?: FakeNetworkManager
@@ -72,6 +74,8 @@ export const createHarness = async (opts?: {
         spawnOpts?.operationTimeoutMs ?? opts?.operationTimeoutMs ?? 30_000,
       sweepConcurrency:
         spawnOpts?.sweepConcurrency ?? opts?.sweepConcurrency ?? 8,
+      orphanScanSweeps:
+        spawnOpts?.orphanScanSweeps ?? opts?.orphanScanSweeps ?? 30,
       orphanGraceMs: 0,
       ...(spawnOpts?.store === undefined ? {} : { store: spawnOpts.store }),
       ...(spawnOpts?.tombstones === undefined
