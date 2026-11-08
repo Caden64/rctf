@@ -26,6 +26,18 @@ import { readinessSchema } from './challenge-config'
  *   PATCH  /v1/instances/:id         push a new expiry (monotonic: max(current, new))
  *   DELETE /v1/instances/:id         idempotent teardown (404 when unknown)
  *
+ * FENCING: DELETE of an id the agent does not know (or already finished) records a
+ * durable tombstone {id, atMs} (kept >= `tombstoneTtlSeconds`, default 24h, persisted
+ * in the agent state dir). A later PUT for a tombstoned id fails with `conflict`
+ * ("instance id was deleted"), so a create request that was delayed on the wire
+ * after the controller gave up on it can never produce a VM. The controller treats
+ * DELETE 200/404 as confirmation that the id will never exist.
+ *
+ * Time: `expiresAtMs` values are on the AGENT clock. The controller reads
+ * `AgentInfo.timeMs` at every heartbeat, estimates the skew (agent - controller,
+ * RTT-compensated) and translates deadlines it sends. A host whose |skew| exceeds
+ * the controller's `maxClockSkewSeconds` takes no new placements.
+ *
  * Errors: `agentErrorSchema` with codes from `errorCodeSchema`.
  * `no_capacity` (507) means the agent's own limits rejected the spec.
  */

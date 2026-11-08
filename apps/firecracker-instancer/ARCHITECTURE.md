@@ -59,6 +59,26 @@ and `lost` are terminal-until-delete. Agent states: `creating, starting, running
    (player sees `stopping`) and is retried; after `hostLostSeconds` it is written off: the unique key is freed,
    the row is tombstoned, the host's orphan cleanup finishes the job when it returns.
 
+### Ambiguous creates and fencing (normative)
+
+A create whose outcome is unknown (timeout, connection reset, HTTP 5xx or a malformed 2xx — _anything except a documented
+pre-create rejection_: `no_capacity`, `draining`, `invalid_request`, `unauthorized`) keeps its row in `creating`, pinned to that
+host, holding the key and reservation. The reconciler resolves it: `get(id)` finds the VM ⇒ adopt; still absent after
+`createFenceSeconds` (default 45) ⇒ row becomes `deleting` and the controller sends `DELETE` — which makes the agent write a
+**tombstone** so a delayed original `PUT` can never create the VM (see agent protocol, FENCING) — and only when the agent
+confirms (200/404) is the row removed and the key freed. Absence is never inferred from a single listing: a listing can be
+stale relative to concurrent creates, so every "missing on agent" conclusion is re-confirmed with a fresh per-id `get` and applied
+with a version CAS on the row snapshot taken **before** the listing.
+
+### Host removal and clocks (normative)
+
+`removeHost` is only allowed for an `unhealthy` host (409 otherwise): it writes the host's rows off as `lost` tombstones (cleanup
+still happens when the agent returns) and leaves the host `draining` (persisted; config seeding never clears it) until an operator
+`undrain`s. Heartbeats run concurrently with a per-probe deadline and each host is judged on its own last success. Deadlines sent to
+an agent are translated to the agent's clock using the skew measured from `AgentInfo.timeMs`; a host beyond `maxClockSkewSeconds`
+(default 10) takes no new placements. Known limitation: when a host is written off after `hostLostSeconds`, a partitioned agent may
+keep the old VM running until its own dead-man deadline, so a team can briefly have two live instances in that rare case.
+
 ## Scheduling and capacity
 
 Per-host reservation = Σ(vcpus, memMiB, diskMiB, 1) of rows in `reserving|creating|running|deleting` (a deleting row still
