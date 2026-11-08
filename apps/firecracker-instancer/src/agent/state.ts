@@ -15,11 +15,12 @@ import * as z from 'zod/mini'
 import {
   agentExposeSchema,
   agentInstanceStateSchema,
+  exposeKindSchema,
   instanceIdSchema,
   readinessSchema,
   type AgentInstanceSpec,
 } from '@rctf/firecracker-protocol'
-import type { NetLease } from '../interfaces'
+import type { NetExposeRequest, NetLease } from '../interfaces'
 import type { Logger } from '../log'
 
 const RECORD_VERSION = 1
@@ -41,6 +42,12 @@ export const storedSpecSchema = z.object({
 })
 export type StoredSpec = z.output<typeof storedSpecSchema>
 
+const netLeaseExposeSchema = z.object({
+  kind: exposeKindSchema,
+  hostPrefix: z.string(),
+  port: z.int(),
+})
+
 const netLeaseSchema = z.object({
   instanceId: z.string(),
   tapName: z.string(),
@@ -51,6 +58,11 @@ const netLeaseSchema = z.object({
   publicPorts: z.record(z.string(), z.int()),
   publicHostnames: z.record(z.string(), z.string()),
   egress: z.boolean(),
+  /**
+   * The frozen NetLease gained this required field in a later contract
+   * revision. Optional here so records written before that revision still load.
+   */
+  expose: z.optional(z.array(netLeaseExposeSchema)),
 })
 
 const vmHandleSchema = z.object({
@@ -158,17 +170,23 @@ export const buildStoredInstance = (
 })
 
 /** JSON-safe copy of a lease. Numeric record keys become strings on disk. */
-export const leaseToJson = (lease: NetLease): NetLease => ({
-  instanceId: lease.instanceId,
-  tapName: lease.tapName,
-  hostIp: lease.hostIp,
-  guestIp: lease.guestIp,
-  prefixLength: lease.prefixLength,
-  guestMac: lease.guestMac,
-  publicPorts: { ...lease.publicPorts },
-  publicHostnames: { ...lease.publicHostnames },
-  egress: lease.egress,
-})
+export const leaseToJson = (lease: NetLease): NetLease => {
+  // The frozen interface is being extended with the full expose list; keep it
+  // when the running contract provides it without requiring it from old fakes.
+  const expose = (lease as NetLease & { expose?: NetExposeRequest[] }).expose
+  return {
+    instanceId: lease.instanceId,
+    tapName: lease.tapName,
+    hostIp: lease.hostIp,
+    guestIp: lease.guestIp,
+    prefixLength: lease.prefixLength,
+    guestMac: lease.guestMac,
+    publicPorts: { ...lease.publicPorts },
+    publicHostnames: { ...lease.publicHostnames },
+    egress: lease.egress,
+    ...(expose === undefined ? {} : { expose }),
+  } as NetLease
+}
 
 const fsyncDirectory = async (dir: string): Promise<void> => {
   let handle: fs.FileHandle | undefined

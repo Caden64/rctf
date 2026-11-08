@@ -16,6 +16,7 @@ import type {
   VmDriver,
   VmHandle,
 } from '../interfaces'
+import { NetworkCapacityError } from '../interfaces'
 import { createLogger, type Logger } from '../log'
 import type { AgentConfig } from './config'
 import {
@@ -74,6 +75,22 @@ const exposeRequests = (spec: StoredInstance['spec']): NetExposeRequest[] =>
     hostPrefix: item.hostPrefix,
     port: item.port,
   }))
+
+/**
+ * The frozen NetLease gained a required `expose` list in a later contract
+ * revision. Backfill it from the stored spec when loading a record written by
+ * an older agent so `net.restore` can still rebuild every route.
+ */
+const leaseWithExpose = (
+  lease: StoredInstance['lease'],
+  spec: StoredInstance['spec']
+): NetLease => {
+  const current = lease as NetLease & { expose?: NetExposeRequest[] }
+  return {
+    ...current,
+    expose: current.expose ?? exposeRequests(spec),
+  } as NetLease
+}
 
 const redactText = (text: string, spec: AgentInstanceSpec): string => {
   let out = text
@@ -159,7 +176,10 @@ export const createInstanceManager = (deps: {
     createdAtMs: record.createdAtMs,
     expiresAtMs: record.expiresAtMs,
     endpoints: record.lease
-      ? net.endpoints(record.lease, exposeRequests(record.spec))
+      ? net.endpoints(
+          leaseWithExpose(record.lease, record.spec),
+          exposeRequests(record.spec)
+        )
       : [],
     specHash: record.specHash,
   })
@@ -471,6 +491,12 @@ export const createInstanceManager = (deps: {
         updatedAtMs: now(),
       }
       await store.save(entry.record)
+      if (err instanceof NetworkCapacityError) {
+        throw new ProtocolError(
+          'no_capacity',
+          'host network capacity exhausted'
+        )
+      }
       return toAgentInstance(entry.record)
     }
 
@@ -622,7 +648,8 @@ export const createInstanceManager = (deps: {
       record = { ...record, vm: handle, updatedAtMs: now() }
       entry.record = record
       await store.save(record)
-      if (record.lease) liveLeases.push(record.lease)
+      if (record.lease)
+        liveLeases.push(leaseWithExpose(record.lease, record.spec))
       if (record.state === 'starting' && record.lease) startBoot(entry)
       logger.info(
         { instanceId: record.id, state: record.state },

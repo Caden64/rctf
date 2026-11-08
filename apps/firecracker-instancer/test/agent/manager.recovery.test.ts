@@ -69,6 +69,11 @@ describe('agent restart recovery', () => {
     expect(adopted?.state).toBe('running')
     expect(adopted?.endpoints).toHaveLength(spec.expose.length)
     expect(net2.leases.has(spec.id)).toBe(true)
+    expect(net2.lastRestored).toHaveLength(1)
+    const restoredLease = net2.lastRestored[0] as unknown as {
+      expose?: unknown[]
+    }
+    expect(restoredLease?.expose).toHaveLength(spec.expose.length)
     expect(harness.vm.adoptCalls).toBeGreaterThan(0)
   })
 
@@ -220,6 +225,11 @@ describe('durable state files', () => {
     })
     const names = await readdir(harness.dir)
     expect(names.filter(name => name.includes('.tmp'))).toHaveLength(0)
-    expect(Object.keys(await readTree(harness.dir))).toContain(fileName)
+    const files = await readTree(harness.dir)
+    expect(Object.keys(files)).toContain(fileName)
+    const persisted = JSON.parse(files[fileName] as string) as {
+      lease?: { expose?: unknown[] }
+    }
+    expect(persisted.lease?.expose).toHaveLength(spec.expose.length)
   })
 })

@@ -125,7 +125,8 @@ export const makeLease = (
     publicPorts,
     publicHostnames,
     egress,
-  }
+    expose,
+  } as NetLease
 }
 
 const toExposeRequests = (
@@ -140,6 +141,7 @@ const toExposeRequests = (
 export class FakeNetworkManager implements NetworkManager {
   readonly leases = new Map<string, NetLease>()
   readonly published = new Set<string>()
+  lastRestored: NetLease[] = []
   allocateCalls = 0
   publishCalls = 0
   unpublishCalls = 0
@@ -149,6 +151,7 @@ export class FakeNetworkManager implements NetworkManager {
   failPublish = false
   failUnpublish = false
   failRelease = false
+  allocateError?: Error
 
   constructor(
     readonly publicHost = 'fc.example.com',
@@ -161,6 +164,7 @@ export class FakeNetworkManager implements NetworkManager {
     expose: NetExposeRequest[]
   }): Promise<NetLease> {
     this.allocateCalls += 1
+    if (this.allocateError) throw this.allocateError
     if (this.failAllocate) throw new Error('allocate failed')
     const existing = this.leases.get(req.instanceId)
     if (existing) return existing
@@ -208,6 +212,7 @@ export class FakeNetworkManager implements NetworkManager {
 
   async restore(leases: NetLease[]): Promise<{ removedOrphans: string[] }> {
     this.restoreCalls += 1
+    this.lastRestored = leases
     const keep = new Set(leases.map(lease => lease.instanceId))
     const removedOrphans: string[] = []
     for (const id of this.leases.keys()) {

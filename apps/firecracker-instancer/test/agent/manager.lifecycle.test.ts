@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import { ProtocolError } from '@rctf/firecracker-protocol'
+import { NetworkCapacityError } from '../../src/interfaces'
 import type { InstanceManager } from '../../src/interfaces'
 import { createHarness, type Harness } from './harness'
 import { makeSpec, nextId, readTree, waitFor } from './fakes'
@@ -137,6 +138,20 @@ describe('instance manager: provisioning failures', () => {
       expect(JSON.stringify(files)).not.toContain('FLAG{test-secret-value}')
     })
   }
+
+  it('surfaces network pool exhaustion as no_capacity and keeps a tombstone', async () => {
+    const harness = await setup()
+    const spec = makeSpec()
+    harness.net.allocateError = new NetworkCapacityError('pool exhausted')
+
+    expect(await rejectionCode(harness.mgr.create(spec))).toBe('no_capacity')
+    const instance = await harness.mgr.get(spec.id)
+    expect(instance?.state).toBe('errored')
+    expectClean(harness)
+    expect(Object.keys(await readTree(harness.dir))).toContain(
+      `${spec.id}.json`
+    )
+  })
 })
 
 describe('instance manager: delete', () => {
@@ -178,6 +193,22 @@ describe('instance manager: delete', () => {
 
     const code = await rejectionCode(harness.mgr.delete(spec.id))
     expect(code).toBe('not_found')
+    expectClean(harness)
+  })
+
+  it('keeps a stopping record and retries when network release fails', async () => {
+    const harness = await setup({ sweepIntervalMs: 2 })
+    const spec = makeSpec()
+    await harness.mgr.create(spec)
+    harness.net.failRelease = true
+
+    expect(await rejectionCode(harness.mgr.delete(spec.id))).toBe('in_progress')
+    expect((await harness.mgr.get(spec.id))?.state).toBe('stopping')
+
+    harness.net.failRelease = false
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id)) === undefined ? true : undefined
+    )
     expectClean(harness)
   })
 
