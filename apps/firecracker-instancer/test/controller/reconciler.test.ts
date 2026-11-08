@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, describe, expect, test } from 'bun:test'
+import { ProtocolError } from '@rctf/firecracker-protocol'
 import { AgentRejectedError } from '../../src/interfaces'
 import { createControllerService } from '../../src/controller/service'
 import {
@@ -258,6 +259,54 @@ describe('reconciler', () => {
     }
   })
 
+  test('an ambiguous per-id GET never declares a running row lost', async () => {
+    const { service, agent, timers, path } = setup()
+    await service.start()
+    try {
+      await service.create(makeCreateRequest('team-1'))
+      const id = [...agent.instances.keys()][0]!
+      agent.forceDrop(id)
+      // Route/proxy 404 on GET: not evidence that this instance is gone.
+      agent.getMissingMode = 'ambiguous'
+      await timers.trigger(2)
+
+      expect(instanceRow(path, 'team-1')?.state).toBe('running')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(1)
+
+      // A genuine instance-specific absence still converges to errored.
+      agent.getMissingMode = 'absent'
+      await timers.trigger(2)
+      expect(instanceRow(path, 'team-1')?.state).toBe('errored')
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('an ambiguous PATCH 404 never declares a running row lost', async () => {
+    const { service, agent, timers, path } = setup()
+    await service.start()
+    try {
+      await service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 10_000 })
+      )
+      const id = [...agent.instances.keys()][0]!
+      // The agent's deadline is behind the row's, forcing a reconciliation
+      // PATCH; the PATCH path answers an unattributable 404 while the instance
+      // is demonstrably alive (the listing/GET still return it).
+      agent.instances.get(id)!.expiresAtMs -= 1000
+      agent.extendErrorMode = 'ambiguous'
+      await timers.trigger(2)
+      expect(instanceRow(path, 'team-1')?.state).toBe('running')
+
+      agent.extendErrorMode = 'none'
+      await timers.trigger(2)
+      expect(instanceRow(path, 'team-1')?.state).toBe('running')
+      expect(instanceRow(path, 'team-1')?.agent_expiry_synced).toBe(1)
+    } finally {
+      await service.stop()
+    }
+  })
+
   test('re-pushes an expiry that failed to reach the agent', async () => {
     const { service, agent, clock, timers, path } = setup()
     await service.start()
@@ -267,12 +316,16 @@ describe('reconciler', () => {
       )
       clock.t += 1000
       agent.unreachable = true
-      const extended = await service.extend({
-        teamId: 'team-1',
-        challengeIntegrationId: 'chal-1',
-        timeoutMilliseconds: 20_000,
-      })
-      expect(extended.status).toBe('running')
+      const error = await service
+        .extend({
+          teamId: 'team-1',
+          challengeIntegrationId: 'chal-1',
+          timeoutMilliseconds: 20_000,
+        })
+        .catch(error => error)
+      // The committed deadline stays, but the player sees the push failure.
+      expect(error).toBeInstanceOf(ProtocolError)
+      expect((error as ProtocolError).code).toBe('host_unavailable')
       expect(instanceRow(path, 'team-1')?.agent_expiry_synced).toBe(0)
 
       agent.unreachable = false
@@ -296,11 +349,15 @@ describe('reconciler', () => {
       expect(instanceRow(path, 'team-1')?.state).toBe('creating')
       clock.t += 1000
       agent.unreachable = true
-      await service.extend({
-        teamId: 'team-1',
-        challengeIntegrationId: 'chal-1',
-        timeoutMilliseconds: 20_000,
-      })
+      const error = await service
+        .extend({
+          teamId: 'team-1',
+          challengeIntegrationId: 'chal-1',
+          timeoutMilliseconds: 20_000,
+        })
+        .catch(error => error)
+      expect(error).toBeInstanceOf(ProtocolError)
+      expect((error as ProtocolError).code).toBe('host_unavailable')
       expect(instanceRow(path, 'team-1')?.agent_expiry_synced).toBe(0)
 
       agent.unreachable = false

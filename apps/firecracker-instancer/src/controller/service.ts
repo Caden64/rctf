@@ -792,36 +792,67 @@ class ControllerServiceImpl implements ControllerService {
       throw new ProtocolError(outcome.code, outcome.message)
     }
 
-    // The controller is authoritative; a failed push is retried by the
-    // reconciler and does not fail the player's extension.
+    // The committed row is authoritative: the deadline above is never rolled
+    // back, and the reconciler retries an unsynced deadline. But the player
+    // must NOT see success when the agent did not take it: report
+    // `host_unavailable` while keeping the committed desired deadline.
     const row = outcome.row
     const client = this.clients[row.hostId]
-    if (client !== undefined) {
+    if (client === undefined) {
+      throw new ProtocolError(
+        'host_unavailable',
+        'no agent client for instance host; the controller will retry the extension'
+      )
+    }
+    let confirmed: AgentInstance
+    try {
       const target = this.toAgentDeadline(row.hostId, row.expiresAtMs)
-      try {
-        const confirmed = await client.extend(row.id, target)
-        if (
-          this.agentCoversDeadline(
-            row.hostId,
-            confirmed.expiresAtMs,
-            row.expiresAtMs
-          )
-        ) {
-          this.store.setExpirySyncedFor(row.id, row.expiresAtMs, true)
-        }
-      } catch (error) {
-        this.logger.warn(
-          {
-            instanceId: row.id,
-            hostId: row.hostId,
-            err: error instanceof Error ? error.message : String(error),
-          },
-          'failed to push expiry to agent; reconciler will retry'
+      confirmed = await client.extend(row.id, target)
+      if (
+        !this.agentCoversDeadline(
+          row.hostId,
+          confirmed.expiresAtMs,
+          row.expiresAtMs
+        )
+      ) {
+        throw new ProtocolError(
+          'host_unavailable',
+          'agent did not confirm the requested extension deadline'
         )
       }
+    } catch (error) {
+      this.logger.warn(
+        {
+          instanceId: row.id,
+          hostId: row.hostId,
+          err: error instanceof Error ? error.message : String(error),
+        },
+        'failed to confirm expiry with agent; committed deadline kept, reconciler will retry'
+      )
+      if (error instanceof ProtocolError) throw error
+      throw new ProtocolError(
+        'host_unavailable',
+        'failed to push expiry to agent; the controller will retry'
+      )
     }
 
-    return this.detailsForRow(row)
+    // Re-read: a concurrent delete/extend may have changed the row while the
+    // PATCH was in flight. Never return the original snapshot as success.
+    const current = this.store.getInstance(row.id)
+    if (current === null) return stoppedDetails()
+    if (
+      (current.state === 'creating' || current.state === 'running') &&
+      this.agentCoversDeadline(
+        current.hostId,
+        confirmed.expiresAtMs,
+        current.expiresAtMs
+      )
+    ) {
+      // Conditional: only marks the deadline that is still current, so a
+      // competing extend that committed a later one stays unsynced.
+      this.store.setExpirySyncedFor(current.id, current.expiresAtMs, true)
+    }
+    return this.detailsForRow(current)
   }
 
   // ---- delete -----------------------------------------------------------

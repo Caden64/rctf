@@ -121,6 +121,17 @@ const rowExpiry = (path: string, teamId: string): number | null => {
   return row?.expires_at_ms ?? null
 }
 
+const rowSynced = (path: string, teamId: string): number | null => {
+  const db = new Database(path, { readonly: true })
+  const row = db
+    .query(
+      'SELECT agent_expiry_synced FROM instances WHERE team_id = ? ORDER BY created_at_ms DESC LIMIT 1'
+    )
+    .get(teamId) as { agent_expiry_synced: number } | null
+  db.close()
+  return row?.agent_expiry_synced ?? null
+}
+
 const hostSkew = (path: string, hostId: string): number => {
   const db = new Database(path, { readonly: true })
   const row = db
@@ -382,6 +393,33 @@ describe('controller service', () => {
 
       // Idempotent after removal.
       expect((await h.service.delete(key)).status).toBe('stopped')
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('an ambiguous DELETE 404 keeps the row fenced and the reservation held', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents })
+    await h.start()
+    try {
+      await h.service.create(makeCreateRequest('team-1'))
+      const id = [...agents['host-a']!.instances.keys()][0]!
+      agents['host-a']!.forceDrop(id)
+      agents['host-a']!.deleteMissingMode = 'ambiguous'
+
+      const key = { teamId: 'team-1', challengeIntegrationId: 'chal-1' }
+      const stopping = await h.service.delete(key)
+      expect(stopping.status).toBe('stopping')
+      expect(rowState(h.path, 'team-1')).toBe('deleting')
+      expect((await h.service.listHosts())[0]!.reserved.instances).toBe(1)
+      expect(agents['host-a']!.isTombstoned(id)).toBe(false)
+
+      // A real instance-absence response confirms and releases the row.
+      agents['host-a']!.deleteMissingMode = 'ok'
+      expect((await h.service.delete(key)).status).toBe('stopped')
+      expect(rowState(h.path, 'team-1')).toBe(null)
+      expect(agents['host-a']!.isTombstoned(id)).toBe(true)
     } finally {
       await h.service.stop()
     }
@@ -963,6 +1001,73 @@ describe('controller service', () => {
       expect(agents['host-a']!.instances.get(id)!.expiresAtMs).toBe(
         longDeadline + 1
       )
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('a short-deadline agent reply fails the extend but keeps the committed deadline', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents })
+    await h.start()
+    try {
+      await h.service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 10_000 })
+      )
+      h.clock.t += 1000
+      agents['host-a']!.extendAckDeadline = applied => applied - 5000
+      const error = await h.service
+        .extend({
+          teamId: 'team-1',
+          challengeIntegrationId: 'chal-1',
+          timeoutMilliseconds: 20_000,
+        })
+        .catch(error => error)
+      expect(error).toBeInstanceOf(ProtocolError)
+      expect((error as ProtocolError).code).toBe('host_unavailable')
+
+      // The desired deadline is authoritative and never rolled back.
+      expect(rowExpiry(h.path, 'team-1')).toBe(h.clock.t + 20_000)
+      expect(rowSynced(h.path, 'team-1')).toBe(0)
+
+      agents['host-a']!.extendAckDeadline = null
+      await h.timers.trigger(2)
+      expect(rowSynced(h.path, 'team-1')).toBe(1)
+    } finally {
+      await h.service.stop()
+    }
+  })
+
+  test('a paused extend response reports a concurrent delete, not success', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents })
+    await h.start()
+    try {
+      await h.service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 10_000 })
+      )
+      h.clock.t += 1000
+      const hold = agents['host-a']!.holdNextExtend()
+      const pending = h.service.extend({
+        teamId: 'team-1',
+        challengeIntegrationId: 'chal-1',
+        timeoutMilliseconds: 20_000,
+      })
+      await hold.captured
+      // The player deletes while the PATCH response is still on the wire.
+      expect(
+        (
+          await h.service.delete({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopped')
+      hold.release()
+
+      const result = await pending
+      expect(result.status).toBe('stopped')
+      expect(countRows(h.path)).toBe(0)
     } finally {
       await h.service.stop()
     }
