@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'bun:test'
 import { agentConfigSchema, alignTapOwner } from '../../src/agent/config'
 
-const base = (overrides: Record<string, unknown> = {}) =>
+const base = (
+  overrides: {
+    network?: Record<string, unknown>
+    vm?: Record<string, unknown>
+  } = {}
+) =>
   agentConfigSchema.parse({
     hostId: 'fc1',
     capacity: { vcpus: 4, memMiB: 4096, diskMiB: 4096, maxInstances: 4 },
     network: {
       publicHost: 'fc1.example.com',
       httpDomain: 'fc1.example.com',
-      ...((overrides.network as object | undefined) ?? {}),
+      ...overrides.network,
     },
     vm: { mode: 'jailer', ...((overrides.vm as object | undefined) ?? {}) },
   })
