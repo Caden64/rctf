@@ -85,7 +85,21 @@ export interface NetworkManager {
    * files, port reservations) that belongs to no listed lease.
    * Returns ids of artifacts that were removed as orphans.
    */
-  restore(leases: NetLease[]): Promise<{ removedOrphans: string[] }>
+  restore(
+    leases: NetLease[],
+    opts?: {
+      /**
+       * Leases whose teardown was in progress when the agent stopped (the
+       * agent still holds their persisted lease). They must be adopted as
+       * ALREADY FENCED and retiring: do not re-create their tap or re-publish
+       * routes, keep their /30, ports and hostnames reserved, and let a
+       * following `release(instanceId)` complete the fence/route/tap/conntrack
+       * teardown and the durable quarantine. A fresh process has no in-memory
+       * state, so an empty map must never be mistaken for "already released".
+       */
+      retiring?: NetLease[]
+    }
+  ): Promise<{ removedOrphans: string[] }>
   /** Cheap self-check used in /v1/info (nft present, ip_forward on, ...). */
   preflight(): Promise<Record<string, boolean>>
 }
