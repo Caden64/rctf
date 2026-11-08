@@ -153,11 +153,33 @@ else
 fi
 
 # --- teardown -------------------------------------------------------------
+# Positive calibration while the VMs exist: the same enumeration used after
+# teardown must find both Firecracker processes now.
+CAL_OK=1
+for id in "$IDA" "$IDB"; do
+  fc_procs "$id"
+  case "$?" in
+    0) [ -n "$FC_PROCS" ] || { bad "positive calibration failed: no firecracker process for $id before teardown"; CAL_OK=0; } ;;
+    *) bad "positive calibration failed: cannot enumerate firecracker processes (${FC_PROCS_ERROR:-probe error})"; CAL_OK=0 ;;
+  esac
+done
+[ "$CAL_OK" = 1 ] && ok "positive calibration: both team Firecracker processes are observable before teardown"
 for id in "$IDA" "$IDB"; do
   delete_instance "$id" >/dev/null 2>&1 || bad "delete $id failed"
   wait_gone "$id" 40 >/dev/null 2>&1 || bad "$id did not stop"
 done
-if fc_procs "$IDA" | grep -q . || fc_procs "$IDB" | grep -q .; then
+PROBE_BAD=0
+PROBE_REMAIN=0
+for id in "$IDA" "$IDB"; do
+  fc_procs "$id"
+  case "$?" in
+    0) [ -z "$FC_PROCS" ] || PROBE_REMAIN=1 ;;
+    *) PROBE_BAD=1; bad "could not enumerate firecracker processes after teardown (${FC_PROCS_ERROR:-probe error})" ;;
+  esac
+done
+if [ "$PROBE_BAD" = 1 ]; then
+  bad "cannot claim both team VMs were destroyed: enumeration failed"
+elif [ "$PROBE_REMAIN" = 1 ]; then
   bad "a firecracker process survived teardown"
 else
   ok "both team VMs were destroyed"

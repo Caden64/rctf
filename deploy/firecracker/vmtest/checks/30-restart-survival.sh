@@ -29,6 +29,14 @@ GUEST=$(lease_guest_ip "$ID")
 TAP=$(lease_tap "$ID")
 AGENT1=$(agent_main_pid)
 echo "  fc pid=$PID guest=$GUEST tap=$TAP agent=$AGENT1"
+if link_exists "$TAP"; then
+  ok "positive calibration: tap $TAP is observable while the VM runs"
+else
+  case "$LINK_STATE" in
+    absent) bad "positive calibration failed: tap $TAP is absent while the VM runs" ;;
+    *) bad "positive calibration failed: could not observe tap $TAP (${LINK_ERROR:-probe error})" ;;
+  esac
+fi
 if [ -z "$PID" ]; then bad "agent state has no vm.pid"; finish; exit 1; fi
 
 # Assert the durable sidecar and the live process agree. This is the strict
@@ -212,8 +220,19 @@ else
 fi
 sleep 1
 if [ -e "$JAILBASE/$ID" ]; then bad "jail dir still present after cleanup"; else ok "jail dir removed after cleanup"; fi
-if ip link show dev "$TAP" >/dev/null 2>&1; then bad "tap still present after cleanup"; else ok "tap removed after cleanup"; fi
-if fc_procs "$ID" | grep -q .; then bad "a firecracker process for $ID survived cleanup"; else ok "no firecracker process for $ID remains"; fi
+link_exists "$TAP"
+case "$?" in
+  0) bad "tap still present after cleanup" ;;
+  1) ok "tap removed after cleanup" ;;
+  *) bad "could not observe tap $TAP after cleanup (${LINK_ERROR:-probe error}); cannot claim it was removed" ;;
+esac
+fc_procs "$ID"
+case "$?" in
+  0)
+    if [ -n "$FC_PROCS" ]; then bad "a firecracker process for $ID survived cleanup"; else ok "no firecracker process for $ID remains"; fi
+    ;;
+  *) bad "could not enumerate firecracker processes (${FC_PROCS_ERROR:-probe error}); cannot claim cleanup" ;;
+esac
 
 api_code DELETE "/v1/instances/$ID" >/dev/null 2>&1 || true
 echo

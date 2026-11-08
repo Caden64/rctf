@@ -103,19 +103,30 @@ else
   fail_observation stateRunning
 fi
 
-# Fail closed: -1 means "could not observe the nftables table", which is NOT
-# the same as "no per-lease rules". Only a successful read of the agent's own
-# table (or proof that the table does not exist) may report 0.
+# Fail closed: -1 means "could not observe the nftables tables", which is NOT
+# the same as "no per-lease rules". Only a successful read of BOTH agent-owned
+# tables (inet rctf_fc and arp rctf_fc_arp, or proof that a table does not
+# exist) may report 0.
 nft_leases=-1
 if command -v nft >/dev/null 2>&1; then
+  nft_ok=1
   if nft_tables=$(nft list tables 2>/dev/null); then
-    if printf '%s\n' "$nft_tables" | grep -qx 'table inet rctf_fc'; then
-      if nft_out=$(nft list table inet rctf_fc 2>/dev/null); then
-        nft_leases=$(printf '%s\n' "$nft_out" | grep -Ec 'fctap[0-9]+' || true)
+    total=0
+    for spec in "inet rctf_fc" "arp rctf_fc_arp"; do
+      fam=${spec%% *}
+      tab=${spec#* }
+      if printf '%s\n' "$nft_tables" | grep -qx "table $fam $tab"; then
+        if nft_out=$(nft list table "$fam" "$tab" 2>/dev/null); then
+          c=$(printf '%s\n' "$nft_out" | grep -Ec 'fctap[0-9]+' || true)
+          total=$((total + ${c:-0}))
+        else
+          nft_ok=0
+        fi
       fi
-    else
-      nft_leases=0
-    fi
+    done
+    [ "$nft_ok" -eq 1 ] && nft_leases=$total
+  else
+    nft_ok=0
   fi
 fi
 [ "$nft_leases" -ge 0 ] || fail_observation nftLeaseRules

@@ -144,10 +144,29 @@ else
     'net.ipv4.ip_forward = 1' >"${SYSCTL_FILE}"
   chmod 0644 "${SYSCTL_FILE}"
 fi
-sysctl --system >/dev/null
+# Apply ONLY the file this script installed. `sysctl --system` would also
+# apply every other /etc/sysctl.d, /run/sysctl.d and /usr/lib/sysctl.d file,
+# silently changing unrelated host tunables (and making this setup non-local).
+log "applying ${SYSCTL_FILE} only (no other sysctl file is touched)"
+sysctl -q -p "${SYSCTL_FILE}" >/dev/null
+# Verify every intended setting from that same file, not just ip_forward.
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%%#*}
+  line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$line" ] || continue
+  case "$line" in *"="*) ;; *) continue ;; esac
+  key=$(printf '%s' "$line" | cut -d= -f1 | tr -d '[:space:]')
+  want=$(printf '%s' "$line" | cut -d= -f2- |
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [ -n "$key" ] && [ -n "$want" ] || die "unparsable setting in ${SYSCTL_FILE}: $line"
+  got=$(sysctl -n "$key" 2>/dev/null) ||
+    die "could not read $key after applying ${SYSCTL_FILE}"
+  [ "$got" = "$want" ] ||
+    die "$key is $got after applying ${SYSCTL_FILE}, expected $want"
+  log "$key=$got"
+done <"${SYSCTL_FILE}"
 IP_FORWARD="$(sysctl -n net.ipv4.ip_forward)"
 [ "${IP_FORWARD}" = "1" ] || die "net.ipv4.ip_forward is ${IP_FORWARD}, expected 1"
-log "net.ipv4.ip_forward=1"
 
 # ---------------------------------------------------------------------------
 # Summary

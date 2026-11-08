@@ -28,12 +28,29 @@ Ordering (the point of this file):
 
 There is deliberately no second PID-based signal path.
 
-Exit codes: 0 handled, 1 no authenticated process (stale pidfile), 2 usage,
-3 observation failure (pidfd/proc could not be read; nothing was signalled).
+Pidfile format (version=3) records the kernel boot id, the process start ticks,
+the canonical executable, the run-specific argv and the PID-namespace identity
+(/proc/<pid>/ns/pid).  The namespace is part of the identity: the same PID in a
+different PID namespace is a different process even when the other fields were
+copied onto it.
+
+Exit codes (the callers must keep them distinct; an observation failure is
+never the same outcome as a stale pidfile):
+
+  0  the recorded process authenticated (verify) or was handled (stop/kill)
+  1  definitely dead/stale: the pidfile is missing, the process is gone, or
+     the record predates this boot; no process can be this record
+  4  identity mismatch: a process with that PID exists but its start ticks,
+     executable, PID namespace, kind or argv do not match the record. Nothing
+     was signalled; the pidfile must be KEPT because the live process may be
+     the VM whose record was replaced
+  2  usage error / pidfd support missing (nothing was signalled)
+  3  observation failure: the identity could not be read (pidfd, /proc, pid
+     namespace); nothing was signalled and the pidfile must be kept
 
 The --test-hook options exist only for the unprivileged decoy self-tests in
-both vm.sh scripts; they let a test simulate a PID reuse race without needing
-to actually recycle a PID:
+both vm.sh scripts; they let a test simulate a PID reuse race or an
+observation failure without needing to really break /proc:
 
   start-delta-after-validate=N   pretend the live start ticks changed by N
                                  between validation and the signal; the helper
@@ -42,6 +59,9 @@ to actually recycle a PID:
                                  the pidfile to PID after validation; the
                                  helper must still signal only through the
                                  pidfd opened before (never PID).
+  force-probe-error              fail the observation before reading the
+                                 pidfile (exit 3); callers must keep the
+                                 pidfile and any resource it protects.
 """
 
 from __future__ import annotations
@@ -66,6 +86,10 @@ class Stale(Exception):
     """The pidfile does not describe a live, authenticated process."""
 
 
+class IdentityMismatch(Stale):
+    """A process exists at the recorded PID but is not the recorded one."""
+
+
 class ProbeError(Exception):
     """The observation itself failed; nothing was signalled."""
 
@@ -76,6 +100,13 @@ def current_boot_id() -> str:
             return f.read().strip()
     except OSError as error:
         raise ProbeError(f"could not read the current boot id: {error}") from error
+
+
+def current_pid_ns() -> str:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError as error:
+        raise ProbeError(f"could not read the current pid namespace: {error}") from error
 
 
 def parse_pidfile(path: str) -> dict:
@@ -94,9 +125,19 @@ def parse_pidfile(path: str) -> dict:
         "boot_id": "",
         "start_ticks": "",
         "exe": "",
+        "pid_ns": "",
         "args": [],
     }
-    known = {"version", "kind", "pid", "boot_id", "start_ticks", "exe", "arg"}
+    known = {
+        "version",
+        "kind",
+        "pid",
+        "boot_id",
+        "start_ticks",
+        "exe",
+        "pid_ns",
+        "arg",
+    }
     for line in lines:
         if line == "":
             continue
@@ -112,14 +153,14 @@ def parse_pidfile(path: str) -> dict:
         else:
             record[key] = value
 
-    if record["version"] != "2":
+    if record["version"] != "3":
         raise Stale(
             f"unsupported pidfile version '{record['version'] or 'none'}'"
         )
     pid = record["pid"]
     if not pid.isdigit():
         raise Stale(f"invalid pid '{pid}'")
-    for field in ("boot_id", "start_ticks", "exe"):
+    for field in ("boot_id", "start_ticks", "exe", "pid_ns"):
         if record[field] == "":
             raise Stale(f"recorded field '{field}' is empty; cannot authenticate")
     recorded_boot = record["boot_id"]
@@ -128,6 +169,13 @@ def parse_pidfile(path: str) -> dict:
         raise Stale(
             f"recorded boot id '{recorded_boot}' != current '{live_boot}' "
             "(stale after reboot)"
+        )
+    recorded_ns = record["pid_ns"]
+    live_ns = current_pid_ns()
+    if recorded_ns != live_ns:
+        raise Stale(
+            f"recorded pid namespace '{recorded_ns}' != current '{live_ns}' "
+            "(different PID namespace)"
         )
     record["pid"] = int(pid)
     return record
@@ -179,6 +227,17 @@ def read_cmdline(pid: int) -> list[str] | None:
     return [os.fsdecode(part) for part in raw.split(b"\0") if part]
 
 
+def read_pid_ns(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/ns/pid")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return None
+        raise ProbeError(f"could not read /proc/{pid}/ns/pid: {error}") from error
+
+
 def open_and_authenticate(
     record: dict, required_args: list[str], expected_kind: str
 ) -> int:
@@ -188,7 +247,9 @@ def open_and_authenticate(
     the pidfile as stale) or ProbeError (observation failed).
     """
     if record["kind"] != expected_kind:
-        raise Stale(f"kind is '{record['kind']}', expected '{expected_kind}'")
+        raise IdentityMismatch(
+            f"kind is '{record['kind']}', expected '{expected_kind}'"
+        )
     pid = record["pid"]
 
     # 1. Pin the current occupant of the PID before looking at anything else.
@@ -205,7 +266,7 @@ def open_and_authenticate(
         if live_start is None:
             raise Stale(f"pid {pid} is not running")
         if live_start != record["start_ticks"]:
-            raise Stale(
+            raise IdentityMismatch(
                 f"pid {pid} start ticks '{record['start_ticks']}' != live "
                 f"'{live_start}' (pid reused)"
             )
@@ -213,21 +274,29 @@ def open_and_authenticate(
         if live_exe is None:
             raise Stale(f"pid {pid} is not running")
         if live_exe != record["exe"]:
-            raise Stale(
+            raise IdentityMismatch(
                 f"pid {pid} executable '{record['exe']}' != live '{live_exe}'"
+            )
+        live_ns = read_pid_ns(pid)
+        if live_ns is None:
+            raise Stale(f"pid {pid} is not running")
+        if live_ns != record["pid_ns"]:
+            raise IdentityMismatch(
+                f"pid {pid} pid namespace '{record['pid_ns']}' != live "
+                f"'{live_ns}' (different PID namespace)"
             )
         live_argv = read_cmdline(pid)
         if live_argv is None:
             raise Stale(f"pid {pid} is not running")
         for needle in required_args:
             if needle not in live_argv:
-                raise Stale(
+                raise IdentityMismatch(
                     f"pid {pid} cmdline lacks required argument '{needle}' "
                     "(not this VM_DIR)"
                 )
         for needle in record["args"]:
             if needle not in live_argv:
-                raise Stale(
+                raise IdentityMismatch(
                     f"pid {pid} cmdline lacks recorded argument '{needle}'"
                 )
     except Stale:
@@ -243,6 +312,11 @@ def parse_hooks(raw_hooks: list[str]) -> dict:
     hooks: dict = {}
     for raw in raw_hooks:
         name, sep, value = raw.partition("=")
+        if name == "force-probe-error":
+            if sep:
+                raise ValueError(f"test hook '{name}' takes no value")
+            hooks[name] = True
+            continue
         if name not in ("start-delta-after-validate", "reuse-after-validate"):
             raise ValueError(f"unknown test hook '{raw}'")
         if name == "start-delta-after-validate":
@@ -267,7 +341,7 @@ def final_identity_check(pid: int, record: dict, signame: str, hooks: dict) -> N
     if live is None:
         raise Stale(f"pid {pid} is not running before {signame}")
     if live != record["start_ticks"]:
-        raise Stale(
+        raise IdentityMismatch(
             f"pid {pid} changed identity before {signame}; not signalling "
             f"(pid reused: start ticks '{record['start_ticks']}' != live '{live}')"
         )
@@ -400,6 +474,10 @@ def main(argv: list[str]) -> int:
         return 2
 
     try:
+        if hooks.get("force-probe-error"):
+            raise ProbeError(
+                "simulated observation failure (test hook): nothing was signalled"
+            )
         record = parse_pidfile(args.pidfile)
         if args.action == "verify":
             do_verify(record, args.require_arg, args.kind)
@@ -421,6 +499,9 @@ def main(argv: list[str]) -> int:
                 getattr(signal, args.signal),
                 hooks,
             )
+    except IdentityMismatch as error:
+        eprint(str(error))
+        return 4
     except Stale as error:
         eprint(str(error))
         return 1

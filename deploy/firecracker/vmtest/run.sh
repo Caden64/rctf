@@ -40,11 +40,13 @@ cleanup() {
   if [ "${KEEP_VM:-0}" != 1 ]; then
     say "==> stopping VM"
     "$HERE/vm.sh" stop >>"$LOG" 2>&1 || true
-    if "$HERE/vm.sh" status >>"$LOG" 2>&1; then
-      say "WARNING: VM is still running after stop"
-    else
-      say "VM stopped; nothing left running."
-    fi
+    status_rc=0
+    "$HERE/vm.sh" status >>"$LOG" 2>&1 || status_rc=$?
+    case "$status_rc" in
+      0) say "WARNING: VM is still running after stop; keeping $VM_DIR/overlay.qcow2" ;;
+      1) say "VM stopped; nothing left running." ;;
+      *) say "WARNING: VM state could not be observed after stop; keeping $VM_DIR/overlay.qcow2" ;;
+    esac
   else
     say "KEEP_VM=1: leaving the VM running at 127.0.0.1:$VM_SSH_PORT"
   fi

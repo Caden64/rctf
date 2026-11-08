@@ -16,7 +16,12 @@ systemctl stop rctf-firecracker-agent >/dev/null 2>&1 || true
 systemctl disable rctf-firecracker-agent >/dev/null 2>&1 || true
 rm -rf /var/lib/rctf-firecracker /srv/jailer /etc/traefik/dynamic/rctf-firecracker \
   /etc/rctf-firecracker /etc/sysctl.d/90-rctf-firecracker.conf
+rm -f /etc/sysctl.d/99-vmtest-unrelated.conf
 sysctl -qw net.ipv4.ip_forward=0 2>/dev/null || true
+# An unrelated sysctl drop-in that `sysctl --system` WOULD apply. The shipped
+# script must apply only the file it installs, so this value must stay 0.
+printf 'net.ipv4.conf.all.log_martians = 1\n' >/etc/sysctl.d/99-vmtest-unrelated.conf
+sysctl -qw net.ipv4.conf.all.log_martians=0 2>/dev/null || true
 
 # --- 1. run it exactly as shipped ------------------------------------------
 set +e
@@ -81,6 +86,9 @@ else
 fi
 expect_eq "$(sysctl -n net.ipv4.ip_forward)" 1 "net.ipv4.ip_forward=1 applied"
 expect_eq "$(sysctl -n net.ipv4.conf.all.rp_filter)" 1 "net.ipv4.conf.all.rp_filter=1 applied"
+expect_eq "$(sysctl -n net.ipv4.conf.default.rp_filter)" 1 "net.ipv4.conf.default.rp_filter=1 applied"
+expect_eq "$(sysctl -n net.ipv4.conf.all.log_martians)" 0 \
+  "host-setup applies only its own sysctl file (the unrelated 99- drop-in was not applied)"
 
 # --- 5. idempotent rerun ---------------------------------------------------
 before=$(stat -c '%a %U %G' /var/lib/rctf-firecracker/state /srv/jailer /var/lib/rctf-firecracker/images)
@@ -92,6 +100,11 @@ after=$(stat -c '%a %U %G' /var/lib/rctf-firecracker/state /srv/jailer /var/lib/
 expect_eq "$RERUN_CODE" 0 "host-setup.sh rerun exits 0 (idempotent)"
 expect_eq "$after" "$before" "directory modes/owners unchanged by the rerun"
 expect_eq "$(sysctl -n net.ipv4.ip_forward)" 1 "ip_forward still 1 after rerun"
+expect_eq "$(sysctl -n net.ipv4.conf.all.log_martians)" 0 \
+  "the unrelated sysctl drop-in is still not applied after the rerun"
+expect_eq "$(sysctl -n net.ipv4.conf.default.rp_filter)" 1 \
+  "default.rp_filter still 1 after rerun"
+rm -f /etc/sysctl.d/99-vmtest-unrelated.conf
 
 # --- provisioning for later checks (not assertions) ------------------------
 mkdir -p "$IMAGES/smoke" "$IMAGES/vmtest"

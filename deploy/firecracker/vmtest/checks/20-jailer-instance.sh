@@ -309,6 +309,24 @@ fi
 rm -f "$BIN_CANARY"
 
 # --- delete / teardown -----------------------------------------------------
+# Positive calibration while the resources must exist: the same probes used
+# below must observe them now. A probe failure here is a failure, not a pass.
+if link_exists "$TAP"; then
+  ok "positive calibration: tap $TAP is present before delete"
+else
+  case "$LINK_STATE" in
+    absent) bad "positive calibration failed: tap $TAP is already absent before delete" ;;
+    *) bad "positive calibration failed: could not observe tap $TAP (${LINK_ERROR:-probe error})" ;;
+  esac
+fi
+if nft_table_grep inet rctf_fc "$GUEST"; then
+  [ "$NFT_STATE" = match ] &&
+    ok "positive calibration: the nftables table lists the live guest IP before delete" ||
+    bad "positive calibration failed: nftables does not list $GUEST before delete (state=$NFT_STATE)"
+else
+  bad "positive calibration failed: could not read inet rctf_fc (${NFT_ERROR:-probe error})"
+fi
+
 CODE=$(api_code DELETE "/v1/instances/$ID")
 echo "  delete: HTTP $CODE $(api_body | head -c 200)"
 expect_eq "$CODE" 200 "delete accepted"
@@ -320,17 +338,32 @@ if kill -0 "$PID" 2>/dev/null; then bad "firecracker process survived delete"; e
 fi
 if [ -e "$JAILBASE/$ID" ]; then bad "jail directory still exists"; else ok "jail directory removed"; fi
 if [ -e "$CGROUP" ]; then bad "cgroup still exists"; else ok "per-instance cgroup removed"; fi
-if ip link show dev "$TAP" >/dev/null 2>&1; then bad "tap $TAP still exists"; else ok "tap $TAP removed"; fi
-if nft list table inet rctf_fc 2>/dev/null | grep -qF "$GUEST"; then
-  bad "nftables still references the released guest IP"
-else
-  ok "nftables rules for the released guest IP removed"
-fi
-if nft list table inet rctf_fc 2>/dev/null | grep -qF "$TAP"; then
-  bad "nftables still references the removed tap"
-else
-  ok "nftables rules for the removed tap removed"
-fi
+link_exists "$TAP"
+case "$?" in
+  0) bad "tap $TAP still exists" ;;
+  1) ok "tap $TAP removed" ;;
+  *) bad "could not observe tap $TAP after delete (${LINK_ERROR:-probe error}); cannot claim it was removed" ;;
+esac
+nft_table_grep inet rctf_fc "$GUEST"
+case "$?" in
+  0)
+    case "$NFT_STATE" in
+      match) bad "nftables still references the released guest IP" ;;
+      absent | missing) ok "nftables rules for the released guest IP removed" ;;
+    esac
+    ;;
+  *) bad "could not read inet rctf_fc after delete (${NFT_ERROR:-probe error}); cannot claim the guest rules were removed" ;;
+esac
+nft_table_grep inet rctf_fc "$TAP"
+case "$?" in
+  0)
+    case "$NFT_STATE" in
+      match) bad "nftables still references the removed tap" ;;
+      absent | missing) ok "nftables rules for the removed tap removed" ;;
+    esac
+    ;;
+  *) bad "could not read inet rctf_fc after delete (${NFT_ERROR:-probe error}); cannot claim the tap rules were removed" ;;
+esac
 
 # --- fencing ---------------------------------------------------------------
 make_spec "$SPEC" "$ID" vmtest true "rctf{fence-check}" "" ""

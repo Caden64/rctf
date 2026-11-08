@@ -317,8 +317,95 @@ assert_instance_no_caps() { # assert_instance_no_caps <rootpid> <label>
 
 # A firecracker process is identified by the exact process name and --id, never
 # by a command line that merely mentions the id (the check's own shell does).
+# Returns 0 with FC_PROCS set (possibly empty) when enumeration succeeded, 2
+# when pgrep itself failed. pgrep exit 1 is the legitimate "no match".
+FC_PROCS=
+FC_PROCS_ERROR=
 fc_procs() { # fc_procs <id>
-  pgrep -a -x firecracker 2>/dev/null | grep -- "--id $1 " || true
+  local out rc
+  FC_PROCS=
+  FC_PROCS_ERROR=
+  out=$(pgrep -a -x firecracker 2>/dev/null) || rc=$?
+  rc=${rc:-0}
+  case "$rc" in
+    0)
+      FC_PROCS=$(printf '%s\n' "$out" | grep -F -- "--id $1 " || true)
+      return 0
+      ;;
+    1) return 0 ;;
+    *)
+      FC_PROCS_ERROR="pgrep -a -x firecracker exited $rc"
+      return 2
+      ;;
+  esac
+}
+
+# Tri-state link observation: 0 present, 1 absent, 2 probe failure.
+# `ip link show dev X` exits 1 with "does not exist" for a missing interface;
+# any other failure is an observation failure and must not pass as absence.
+LINK_STATE=
+link_exists() { # link_exists <ifname>
+  local out err rc
+  err=$(mktemp)
+  out=$(ip link show dev "$1" 2>"$err") || rc=$?
+  rc=${rc:-0}
+  case "$rc" in
+    0)
+      LINK_STATE=present
+      rm -f "$err"
+      return 0
+      ;;
+    1)
+      if grep -q 'does not exist' "$err"; then
+        LINK_STATE=absent
+        rm -f "$err"
+        return 1
+      fi
+      LINK_STATE=error
+      LINK_ERROR="ip link show dev $1 exited 1: $(tr '\n' ' ' <"$err")"
+      rm -f "$err"
+      return 2
+      ;;
+    *)
+      LINK_STATE=error
+      LINK_ERROR="ip link show dev $1 exited $rc: $(tr '\n' ' ' <"$err")"
+      rm -f "$err"
+      return 2
+      ;;
+  esac
+}
+
+# Tri-state nft observation: 0 the command succeeded (NFT_STATE is match,
+# absent or missing), 2 the producer failed. "missing" is legitimate absence
+# ONLY for the specific "No such file or directory" error after teardown; any
+# other nft error is a probe failure and the check must fail, not pass.
+NFT_STATE=
+NFT_ERROR=
+nft_table_grep() { # nft_table_grep <family> <table> <fixed-needle>
+  local fam=$1 table=$2 needle=$3 out err rc
+  NFT_STATE=
+  NFT_ERROR=
+  err=$(mktemp)
+  out=$(nft list table "$fam" "$table" 2>"$err") || rc=$?
+  rc=${rc:-0}
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$err"
+    if printf '%s\n' "$out" | grep -qF -- "$needle"; then
+      NFT_STATE=match
+    else
+      NFT_STATE=absent
+    fi
+    return 0
+  fi
+  if grep -q 'No such file or directory' "$err"; then
+    NFT_STATE=missing
+    rm -f "$err"
+    return 0
+  fi
+  NFT_STATE=error
+  NFT_ERROR="nft list table $fam $table exited $rc: $(tr '\n' ' ' <"$err")"
+  rm -f "$err"
+  return 2
 }
 
 cleanup_all_instances() {
