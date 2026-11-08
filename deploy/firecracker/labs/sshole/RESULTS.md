@@ -9,7 +9,7 @@ Executed for real with `/dev/kvm` available; nothing privileged ran on the host.
 - Repo: `rCTF` fork, branch `feat/firecracker-backend`, commit `50c5f16c` plus
   this lab.
 - Lab VM: fresh Ubuntu 24.04 cloud image under nested KVM, unique per-run
-  `VM_DIR` (`~/.cache/rctf-sshole/vm/run-20261108-164044-983346`) and random
+  `VM_DIR` (`~/.cache/rctf-sshole/vm/run-20261108-164425-989705`) and random
   host ports (ssh `127.0.0.1:…`, seed `127.0.0.1:…`); the vmtest default VM
   was not touched.
 - Firecracker: v1.17.0, kernel `vmlinux-6.1.155` (shared smoke artifacts,
@@ -17,7 +17,7 @@ Executed for real with `/dev/kvm` available; nothing privileged ran on the host.
 - Command: `cd deploy/firecracker/labs/sshole && ./run.sh`
 - Result: **44 passed, 0 failed**; `run.sh` exited 0; the VM was destroyed and
   its overlay removed. Transcript:
-  `~/.cache/rctf-sshole/logs/run-20261108-164044-983346.log`.
+  `~/.cache/rctf-sshole/logs/run-20261108-164425-989705.log`.
 
 ### Images built (unprivileged)
 
@@ -27,10 +27,10 @@ no guest binary executed on the host.
 
 | Image               | Size | rootfs.ext4 sha256 (this build)                                    | build-time banner |
 | ------------------- | ---- | ------------------------------------------------------------------ | ----------------- |
-| `sshole-musl-vuln`  | 256M | `a25066e451f4bda310e62d240ffb855dfbad83e169d1e3c9329118fa6f54b27a` | `OpenSSH_10.3p1`  |
-| `sshole-musl-fixed` | 256M | `4252ab30211b1bf8ff2115131edbd98769f0087b3a766d7d7f5733bc42ce3d61` | `OpenSSH_10.6p2`  |
-| `sshole-glibc`      | 512M | `9f3efa96c7893c1ee6c518751ef544bbe2f58b4f37c13c98bc9c1a63f6558671` | `OpenSSH_9.6p1`   |
-| `sshole-pam`        | 256M | `6e0eabc5b2fdc6d88dde5112cbdb83206b10b62ded2d992ee532d444698ed9de` | `OpenSSH_10.3p1`  |
+| `sshole-musl-vuln`  | 256M | `3c481f1e3f0b592aa72bec0454b6815c1b55338a740883bc714b2585935c3f4a` | `OpenSSH_10.3p1`  |
+| `sshole-musl-fixed` | 256M | `e9376e097e956eab3cd3ffc8c5354ee1d6462628625db2937e01682564a012f3` | `OpenSSH_10.6p2`  |
+| `sshole-glibc`      | 512M | `4daca03cdb063f231fc2b7b582b2ae803a8aad4691801429a36a26126fe5d3df` | `OpenSSH_9.6p1`   |
+| `sshole-pam`        | 256M | `2af5e8db2f94f2a884dc3a2fca50fd4955f103bdca758568a9727d5fae80704d` | `OpenSSH_10.3p1`  |
 
 Bytes differ between builds (mkfs UUID/timestamps); the build-time assertions
 tie every image back to the pinned package digests and expected banner, and the
