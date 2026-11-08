@@ -355,7 +355,7 @@ export const createControllerServer = (options: ControllerServerOptions) => {
     if (inflight.size === 0) return
     let timer: ReturnType<typeof setTimeout> | undefined
     await Promise.race([
-      Promise.allSettled([...inflight]),
+      Promise.allSettled(inflight),
       new Promise<void>(resolve => {
         timer = setTimeout(resolve, timeoutMs)
       }),
