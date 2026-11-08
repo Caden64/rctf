@@ -18,11 +18,10 @@ import type { VmHandle } from '../../src/interfaces'
 import type { VmConfig } from '../../src/agent/vm/config'
 import { createVmDriver } from '../../src/agent/vm'
 import type { VmSpawn } from '../../src/agent/vm/driver'
-import { findInstanceProcesses } from '../../src/agent/vm/proc'
 import {
   FLAG_VALUE,
   clearFakeEnv,
-  exeNamesFor,
+  findDirectInstances,
   makeDirs,
   makeImage,
   makeLogger,
@@ -321,12 +320,7 @@ describe('vm launch', () => {
           h.driver.launch(makeRequest(id, 'web-demo'))
         ).rejects.toThrow(new RegExp(failPath))
         expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
-        expect(
-          await findInstanceProcesses(
-            id,
-            await exeNamesFor(h.config.firecrackerBin)
-          )
-        ).toEqual([])
+        expect(await findDirectInstances(h.config, id)).toEqual([])
         expect(await h.driver.listInstanceIds()).not.toContain(id)
       } finally {
         await teardown(h, id)
@@ -387,12 +381,7 @@ describe('vm launch', () => {
         h.driver.launch(makeRequest(id, 'web-demo'))
       ).rejects.toThrow(/API socket/)
       expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
-      expect(
-        await findInstanceProcesses(
-          id,
-          await exeNamesFor(h.config.firecrackerBin)
-        )
-      ).toEqual([])
+      expect(await findDirectInstances(h.config, id)).toEqual([])
     } finally {
       await teardown(h, id)
     }
@@ -426,12 +415,7 @@ describe('vm launch', () => {
         h.driver.launch(makeRequest(id, 'web-demo'))
       ).rejects.toThrow(/API socket/)
       expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
-      expect(
-        await findInstanceProcesses(
-          id,
-          await exeNamesFor(h.config.firecrackerBin)
-        )
-      ).toEqual([])
+      expect(await findDirectInstances(h.config, id)).toEqual([])
     } finally {
       await teardown(h, id)
     }
@@ -453,6 +437,44 @@ describe('vm launch', () => {
       /larger than/
     )
     expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
+    await teardown(h, id)
+  })
+
+  test('never logs injected exception messages (flags or JSON-escaped) on launch failure', async () => {
+    const h = await harness()
+    const id = newInstanceId()
+    await makeImage(h.config.imagesDir, 'web-demo')
+    const chunks: string[] = []
+    const logger = pino(
+      { level: 'debug' },
+      { write: (chunk: string) => chunks.push(chunk) }
+    ) as unknown as Logger
+    const escaped = FLAG_VALUE.replace('{', '\\u007b')
+    const runner = {
+      async run(): Promise<never> {
+        throw new Error(
+          `copy failed: ${FLAG_VALUE} ${JSON.stringify(FLAG_VALUE)} ${escaped}`
+        )
+      },
+    }
+    const driver = createVmDriver(h.config, {
+      runner,
+      logger,
+      spawn: spawnWithEnv,
+    })
+    let thrown = ''
+    try {
+      await driver.launch(makeRequest(id, 'web-demo'))
+    } catch (err) {
+      thrown = err instanceof Error ? err.message : String(err)
+    }
+    const logged = chunks.join('')
+    expect(thrown).toContain(FLAG_VALUE)
+    expect(logged).not.toContain(FLAG_VALUE)
+    expect(logged).not.toContain(escaped)
+    expect(logged).not.toContain('copy failed')
+    expect(logged).toContain('vm.launch')
+    expect(logged).toContain('Error')
     await teardown(h, id)
   })
 
@@ -492,7 +514,9 @@ done
 b=$(basename "$exec_file")
 dir=$base/$b/$id/root
 mkdir -p "$dir"
-"$exec_file" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
+cp "$exec_file" "$dir/$b"
+chmod 0755 "$dir/$b"
+"$dir/$b" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
 printf '%s\\n' "$!" > "$dir/$b.pid"
 `,
       { mode: 0o755 }
