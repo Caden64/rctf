@@ -20,7 +20,6 @@ import type {
 import type { Clock } from '../interfaces'
 
 export type InstanceState =
-  | 'reserving'
   | 'creating'
   | 'running'
   | 'deleting'
@@ -33,7 +32,6 @@ export type InstanceState =
  * confirms the teardown; `errored` and `lost` are terminal-until-delete.
  */
 export const LIVE_STATES: readonly InstanceState[] = [
-  'reserving',
   'creating',
   'running',
   'deleting',
@@ -108,6 +106,8 @@ export interface HostRecord {
   createdAtMs: number
   /** Last capacity reported by the agent; effective capacity is min(config, this). */
   reportedCapacity: Capacity | null
+  /** Estimated (agent - controller) clock offset in ms, RTT compensated. */
+  clockSkewMs: number
 }
 
 export interface InstanceKeyRow {
@@ -147,6 +147,7 @@ interface HostDbRow {
   reported_mem_mib: number | null
   reported_disk_mib: number | null
   reported_max_instances: number | null
+  clock_skew_ms: number
 }
 
 interface Migration {
@@ -195,11 +196,27 @@ const MIGRATIONS: readonly Migration[] = [
       -- One live instance per (team, challenge), even under concurrent creates.
       CREATE UNIQUE INDEX IF NOT EXISTS instances_live_key
         ON instances(team_id, challenge_integration_id)
-        WHERE state IN ('reserving', 'creating', 'running', 'deleting');
+        WHERE state IN ('creating', 'running', 'deleting');
 
       CREATE INDEX IF NOT EXISTS instances_host_idx ON instances(host_id);
       CREATE INDEX IF NOT EXISTS instances_state_expiry_idx
         ON instances(state, expires_at_ms);
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE hosts ADD COLUMN clock_skew_ms INTEGER NOT NULL DEFAULT 0;
+
+      -- 'reserving' was never written; keep the live index in sync with
+      -- LIVE_STATES and re-assert it for databases created by v1.
+      DROP INDEX IF EXISTS instances_live_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS instances_live_key
+        ON instances(team_id, challenge_integration_id)
+        WHERE state IN ('creating', 'running', 'deleting');
+
+      CREATE INDEX IF NOT EXISTS instances_key_idx
+        ON instances(team_id, challenge_integration_id, state);
     `,
   },
 ]
@@ -259,6 +276,7 @@ const rowToHost = (row: HostDbRow): HostRecord => ({
           diskMiB: row.reported_disk_mib,
           maxInstances: row.reported_max_instances,
         },
+  clockSkewMs: row.clock_skew_ms ?? 0,
 })
 
 const placeholders = (count: number): string =>
@@ -383,6 +401,8 @@ export class Store {
       now: number
       accepting: boolean
       capacity: Capacity
+      /** Estimated (agent - controller) clock offset in ms. */
+      skewMs?: number
     }
   ): void {
     this.db
@@ -390,8 +410,8 @@ export class Store {
         `INSERT INTO hosts (
            id, url, created_at_ms, health, accepting, last_seen_ms,
            reported_vcpus, reported_mem_mib, reported_disk_mib,
-           reported_max_instances
-         ) VALUES (?, ?, ?, 'healthy', ?, ?, ?, ?, ?, ?)
+           reported_max_instances, clock_skew_ms
+         ) VALUES (?, ?, ?, 'healthy', ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            health = 'healthy',
            accepting = excluded.accepting,
@@ -399,7 +419,8 @@ export class Store {
            reported_vcpus = excluded.reported_vcpus,
            reported_mem_mib = excluded.reported_mem_mib,
            reported_disk_mib = excluded.reported_disk_mib,
-           reported_max_instances = excluded.reported_max_instances`
+           reported_max_instances = excluded.reported_max_instances,
+           clock_skew_ms = excluded.clock_skew_ms`
       )
       .run(
         id,
@@ -410,7 +431,8 @@ export class Store {
         opts.capacity.vcpus,
         opts.capacity.memMiB,
         opts.capacity.diskMiB,
-        opts.capacity.maxInstances
+        opts.capacity.maxInstances,
+        Math.round(opts.skewMs ?? 0)
       )
   }
 
@@ -424,12 +446,17 @@ export class Store {
       .run(draining ? 1 : 0, id)
   }
 
-  removeHost(id: string): void {
-    this.transaction(() => {
-      // Instances are removed explicitly (not only via ON DELETE CASCADE) so
-      // the caller can observe what was forgotten.
-      this.db.prepare('DELETE FROM instances WHERE host_id = ?').run(id)
-      this.db.prepare('DELETE FROM hosts WHERE id = ?').run(id)
+  /**
+   * Operator removal of a lost host: write its live rows off as `lost`
+   * tombstones (cleanup happens if/when the agent returns) and leave the host
+   * draining so config seeding/heartbeats can never put it back into service.
+   * `service.removeHost` enforces that only `unhealthy` hosts are removable.
+   */
+  removeHost(id: string, now = this.now()): string[] {
+    return this.transaction(() => {
+      const ids = this.writeOffHostUnsafe(id, now)
+      this.db.prepare('UPDATE hosts SET draining = 1 WHERE id = ?').run(id)
+      return ids
     })
   }
 
@@ -532,6 +559,40 @@ export class Store {
     return rows.map(rowToInstance)
   }
 
+  /** Terminal `errored` rows for one key; GC'd before a fresh create. */
+  listErroredForKey(key: InstanceKeyRow): InstanceRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${INSTANCE_COLUMNS} FROM instances
+         WHERE team_id = ? AND challenge_integration_id = ? AND state = 'errored'
+         ORDER BY created_at_ms ASC`
+      )
+      .all(key.teamId, key.challengeIntegrationId) as InstanceDbRow[]
+    return rows.map(rowToInstance)
+  }
+
+  /**
+   * `errored` rows superseded by a newer row for the same key. They are no
+   * longer visible as the key's instance and must not keep an agent-side
+   * tombstone forever.
+   */
+  listSupersededErrored(): InstanceRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${INSTANCE_COLUMNS} FROM instances e
+         WHERE e.state = 'errored'
+           AND EXISTS (
+             SELECT 1 FROM instances n
+             WHERE n.team_id = e.team_id
+               AND n.challenge_integration_id = e.challenge_integration_id
+               AND n.id <> e.id
+               AND n.created_at_ms >= e.created_at_ms
+           )`
+      )
+      .all() as InstanceDbRow[]
+    return rows.map(rowToInstance)
+  }
+
   listExpiredRunning(now: number): InstanceRecord[] {
     const rows = this.db
       .prepare(
@@ -565,6 +626,43 @@ export class Store {
     patch: StatePatch = {}
   ): boolean {
     if (from.length === 0) return false
+    return this.applyStateUpdate(
+      `id = ? AND state IN (${placeholders(from.length)})`,
+      [id, ...from],
+      to,
+      now,
+      patch
+    )
+  }
+
+  /**
+   * CAS against a row snapshot read earlier (`state` + `updated_at_ms`).
+   * Used whenever a decision was made from data fetched before a network
+   * round-trip: if anything changed the row in the meantime, the update is a
+   * no-op instead of clobbering newer ownership.
+   */
+  casStateSnapshot(
+    snapshot: InstanceRecord,
+    to: InstanceState,
+    now: number,
+    patch: StatePatch = {}
+  ): boolean {
+    return this.applyStateUpdate(
+      'id = ? AND state = ? AND updated_at_ms = ?',
+      [snapshot.id, snapshot.state, snapshot.updatedAtMs],
+      to,
+      now,
+      patch
+    )
+  }
+
+  private applyStateUpdate(
+    where: string,
+    whereParams: (string | number)[],
+    to: InstanceState,
+    now: number,
+    patch: StatePatch
+  ): boolean {
     const sets = ['state = ?', 'updated_at_ms = ?']
     const params: (string | number | null)[] = [to, now]
     if (patch.message !== undefined) {
@@ -581,19 +679,17 @@ export class Store {
       sets.push('agent_expiry_synced = ?')
       params.push(patch.agentExpirySynced ? 1 : 0)
     }
-    params.push(id, ...from)
     const result = this.db
-      .prepare(
-        `UPDATE instances SET ${sets.join(', ')}
-         WHERE id = ? AND state IN (${placeholders(from.length)})`
-      )
-      .run(...params)
+      .prepare(`UPDATE instances SET ${sets.join(', ')} WHERE ${where}`)
+      .run(...params, ...whereParams)
     return result.changes > 0
   }
 
   /**
    * Extend CAS: only succeeds while the row is still live with a future
-   * deadline. The reaper races this in another transaction; exactly one wins.
+   * deadline. The deadline is monotonic (`MAX(old, new)`) so competing or
+   * out-of-order extension pushes can never shorten an instance's life.
+   * The reaper races this in another transaction; exactly one wins.
    */
   updateExpiry(
     id: string,
@@ -605,7 +701,8 @@ export class Store {
     const result = this.db
       .prepare(
         `UPDATE instances
-         SET expires_at_ms = ?, updated_at_ms = ?, agent_expiry_synced = 0
+         SET expires_at_ms = MAX(expires_at_ms, ?), updated_at_ms = ?,
+             agent_expiry_synced = 0
          WHERE id = ? AND state IN (${placeholders(from.length)})
            AND expires_at_ms > ?`
       )
@@ -627,12 +724,6 @@ export class Store {
         )
         .run(synced ? 1 : 0, id, expiresAtMs).changes > 0
     )
-  }
-
-  setExpirySynced(id: string, synced: boolean): void {
-    this.db
-      .prepare('UPDATE instances SET agent_expiry_synced = ? WHERE id = ?')
-      .run(synced ? 1 : 0, id)
   }
 
   /** Claim an expired running row for deletion; returns false if it was extended first. */
@@ -692,26 +783,28 @@ export class Store {
    * as tombstones so the reconciler can delete the agent side when it returns.
    */
   writeOffHost(hostId: string, now: number): string[] {
-    return this.transaction(() => {
-      const rows = this.db
+    return this.transaction(() => this.writeOffHostUnsafe(hostId, now))
+  }
+
+  private writeOffHostUnsafe(hostId: string, now: number): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${INSTANCE_COLUMNS} FROM instances
+         WHERE host_id = ? AND state IN (${placeholders(LIVE_STATES.length)})`
+      )
+      .all(hostId, ...LIVE_STATES) as InstanceDbRow[]
+    const ids: string[] = []
+    for (const row of rows) {
+      const result = this.db
         .prepare(
-          `SELECT ${INSTANCE_COLUMNS} FROM instances
-           WHERE host_id = ? AND state IN (${placeholders(LIVE_STATES.length)})`
+          `UPDATE instances
+           SET state = 'lost', updated_at_ms = ?,
+               message = 'host lost'
+           WHERE id = ? AND state = ?`
         )
-        .all(hostId, ...LIVE_STATES) as InstanceDbRow[]
-      const ids: string[] = []
-      for (const row of rows) {
-        const result = this.db
-          .prepare(
-            `UPDATE instances
-             SET state = 'lost', updated_at_ms = ?,
-                 message = 'host lost'
-             WHERE id = ? AND state = ?`
-          )
-          .run(now, row.id, row.state)
-        if (result.changes > 0) ids.push(row.id)
-      }
-      return ids
-    })
+        .run(now, row.id, row.state)
+      if (result.changes > 0) ids.push(row.id)
+    }
+    return ids
   }
 }

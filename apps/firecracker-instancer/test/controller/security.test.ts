@@ -33,6 +33,7 @@ describe('controller persistence security', () => {
       diskMiB: 4096,
       maxInstances: 10,
     })
+    agent.setClock(clock.now)
     const config = makeConfig(dir, [makeHost('host-a')])
     const service = createControllerService(config, {
       clients: { 'host-a': agent },

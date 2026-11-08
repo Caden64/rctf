@@ -13,6 +13,7 @@ import {
   type Clock,
 } from '../interfaces'
 import type { Logger } from '../log'
+import { isConfirmedGone } from './agent-client'
 import { Store } from './store'
 
 export interface ReaperDeps {
@@ -71,6 +72,10 @@ export class Reaper {
         await client.delete(id)
         if (store.deleteInstanceIfState(id, 'deleting')) removed.push(id)
       } catch (error) {
+        if (isConfirmedGone(error)) {
+          if (store.deleteInstanceIfState(id, 'deleting')) removed.push(id)
+          continue
+        }
         if (error instanceof AgentUnreachableError) {
           logger.warn(
             { instanceId: id, hostId: row.hostId },

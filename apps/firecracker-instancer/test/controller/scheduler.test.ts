@@ -4,6 +4,7 @@ import {
   checkFit,
   describeNoCapacity,
   effectiveCapacity,
+  isPlaceable,
   selectHost,
   type PlacementCandidate,
 } from '../../src/controller/scheduler'
@@ -18,6 +19,7 @@ const host = (id: string, overrides: Partial<HostRecord> = {}): HostRecord => ({
   lastSeenMs: 1000,
   createdAtMs: 0,
   reportedCapacity: null,
+  clockSkewMs: 0,
   ...overrides,
 })
 
@@ -36,6 +38,7 @@ const candidate = (
   overrides: {
     record?: Partial<HostRecord>
     capacity?: Partial<HostConfig['capacity']>
+    maxClockSkewMs?: number
   } = {}
 ): PlacementCandidate => ({
   config: config(id, {
@@ -53,6 +56,7 @@ const candidate = (
     instances: 0,
     ...reserved,
   },
+  maxClockSkewMs: overrides.maxClockSkewMs,
 })
 
 const request = { vcpus: 1, memMiB: 256, diskMiB: 128 }
@@ -114,20 +118,23 @@ describe('scheduler', () => {
     expect(message).not.toContain('http://')
   })
 
-  test('explains draining and unhealthy hosts', () => {
-    expect(
-      describeNoCapacity(
-        [candidate('a', {}, { record: { draining: true } })],
-        request,
-        overcommit
-      )
-    ).toContain('draining')
-    expect(
-      describeNoCapacity(
-        [candidate('a', {}, { record: { health: 'unhealthy' } })],
-        request,
-        overcommit
-      )
-    ).toContain('unhealthy')
+  test('excludes hosts beyond the maximum clock skew with a clear message', () => {
+    const skewed = candidate(
+      'a',
+      {},
+      { record: { clockSkewMs: 20_000 }, maxClockSkewMs: 10_000 }
+    )
+    expect(isPlaceable(skewed)).toBe(false)
+    expect(selectHost([skewed], request, overcommit)).toBeUndefined()
+    const message = describeNoCapacity([skewed], request, overcommit)
+    expect(message).toContain('no capacity')
+    expect(message).toContain('clock skew')
+
+    const boundary = candidate(
+      'b',
+      {},
+      { record: { clockSkewMs: -10_000 }, maxClockSkewMs: 10_000 }
+    )
+    expect(isPlaceable(boundary)).toBe(true)
   })
 })

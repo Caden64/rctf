@@ -49,11 +49,24 @@ export const controllerConfigSchema = z.object({
   hostTimeoutSeconds: z.optional(z.prefault(z.int(), 20)),
   /** After this, instances on an unhealthy host are written off (key freed, cleanup deferred to host return). */
   hostLostSeconds: z.optional(z.prefault(z.int(), 300)),
+  /** Per-host deadline for one heartbeat probe (seconds). Probes run concurrently. */
+  hostProbeTimeoutSeconds: z.optional(z.prefault(z.number(), 10)),
   reaperIntervalSeconds: z.optional(z.prefault(z.int(), 5)),
   /** How often DB-vs-agent reconciliation runs. */
   reconcileIntervalSeconds: z.optional(z.prefault(z.int(), 30)),
   /** Agent-side records unknown to the DB are deleted after this grace (in-flight creates). */
   orphanGraceSeconds: z.optional(z.prefault(z.int(), 30)),
+  /**
+   * How long an ambiguous create is left in `creating` before the reconciler
+   * fences it (row -> deleting + agent DELETE/tombstone) when the agent has no
+   * record of the instance.
+   */
+  createFenceSeconds: z.optional(z.prefault(z.int(), 45)),
+  /**
+   * Hosts whose measured clock skew (agent - controller) exceeds this take no
+   * new placements. Deadlines sent to agents are translated by the skew.
+   */
+  maxClockSkewSeconds: z.optional(z.prefault(z.int(), 10)),
   /**
    * Optional hard cap on an instance's total lifetime (seconds from creation).
    * Extends are clamped to `createdAt + maxLifetimeSeconds`.
@@ -75,6 +88,19 @@ const formatIssues = (error: {
 
 const hostTokenEnvKey = (hostId: string): string =>
   `FIRECRACKER_HOST_TOKEN_${hostId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`
+
+const intEnv = (
+  env: Record<string, string | undefined>,
+  key: string
+): number | undefined => {
+  const raw = env[key]
+  if (raw === undefined || raw.trim() === '') return undefined
+  const value = Number(raw)
+  if (!Number.isInteger(value)) {
+    throw new Error(`${key} must be an integer, got ${raw}`)
+  }
+  return value
+}
 
 /**
  * Load controller config from a YAML/JSON file path (or an already-parsed
@@ -129,6 +155,10 @@ export const loadControllerConfig = (
   if (env.FIRECRACKER_TEAM_KEY_SECRET !== undefined) {
     input.teamKeySecret = env.FIRECRACKER_TEAM_KEY_SECRET
   }
+  const createFence = intEnv(env, 'FIRECRACKER_CREATE_FENCE_SECONDS')
+  if (createFence !== undefined) input.createFenceSeconds = createFence
+  const maxSkew = intEnv(env, 'FIRECRACKER_MAX_CLOCK_SKEW_SECONDS')
+  if (maxSkew !== undefined) input.maxClockSkewSeconds = maxSkew
   if (Array.isArray(input.hosts)) {
     input.hosts = input.hosts.map(entry => {
       if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {

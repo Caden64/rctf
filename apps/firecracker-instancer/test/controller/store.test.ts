@@ -57,7 +57,7 @@ describe('store', () => {
     store.close()
   })
 
-  test('reservations count reserving/creating/running/deleting only', () => {
+  test('reservations count creating/running/deleting only', () => {
     const { store } = newStore()
     store.ensureHost('host-a', 'http://a')
     store.insertInstance(instance({ id: 'a'.repeat(24), state: 'running' }))
@@ -135,7 +135,7 @@ describe('store', () => {
     const db = new Database(path, { readonly: true })
     const migrations = db.query('SELECT version FROM schema_migrations').all()
     db.close()
-    expect(migrations).toEqual([{ version: 1 }])
+    expect(migrations).toEqual([{ version: 1 }, { version: 2 }])
     void dir
   })
 

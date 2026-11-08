@@ -32,6 +32,8 @@ export class PeriodicLoop {
   private handle: unknown = undefined
   private running = false
   private started = false
+  private stopping = false
+  private active: Promise<void> | null = null
 
   constructor(
     private readonly name: string,
@@ -44,34 +46,47 @@ export class PeriodicLoop {
   start(): void {
     if (this.started) return
     this.started = true
+    this.stopping = false
     this.handle = this.timers.setInterval(() => this.run(), this.intervalMs)
   }
 
-  async run(): Promise<void> {
-    if (this.running) return
+  run(): Promise<void> {
+    // A tick triggered after stop() began (an already-queued interval
+    // callback) must be a no-op, not a write against a closing database.
+    if (this.stopping) return Promise.resolve()
+    if (this.running) return this.active ?? Promise.resolve()
     this.running = true
-    try {
-      await this.fn()
-    } catch (error) {
-      this.logger.warn(
-        {
-          loop: this.name,
-          err: error instanceof Error ? error.message : String(error),
-        },
-        'controller loop tick failed'
-      )
-    } finally {
-      this.running = false
-    }
+    this.active = (async () => {
+      try {
+        await this.fn()
+      } catch (error) {
+        this.logger.warn(
+          {
+            loop: this.name,
+            err: error instanceof Error ? error.message : String(error),
+          },
+          'controller loop tick failed'
+        )
+      } finally {
+        this.running = false
+        this.active = null
+      }
+    })()
+    return this.active
   }
 
-  stop(): void {
-    if (!this.started) return
-    this.started = false
-    if (this.handle !== undefined) {
-      this.timers.clearInterval(this.handle)
-      this.handle = undefined
+  /** Stop scheduling and wait for the in-flight tick (if any) to finish. */
+  async stop(): Promise<void> {
+    this.stopping = true
+    if (this.started) {
+      this.started = false
+      if (this.handle !== undefined) {
+        this.timers.clearInterval(this.handle)
+        this.handle = undefined
+      }
     }
+    const active = this.active
+    if (active !== null) await active.catch(() => undefined)
   }
 }
 
@@ -107,46 +122,27 @@ export class HostMonitor {
     const { store, clients, config, now } = this.deps
     this.seed()
 
-    for (const host of this.hostConfigs()) {
-      const client = clients[host.id]
-      if (client === undefined) {
-        this.deps.logger.warn(
-          { hostId: host.id },
-          'configured host has no agent client'
-        )
-        continue
-      }
-      try {
-        const info = await client.info()
-        store.recordHeartbeat(host.id, {
-          url: host.url,
-          now: now(),
-          accepting: info.accepting,
-          capacity: info.capacity,
-        })
-      } catch (error) {
-        if (!(error instanceof AgentUnreachableError)) {
-          this.deps.logger.warn(
-            {
-              hostId: host.id,
-              err: error instanceof Error ? error.message : String(error),
-            },
-            'host heartbeat failed'
-          )
-        }
-        // Staleness is handled below; a single missed heartbeat is harmless.
-      }
-    }
-
+    // Probe every host concurrently and record each success at its own
+    // completion time. Serial probes would let one slow/timing-out host age an
+    // earlier success past hostTimeoutSeconds and falsely mark it stale.
+    const probeTimeoutMs = Math.max(
+      1,
+      (config.hostProbeTimeoutSeconds ?? 10) * 1000
+    )
     const timeoutMs = (config.hostTimeoutSeconds ?? 20) * 1000
     const lostMs = (config.hostLostSeconds ?? 300) * 1000
-    const appliedAt = now()
     const unhealthy: string[] = []
     const lost: string[] = []
 
-    for (const host of store.listHosts()) {
+    // Evaluate a host at its OWN completion time using its OWN last success.
+    // Waiting for every probe before judging would let a slow peer age an
+    // early success past hostTimeoutSeconds.
+    const evaluate = (hostId: string): void => {
+      const host = store.getHost(hostId)
+      if (host === null) return
+      const at = now()
       const lastSeen = host.lastSeenMs ?? host.createdAtMs
-      const age = appliedAt - lastSeen
+      const age = at - lastSeen
       if (age > timeoutMs && host.health !== 'unhealthy') {
         store.markHostHealth(host.id, 'unhealthy')
         unhealthy.push(host.id)
@@ -156,7 +152,7 @@ export class HostMonitor {
         )
       }
       if (age > lostMs) {
-        const ids = store.writeOffHost(host.id, appliedAt)
+        const ids = store.writeOffHost(host.id, at)
         if (ids.length > 0) {
           lost.push(host.id)
           this.deps.logger.error(
@@ -167,6 +163,81 @@ export class HostMonitor {
       }
     }
 
+    await Promise.allSettled(
+      this.hostConfigs().map(async host => {
+        const client = clients[host.id]
+        if (client === undefined) {
+          this.deps.logger.warn(
+            { hostId: host.id },
+            'configured host has no agent client'
+          )
+          evaluate(host.id)
+          return
+        }
+        const startedAt = now()
+        try {
+          const info = await probeWithDeadline(
+            client.info(),
+            probeTimeoutMs,
+            this.deps.logger,
+            host.id
+          )
+          const finishedAt = now()
+          // RTT-compensated estimate of (agent clock - controller clock).
+          const midpoint = (startedAt + finishedAt) / 2
+          store.recordHeartbeat(host.id, {
+            url: host.url,
+            now: finishedAt,
+            accepting: info.accepting,
+            capacity: info.capacity,
+            skewMs: info.timeMs - midpoint,
+          })
+        } catch (error) {
+          if (!(error instanceof AgentUnreachableError)) {
+            this.deps.logger.warn(
+              {
+                hostId: host.id,
+                err: error instanceof Error ? error.message : String(error),
+              },
+              'host heartbeat failed'
+            )
+          }
+          // Staleness is handled below; a single missed heartbeat is harmless.
+        } finally {
+          evaluate(host.id)
+        }
+      })
+    )
+
     return { unhealthy, lost }
+  }
+}
+
+/** Race a heartbeat probe against a hard per-probe deadline. */
+const probeWithDeadline = async <T>(
+  probe: Promise<T>,
+  timeoutMs: number,
+  logger: Logger,
+  hostId: string
+): Promise<T> => {
+  let handle: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => {
+      logger.warn(
+        { hostId, timeoutMs },
+        'host heartbeat probe deadline exceeded'
+      )
+      reject(
+        new AgentUnreachableError(
+          hostId,
+          `heartbeat probe timed out after ${timeoutMs}ms`
+        )
+      )
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([probe, deadline])
+  } finally {
+    if (handle !== undefined) clearTimeout(handle)
   }
 }

@@ -2,9 +2,18 @@
  * HTTP client for one host agent (see `agent-protocol.ts`).
  *
  * Every response body is validated with the shared zod schemas. Transport
- * failures, timeouts and 5xx responses become `AgentUnreachableError` (the
- * host may be down; a request may or may not have been applied). A well-formed
- * `agentError` body becomes `AgentRejectedError` with its stable code.
+ * failures and timeouts become `AgentUnreachableError`.
+ *
+ * Error classification is deliberately conservative:
+ * - `create` treats only the documented pre-create rejections (`no_capacity`,
+ *   `draining`, `invalid_request`, `unauthorized` with matching statuses) as
+ *   `AgentRejectedError`. A 5xx, `internal`, `host_unavailable`,
+ *   `spec_mismatch`, `conflict`, a malformed 2xx, or any other error is
+ *   AMBIGUOUS: the PUT may still create the VM, so `AgentUnreachableError` is
+ *   thrown and the controller keeps the row in `creating` for the reconciler.
+ * - Other calls map 4xx `agentError` bodies to `AgentRejectedError` and 5xx or
+ *   unrecognised failures to `AgentUnreachableError` (a failed GET must never
+ *   make the controller delete a row).
  *
  * Request bodies can contain flags: they are never logged here.
  */
@@ -37,6 +46,13 @@ type AgentFetch = (
 type CallResult =
   | { kind: 'ok'; status: number; text: string }
   | { kind: 'notFound' }
+  | {
+      kind: 'error'
+      status: number
+      /** Stable code from a well-formed agentError body, if any. */
+      code: ErrorCode | null
+      message: string
+    }
 
 interface IssueLike {
   path: readonly PropertyKey[]
@@ -51,6 +67,21 @@ const issueMessage = (error: { issues: readonly IssueLike[] }): string =>
         : issue.message
     )
     .join('; ')
+
+/** The only agent responses that prove a create did NOT happen. */
+export const isDefinitiveCreateRejection = (
+  status: number,
+  code: ErrorCode | null
+): boolean =>
+  (status === 507 && code === 'no_capacity') ||
+  (status === 503 && code === 'draining') ||
+  (status === 400 && code === 'invalid_request') ||
+  (status === 401 && code === 'unauthorized')
+
+/** Errors that confirm an id is gone (DELETE/GET 404 or an expired row). */
+export const isConfirmedGone = (error: unknown): boolean =>
+  error instanceof AgentRejectedError &&
+  (error.code === 'not_found' || error.code === 'expired')
 
 export class HttpAgentClient implements AgentClient {
   readonly hostId: string
@@ -135,20 +166,16 @@ export class HttpAgentClient implements AgentClient {
 
     if (!response.ok) {
       const parsed = this.parseError(text)
-      if (parsed !== null) {
-        throw new AgentRejectedError(this.hostId, parsed.code, parsed.message)
+      return {
+        kind: 'error',
+        status: response.status,
+        code: parsed?.code ?? null,
+        message:
+          parsed?.message ??
+          `agent returned HTTP ${response.status}${
+            text.trim() === '' ? '' : `: ${text.slice(0, 200)}`
+          }`,
       }
-      if (response.status >= 500) {
-        throw new AgentUnreachableError(
-          this.hostId,
-          `agent returned HTTP ${response.status}`
-        )
-      }
-      throw new AgentRejectedError(
-        this.hostId,
-        'internal',
-        `agent returned HTTP ${response.status}`
-      )
     }
 
     return { kind: 'ok', status: response.status, text }
@@ -169,25 +196,48 @@ export class HttpAgentClient implements AgentClient {
       : null
   }
 
+  private rejectNonCreate(
+    error: Extract<CallResult, { kind: 'error' }>
+  ): never {
+    if (error.status >= 500 || error.code === null) {
+      throw new AgentUnreachableError(this.hostId, error.message)
+    }
+    throw new AgentRejectedError(this.hostId, error.code, error.message)
+  }
+
+  private rejectCreate(error: Extract<CallResult, { kind: 'error' }>): never {
+    if (isDefinitiveCreateRejection(error.status, error.code)) {
+      throw new AgentRejectedError(
+        this.hostId,
+        error.code as ErrorCode,
+        error.message
+      )
+    }
+    // Ambiguous: the agent may have (or may still) create the instance. Keep
+    // the controller row and let the reconciler resolve it with GET/DELETE.
+    throw new AgentUnreachableError(this.hostId, error.message)
+  }
+
   private parseSuccess<T>(
     text: string,
-    schema: z.ZodMiniType<T> | z.ZodMiniType<T[]>
+    schema: z.ZodMiniType<T> | z.ZodMiniType<T[]>,
+    opts: { ambiguous?: boolean } = {}
   ): T {
+    const invalid = (message: string): never => {
+      if (opts.ambiguous === true) {
+        throw new AgentUnreachableError(this.hostId, message)
+      }
+      throw new AgentRejectedError(this.hostId, 'internal', message)
+    }
     let json: unknown
     try {
       json = JSON.parse(text)
     } catch {
-      throw new AgentRejectedError(
-        this.hostId,
-        'internal',
-        'agent returned malformed JSON'
-      )
+      return invalid('agent returned malformed JSON')
     }
     const parsed = (schema as z.ZodMiniType<T>).safeParse(json)
     if (!parsed.success) {
-      throw new AgentRejectedError(
-        this.hostId,
-        'internal',
+      return invalid(
         `agent returned an invalid response: ${issueMessage(parsed.error)}`
       )
     }
@@ -199,6 +249,7 @@ export class HttpAgentClient implements AgentClient {
     if (result.kind === 'notFound') {
       throw new AgentUnreachableError(this.hostId, 'agent /v1/info not found')
     }
+    if (result.kind === 'error') this.rejectNonCreate(result)
     return this.parseSuccess(result.text, agentInfoSchema)
   }
 
@@ -215,6 +266,7 @@ export class HttpAgentClient implements AgentClient {
         'agent /v1/instances not found'
       )
     }
+    if (result.kind === 'error') this.rejectNonCreate(result)
     return this.parseSuccess<AgentInstance[]>(
       result.text,
       z.array(agentInstanceSchema)
@@ -239,13 +291,17 @@ export class HttpAgentClient implements AgentClient {
       this.timeoutOverride ?? CREATE_TIMEOUT_MS
     )
     if (result.kind === 'notFound') {
-      throw new AgentRejectedError(
+      // Ambiguous: an unexpected 404 does not prove the create failed (a proxy
+      // or a mid-deploy agent can produce it).
+      throw new AgentUnreachableError(
         this.hostId,
-        'not_found',
         'agent create endpoint not found'
       )
     }
-    return this.parseSuccess(result.text, agentInstanceSchema)
+    if (result.kind === 'error') this.rejectCreate(result)
+    return this.parseSuccess(result.text, agentInstanceSchema, {
+      ambiguous: true,
+    })
   }
 
   async get(id: string): Promise<AgentInstance | undefined> {
@@ -256,6 +312,7 @@ export class HttpAgentClient implements AgentClient {
       this.timeoutMs
     )
     if (result.kind === 'notFound') return undefined
+    if (result.kind === 'error') this.rejectNonCreate(result)
     return this.parseSuccess(result.text, agentInstanceSchema)
   }
 
@@ -273,6 +330,7 @@ export class HttpAgentClient implements AgentClient {
         'instance not found on agent'
       )
     }
+    if (result.kind === 'error') this.rejectNonCreate(result)
     return this.parseSuccess(result.text, agentInstanceSchema)
   }
 
@@ -284,6 +342,7 @@ export class HttpAgentClient implements AgentClient {
       this.timeoutMs
     )
     if (result.kind === 'notFound') return
+    if (result.kind === 'error') this.rejectNonCreate(result)
     // Teardown is confirmed by the status. Older/newer agents may return an
     // empty body or the instance record; an unparseable body must not undo a
     // successful teardown.
