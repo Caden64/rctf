@@ -54,9 +54,11 @@ interface ClockEstimate {
 
 /**
  * PATCH-only interpretation: `not_found`/`expired` from an extend means the
- * instance is gone. This is deliberately NOT used to confirm a DELETE: only a
- * resolving `AgentClient.delete` (HTTP 2xx/404) proves the agent wrote its
- * tombstone.
+ * instance is gone. The client only produces these for an instance-scoped
+ * absence response; a route/proxy 404 arrives as `AgentUnreachableError` and
+ * must leave the row untouched. This is deliberately NOT used to confirm a
+ * DELETE: only a resolving `AgentClient.delete` (2xx or verified instance
+ * absence) proves the agent wrote its tombstone.
  */
 const isMissingOnExtend = (error: unknown): boolean =>
   error instanceof AgentRejectedError &&
@@ -415,7 +417,8 @@ export class Reconciler {
   ): Promise<void> {
     const { store } = this.deps
     try {
-      // Only a resolving delete proves the agent wrote its tombstone.
+      // Only a resolving delete (2xx or verified instance absence) proves the
+      // agent wrote its tombstone; an unrecognised 404 throws.
       await client.delete(row.id)
       store.deleteInstanceIfState(row.id, 'deleting')
     } catch {

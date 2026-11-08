@@ -14,15 +14,24 @@
  * - Other calls map 4xx `agentError` bodies to `AgentRejectedError` and 5xx or
  *   unrecognised failures to `AgentUnreachableError` (a failed GET must never
  *   make the controller delete a row).
- * - `delete` confirms ownership release ONLY for HTTP 2xx or 404, which is the
- *   only outcome that guarantees the agent wrote its durable tombstone. Every
- *   other response (410/`expired`, another 4xx, 5xx, timeout, malformed body)
- *   throws, so the caller keeps the row fenced and retries.
+ * - Absence (GET/PATCH/DELETE 404) is only trusted when it is attributable to
+ *   the instance: a `not_found` body carrying the requested `instanceId`.
+ *   Plain, route-level, mismatched-id and malformed 404s are AMBIGUOUS
+ *   (`AgentUnreachableError`). The advertised `instance-absence-v1` capability
+ *   only decides whether a marker-less 404 is still acceptable from a legacy
+ *   agent; the client probes `/v1/info` before accepting one and treats a
+ *   failed probe as ambiguous.
+ * - `delete` confirms ownership release ONLY for HTTP 2xx or a verified
+ *   instance absence, which is the only outcome that guarantees the agent
+ *   wrote its durable tombstone. Every other response (410/`expired`, another
+ *   4xx, 5xx, timeout, malformed body) throws, so the caller keeps the row
+ *   fenced and retries.
  *
  * Request bodies can contain flags: they are never logged here.
  */
 import * as z from 'zod/mini'
 import {
+  AGENT_CAPABILITY_INSTANCE_ABSENCE,
   agentErrorSchema,
   agentInfoSchema,
   agentInstanceSchema,
@@ -52,7 +61,14 @@ type AgentFetch = (
 
 type CallResult =
   | { kind: 'ok'; status: number; text: string }
-  | { kind: 'notFound' }
+  | {
+      kind: 'notFound'
+      /** Well-formed code/body fields, if the 404 carried one. */
+      code: ErrorCode | null
+      /** Id echoed by an instance-scoped route (absence discriminator). */
+      instanceId: string | null
+      message: string
+    }
   | {
       kind: 'error'
       status: number
@@ -60,6 +76,12 @@ type CallResult =
       code: ErrorCode | null
       message: string
     }
+
+interface ParsedAgentError {
+  code: ErrorCode
+  message: string
+  instanceId: string | null
+}
 
 interface IssueLike {
   path: readonly PropertyKey[]
@@ -92,6 +114,9 @@ export class HttpAgentClient implements AgentClient {
   private readonly tls: FetchTlsOptions | undefined
   private readonly timeoutMs: number
   private readonly timeoutOverride: number | undefined
+  /** null until an /v1/info response tells us what the agent supports. */
+  private capabilities: Set<string> | null = null
+  private capabilityProbe: Promise<Set<string>> | null = null
 
   constructor(
     readonly config: HostConfig,
@@ -162,9 +187,20 @@ export class HttpAgentClient implements AgentClient {
     }
 
     if (response.status === 404) {
-      // Drain the body so the connection can be reused.
-      await response.text().catch(() => '')
-      return { kind: 'notFound' }
+      // The body is evidence: only an instance-scoped agentError carries the
+      // requested instanceId (see classifyAbsence). Drain it either way.
+      const text = await response.text().catch(() => '')
+      const parsed = this.parseError(text)
+      return {
+        kind: 'notFound',
+        code: parsed?.code ?? null,
+        instanceId: parsed?.instanceId ?? null,
+        message:
+          parsed?.message ??
+          `agent returned HTTP 404${
+            text.trim() === '' ? '' : `: ${text.slice(0, 200)}`
+          }`,
+      }
     }
 
     let text: string
@@ -196,9 +232,7 @@ export class HttpAgentClient implements AgentClient {
     return { kind: 'ok', status: response.status, text }
   }
 
-  private parseError(
-    text: string
-  ): { code: ErrorCode; message: string } | null {
+  private parseError(text: string): ParsedAgentError | null {
     let json: unknown
     try {
       json = JSON.parse(text)
@@ -207,8 +241,72 @@ export class HttpAgentClient implements AgentClient {
     }
     const parsed = agentErrorSchema.safeParse(json)
     return parsed.success
-      ? { code: parsed.data.code, message: parsed.data.message }
+      ? {
+          code: parsed.data.code,
+          message: parsed.data.message,
+          instanceId: parsed.data.instanceId ?? null,
+        }
       : null
+  }
+
+  /**
+   * Decide whether a 404 is evidence that *this instance* is absent. Only a
+   * `not_found` body that echoes the requested id is self-authenticating.
+   * Without it, ask the agent whether it advertises the discriminator: a
+   * modern agent's marker-less 404 is routing noise (ambiguous), while an
+   * agent that predates the capability keeps the old 404-means-absent
+   * semantics. A failed probe is always ambiguous (fail closed).
+   */
+  private async classifyAbsence(
+    id: string,
+    result: Extract<CallResult, { kind: 'notFound' }>
+  ): Promise<void> {
+    if (result.instanceId !== null) {
+      if (result.instanceId === id && result.code === 'not_found') return
+      // Explicitly names another instance (or an unrelated code): never
+      // evidence for this one.
+      throw new AgentUnreachableError(
+        this.hostId,
+        `ambiguous 404 for instance ${id}: ${result.message}`
+      )
+    }
+
+    let capabilities: Set<string>
+    try {
+      capabilities = await this.advertisedCapabilities()
+    } catch (error) {
+      throw new AgentUnreachableError(
+        this.hostId,
+        `cannot verify 404 for instance ${id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+    if (capabilities.has(AGENT_CAPABILITY_INSTANCE_ABSENCE)) {
+      throw new AgentUnreachableError(
+        this.hostId,
+        `agent 404 for instance ${id} did not identify the instance`
+      )
+    }
+  }
+
+  /** Cached capabilities, probing /v1/info once when no heartbeat has yet. */
+  private async advertisedCapabilities(): Promise<Set<string>> {
+    if (this.capabilities !== null) return this.capabilities
+    const existing = this.capabilityProbe
+    if (existing !== null) return existing
+    const probe = this.info().then(info => {
+      const capabilities = new Set(info.capabilities ?? [])
+      this.capabilities = capabilities
+      return capabilities
+    })
+    this.capabilityProbe = probe
+    void probe
+      .finally(() => {
+        if (this.capabilityProbe === probe) this.capabilityProbe = null
+      })
+      .catch(() => undefined)
+    return probe
   }
 
   private rejectNonCreate(
@@ -265,7 +363,9 @@ export class HttpAgentClient implements AgentClient {
       throw new AgentUnreachableError(this.hostId, 'agent /v1/info not found')
     }
     if (result.kind === 'error') this.rejectNonCreate(result)
-    return this.parseSuccess(result.text, agentInfoSchema)
+    const info = this.parseSuccess(result.text, agentInfoSchema)
+    this.capabilities = new Set(info.capabilities ?? [])
+    return info
   }
 
   async list(): Promise<AgentInstance[]> {
@@ -326,7 +426,10 @@ export class HttpAgentClient implements AgentClient {
       undefined,
       this.timeoutMs
     )
-    if (result.kind === 'notFound') return undefined
+    if (result.kind === 'notFound') {
+      await this.classifyAbsence(id, result)
+      return undefined
+    }
     if (result.kind === 'error') this.rejectNonCreate(result)
     return this.parseSuccess(result.text, agentInstanceSchema)
   }
@@ -339,6 +442,7 @@ export class HttpAgentClient implements AgentClient {
       this.timeoutMs
     )
     if (result.kind === 'notFound') {
+      await this.classifyAbsence(id, result)
       throw new AgentRejectedError(
         this.hostId,
         'not_found',
@@ -356,9 +460,13 @@ export class HttpAgentClient implements AgentClient {
       undefined,
       this.timeoutMs
     )
-    if (result.kind === 'notFound') return
+    if (result.kind === 'notFound') {
+      await this.classifyAbsence(id, result)
+      return
+    }
     if (result.kind === 'error') this.rejectNonCreate(result)
-    // Only HTTP 2xx/404 confirm a teardown (the agent wrote its tombstone).
+    // Only HTTP 2xx or a verified instance absence confirm a teardown (the
+    // agent wrote its tombstone).
     // Older/newer agents may return an empty body or the instance record; a
     // malformed body is NOT confirmation, so the caller keeps the row fenced
     // and retries the DELETE.

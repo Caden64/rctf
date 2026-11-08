@@ -30,8 +30,20 @@ import { readinessSchema } from './challenge-config'
  * durable tombstone {id, atMs} (kept >= `tombstoneTtlSeconds`, default 24h, persisted
  * in the agent state dir). A later PUT for a tombstoned id fails with `conflict`
  * ("instance id was deleted"), so a create request that was delayed on the wire
- * after the controller gave up on it can never produce a VM. The controller treats
- * DELETE 200/404 as confirmation that the id will never exist.
+ * after the controller gave up on it can never produce a VM.
+ *
+ * ABSENCE DISCRIMINATOR: agents that advertise
+ * `AGENT_CAPABILITY_INSTANCE_ABSENCE` stamp every `not_found` emitted by an
+ * instance-scoped route with the requested `instanceId`. A DELETE 404 carrying
+ * the matching id therefore proves the agent ran the instance DELETE route and
+ * wrote its tombstone. A plain/route-level 404 (an unmatched route, a proxy, or
+ * a mid-deploy agent) never carries the id and is AMBIGUOUS: the controller
+ * keeps the row fenced and retries. The same discriminator gates GET/PATCH
+ * absence, so a routing 404 cannot declare a live instance lost. Agents that do
+ * not advertise the capability keep the pre-negotiation semantics (any 404 is
+ * absence); the controller probes `GET /v1/info` before trusting a marker-less
+ * 404 and treats a failed probe as ambiguous, so a modern agent is never
+ * mistaken for a legacy one.
  *
  * Time: `expiresAtMs` values are on the AGENT clock. The controller reads
  * `AgentInfo.timeMs` at every heartbeat, estimates the skew (agent - controller,
@@ -121,6 +133,16 @@ const resourcesSchema = z.object({
   instances: z.number(),
 })
 
+/**
+ * Capability advertised by agents that echo the instance id on instance-scoped
+ * absence errors (see ABSENCE DISCRIMINATOR above). Optional on the wire so an
+ * older agent's `/v1/info` still validates.
+ */
+export const AGENT_CAPABILITY_INSTANCE_ABSENCE = 'instance-absence-v1'
+export const AGENT_CAPABILITIES: readonly string[] = [
+  AGENT_CAPABILITY_INSTANCE_ABSENCE,
+]
+
 export const agentInfoSchema = z.object({
   version: z.string(),
   hostId: z.string(),
@@ -136,6 +158,8 @@ export const agentInfoSchema = z.object({
   accepting: z.boolean(),
   checks: z.record(z.string(), z.boolean()),
   images: z.array(z.string()),
+  /** Protocol capabilities; absent on agents that predate negotiation. */
+  capabilities: z.optional(z.array(z.string())),
 })
 export type AgentInfo = z.output<typeof agentInfoSchema>
 
@@ -147,5 +171,11 @@ export const agentErrorSchema = z.object({
   kind: z.literal('agentError'),
   code: errorCodeSchema,
   message: z.string(),
+  /**
+   * Echo of the validated path id, set ONLY by instance-scoped routes. Absent
+   * for unmatched-route/proxy errors and for agents without
+   * `AGENT_CAPABILITY_INSTANCE_ABSENCE`.
+   */
+  instanceId: z.optional(instanceIdSchema),
 })
 export type AgentErrorBody = z.output<typeof agentErrorSchema>

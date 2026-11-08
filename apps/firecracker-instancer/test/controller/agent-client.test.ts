@@ -102,29 +102,112 @@ describe('HttpAgentClient', () => {
     expect(seen.authorizations).toEqual(['Bearer host-token'])
   })
 
-  test('404 on get is undefined and delete of an unknown id resolves', async () => {
-    const { client } = startServer(
-      () => new Response('not found', { status: 404 })
+  const absenceCapability = 'instance-absence-v1'
+  const modernInfo = { ...agentInfo, capabilities: [absenceCapability] }
+  const legacyInfo = agentInfo
+  const id = 'a'.repeat(24)
+
+  const instanceAbsence = (instanceId = id): Response =>
+    json(
+      {
+        kind: 'agentError',
+        code: 'not_found',
+        message: 'instance not found',
+        instanceId,
+      },
+      404
     )
-    expect(await client().get('a'.repeat(24))).toBeUndefined()
-    await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
+
+  /** Serve /v1/info from `info`; every other request gets `instanceResponse`. */
+  const absenceServer = (
+    info: unknown,
+    instanceResponse: () => Response
+  ): ReturnType<typeof startServer> =>
+    startServer(request => {
+      const path = new URL(request.url).pathname
+      return path === '/v1/info' ? json(info) : instanceResponse()
+    })
+
+  test('an instance-scoped 404 is absence on GET/DELETE and not_found on PATCH', async () => {
+    const { client } = absenceServer(modernInfo, () => instanceAbsence())
+    expect(await client().get(id)).toBeUndefined()
+    await expect(client().delete(id)).resolves.toBeUndefined()
+    const error = await client()
+      .extend(id, 10_000)
+      .catch(error => error)
+    expect(error).toBeInstanceOf(AgentRejectedError)
+    expect((error as AgentRejectedError).code).toBe('not_found')
   })
 
-  test('DELETE only confirms on 2xx or 404', async () => {
+  test('a plain or route-level 404 is ambiguous on a modern agent', async () => {
+    const bodies = [
+      'not found',
+      JSON.stringify({ kind: 'agentError', code: 'not_found', message: 'x' }),
+      JSON.stringify({
+        kind: 'agentError',
+        code: 'not_found',
+        message: 'x',
+        instanceId: 'b'.repeat(24),
+      }),
+    ]
+    for (const body of bodies) {
+      const { client } = absenceServer(
+        modernInfo,
+        () => new Response(body, { status: 404 })
+      )
+      for (const operation of [
+        () => client().get(id),
+        () => client().delete(id),
+        () => client().extend(id, 10_000),
+      ]) {
+        const error = await operation().catch(error => error)
+        expect(error).toBeInstanceOf(AgentUnreachableError)
+      }
+    }
+  })
+
+  test('a legacy agent keeps pre-negotiation 404 semantics', async () => {
+    const bodies = [
+      'not found',
+      JSON.stringify({ kind: 'agentError', code: 'not_found', message: 'x' }),
+    ]
+    for (const body of bodies) {
+      const { client } = absenceServer(
+        legacyInfo,
+        () => new Response(body, { status: 404 })
+      )
+      expect(await client().get(id)).toBeUndefined()
+      await expect(client().delete(id)).resolves.toBeUndefined()
+      const error = await client()
+        .extend(id, 10_000)
+        .catch(error => error)
+      expect(error).toBeInstanceOf(AgentRejectedError)
+      expect((error as AgentRejectedError).code).toBe('not_found')
+    }
+  })
+
+  test('a failed capability probe makes a marker-less 404 ambiguous', async () => {
+    const { client } = startServer(request =>
+      new URL(request.url).pathname === '/v1/info'
+        ? new Response('down', { status: 502 })
+        : new Response('not found', { status: 404 })
+    )
+    const error = await client()
+      .delete(id)
+      .catch(error => error)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
+
+  test('DELETE confirms on 2xx or a verified instance absence only', async () => {
     // 2xx (empty or record body) confirms.
     for (const body of ['', JSON.stringify(agentInstance)]) {
       const { client } = startServer(() => new Response(body, { status: 200 }))
-      await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
+      await expect(client().delete(id)).resolves.toBeUndefined()
     }
 
-    // 404 (plain or agent not_found body) confirms.
-    for (const body of [
-      'not found',
-      JSON.stringify({ kind: 'agentError', code: 'not_found', message: 'x' }),
-    ]) {
-      const { client } = startServer(() => new Response(body, { status: 404 }))
-      await expect(client().delete('a'.repeat(24))).resolves.toBeUndefined()
-    }
+    // An instance-scoped 404 confirms once (the agent wrote its tombstone).
+    const verified = absenceServer(modernInfo, () => instanceAbsence())
+    await expect(verified.client().delete(id)).resolves.toBeUndefined()
 
     // Everything else must throw: the caller keeps the row fenced.
     const failures: Array<{
@@ -159,7 +242,7 @@ describe('HttpAgentClient', () => {
         () => new Response(failure.body, { status: failure.status })
       )
       const error = await client()
-        .delete('a'.repeat(24))
+        .delete(id)
         .then(() => 'resolved')
         .catch(error => error)
       expect(error).toBeInstanceOf(

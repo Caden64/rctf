@@ -42,7 +42,12 @@ export type CreateMode =
 
 export type InfoMode = 'ok' | 'unreachable' | 'hang'
 
-export type DeleteMissingMode = 'ok' | 'not_found' | 'expired'
+export type DeleteMissingMode =
+  | 'ok'
+  | 'not_found'
+  | 'expired'
+  /** Simulates a route/proxy 404 that the controller cannot attribute. */
+  | 'ambiguous'
 
 /** One captured PUT whose delivery is delayed until `execute()`. */
 export interface DeferredCreate {
@@ -104,10 +109,25 @@ export class FakeAgent implements AgentClient {
   infoMode: InfoMode = 'ok'
   /** Await this before answering `info()` (holds a heartbeat tick open). */
   infoHold: Promise<void> | null = null
-  /** A DELETE of an unknown id still writes the tombstone; `expired` throws. */
+  /**
+   * A DELETE of an unknown id still writes the tombstone; `expired` throws
+   * AFTER fencing, while `ambiguous` models a route/proxy 404 (no fence).
+   */
   deleteMissingMode: DeleteMissingMode = 'ok'
   /** Error returned for a DELETE of a KNOWN id (before any mutation). */
   deleteErrorMode: 'none' | 'expired' | 'internal' = 'none'
+  /** How GET answers for an unknown id: absent, or an unattributable 404. */
+  getMissingMode: 'absent' | 'ambiguous' = 'absent'
+  /** How PATCH answers for an unknown id: not_found, or an unattributable 404. */
+  extendMissingMode: 'not_found' | 'ambiguous' = 'not_found'
+  /** Error for a PATCH of a KNOWN id (e.g. a routing 404 while it is alive). */
+  extendErrorMode: 'none' | 'not_found' | 'ambiguous' = 'none'
+  /**
+   * When set, the agent answers PATCH with this deadline instead of the one it
+   * actually applied (models a silent short/clamped acknowledgement).
+   */
+  extendAckDeadline: ((applied: number, requested: number) => number) | null =
+    null
   /** (agent - controller) clock offset reported in AgentInfo.timeMs. */
   clockOffsetMs = 0
   /** Runs inside `info()` after the request started (can step the clock). */
@@ -350,7 +370,16 @@ export class FakeAgent implements AgentClient {
     this.expireDeadman()
     this.assertReachable()
     const instance = this.instances.get(id)
-    return instance === undefined ? undefined : { ...instance }
+    if (instance === undefined) {
+      if (this.getMissingMode === 'ambiguous') {
+        throw new AgentUnreachableError(
+          this.hostId,
+          'fake ambiguous GET 404 (route/proxy)'
+        )
+      }
+      return undefined
+    }
+    return { ...instance }
   }
 
   async extend(id: string, expiresAtMs: number): Promise<AgentInstance> {
@@ -360,11 +389,32 @@ export class FakeAgent implements AgentClient {
     this.extendCalls.push({ id, expiresAtMs })
     const instance = this.instances.get(id)
     if (instance === undefined) {
+      if (this.extendMissingMode === 'ambiguous') {
+        throw new AgentUnreachableError(
+          this.hostId,
+          'fake ambiguous PATCH 404 (route/proxy)'
+        )
+      }
+      throw new AgentRejectedError(this.hostId, 'not_found', 'no such instance')
+    }
+    if (this.extendErrorMode === 'ambiguous') {
+      throw new AgentUnreachableError(
+        this.hostId,
+        'fake ambiguous PATCH 404 (instance alive)'
+      )
+    }
+    if (this.extendErrorMode === 'not_found') {
       throw new AgentRejectedError(this.hostId, 'not_found', 'no such instance')
     }
     // Monotonic: a competing/out-of-order push never shortens the deadline.
     instance.expiresAtMs = Math.max(instance.expiresAtMs, expiresAtMs)
     const snapshot = { ...instance }
+    if (this.extendAckDeadline !== null) {
+      snapshot.expiresAtMs = this.extendAckDeadline(
+        instance.expiresAtMs,
+        expiresAtMs
+      )
+    }
     const gate = this.extendGate
     if (gate !== null) {
       this.extendGate = null
@@ -388,6 +438,14 @@ export class FakeAgent implements AgentClient {
     this.deleteCalls.push(id)
     const known = this.instances.has(id)
     if (!known) {
+      if (this.deleteMissingMode === 'ambiguous') {
+        // A route/proxy 404: the agent never ran the instance DELETE, so no
+        // tombstone exists and the controller must keep the row fenced.
+        throw new AgentUnreachableError(
+          this.hostId,
+          'fake ambiguous DELETE 404 (no fence)'
+        )
+      }
       // Faithful FENCING: the agent writes the durable tombstone BEFORE it
       // answers (404 for an unknown id, or an error mode's 410/expired).
       this.tombstones.set(id, this.agentNow())
@@ -487,6 +545,10 @@ export class FakeAgent implements AgentClient {
     this.infoHold = null
     this.deleteMissingMode = 'ok'
     this.deleteErrorMode = 'none'
+    this.getMissingMode = 'absent'
+    this.extendMissingMode = 'not_found'
+    this.extendErrorMode = 'none'
+    this.extendAckDeadline = null
     this.infoHook = null
     this.listSnapshotOverride = null
     this.listHook = null

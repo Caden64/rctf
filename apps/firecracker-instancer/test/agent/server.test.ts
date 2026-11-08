@@ -85,6 +85,7 @@ describe('agent HTTP auth', () => {
     const info = agentInfoSchema.parse(await response.json())
     expect(info.hostId).toBe('host1')
     expect(info.accepting).toBe(true)
+    expect(info.capabilities).toContain('instance-absence-v1')
   })
 
   it('has a constant-time comparison helper', () => {
@@ -177,7 +178,10 @@ describe('agent HTTP instance routes', () => {
       headers: ctx.headers,
     })
     expect(again.status).toBe(404)
-    expect(agentErrorSchema.parse(await again.json()).code).toBe('not_found')
+    const againBody = agentErrorSchema.parse(await again.json())
+    expect(againBody.code).toBe('not_found')
+    // The absence discriminator: the instance route echoes the validated id.
+    expect(againBody.instanceId).toBe(spec.id)
   })
 
   it('validates path ids and body ids', async () => {
@@ -256,23 +260,42 @@ describe('agent HTTP instance routes', () => {
     expect(sent).toBeLessThan(total)
   })
 
-  it('returns 404 for unknown routes and instances', async () => {
+  it('distinguishes instance absence from unknown routes', async () => {
     const ctx = await setup()
     const unknown = await call(ctx, '/v1/nope', { headers: ctx.headers })
     expect(unknown.status).toBe(404)
+    // A route-level 404 must NEVER look like a fenced instance absence.
+    expect(
+      agentErrorSchema.parse(await unknown.json()).instanceId
+    ).toBeUndefined()
 
     const unknownId = nextId()
     const missing = await call(ctx, `/v1/instances/${unknownId}`, {
       headers: ctx.headers,
     })
     expect(missing.status).toBe(404)
+    expect(agentErrorSchema.parse(await missing.json()).instanceId).toBe(
+      unknownId
+    )
+
+    const patchMissing = await call(ctx, `/v1/instances/${unknownId}`, {
+      method: 'PATCH',
+      headers: ctx.headers,
+      body: JSON.stringify({ expiresAtMs: 1_000_000 }),
+    })
+    expect(patchMissing.status).toBe(404)
+    const patchBody = agentErrorSchema.parse(await patchMissing.json())
+    expect(patchBody.code).toBe('not_found')
+    expect(patchBody.instanceId).toBe(unknownId)
 
     const deleted = await call(ctx, `/v1/instances/${unknownId}`, {
       method: 'DELETE',
       headers: ctx.headers,
     })
     expect(deleted.status).toBe(404)
-    expect(agentErrorSchema.parse(await deleted.json()).code).toBe('not_found')
+    const deleteBody = agentErrorSchema.parse(await deleted.json())
+    expect(deleteBody.code).toBe('not_found')
+    expect(deleteBody.instanceId).toBe(unknownId)
 
     const resurrect = await call(ctx, `/v1/instances/${unknownId}`, {
       method: 'PUT',

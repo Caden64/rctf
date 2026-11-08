@@ -11,6 +11,7 @@
  */
 import { createHash, timingSafeEqual } from 'node:crypto'
 import {
+  AGENT_CAPABILITIES,
   ERROR_HTTP_STATUS,
   INSTANCE_ID_REGEX,
   ProtocolError,
@@ -56,8 +57,18 @@ class HttpProblem extends Error {
   }
 }
 
-const errorResponse = (code: ErrorCode, message: string, status?: number) => {
-  const body: AgentErrorBody = { kind: 'agentError', code, message }
+const errorResponse = (
+  code: ErrorCode,
+  message: string,
+  status?: number,
+  instanceId?: string
+) => {
+  const body: AgentErrorBody = {
+    kind: 'agentError',
+    code,
+    message,
+    ...(instanceId === undefined ? {} : { instanceId }),
+  }
   return new Response(JSON.stringify(body), {
     status: status ?? ERROR_HTTP_STATUS[code],
     headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -170,7 +181,10 @@ export const createAgentServer = (deps: {
         if (request.method !== 'GET') {
           return errorResponse('invalid_request', 'method not allowed', 405)
         }
-        return jsonResponse(await manager.info())
+        return jsonResponse({
+          ...(await manager.info()),
+          capabilities: [...AGENT_CAPABILITIES],
+        })
       }
 
       if (pathname === '/v1/instances') {
@@ -187,46 +201,69 @@ export const createAgentServer = (deps: {
           return errorResponse('invalid_request', 'invalid instance id')
         }
 
-        switch (request.method) {
-          case 'GET': {
-            const instance = await manager.get(id)
-            if (!instance) {
-              return errorResponse('not_found', 'instance not found')
+        try {
+          switch (request.method) {
+            case 'GET': {
+              const instance = await manager.get(id)
+              if (!instance) {
+                // Instance-scoped absence: the id was validated above, so the
+                // controller may treat this as a real missing instance. Never
+                // emitted by the unmatched-route branch below.
+                return errorResponse(
+                  'not_found',
+                  'instance not found',
+                  undefined,
+                  id
+                )
+              }
+              return jsonResponse(instance)
             }
-            return jsonResponse(instance)
-          }
-          case 'PUT': {
-            const body = await readJson(request)
-            const parsed = agentInstanceSpecSchema.safeParse(body)
-            if (!parsed.success) {
-              return errorResponse('invalid_request', 'invalid instance spec')
+            case 'PUT': {
+              const body = await readJson(request)
+              const parsed = agentInstanceSpecSchema.safeParse(body)
+              if (!parsed.success) {
+                return errorResponse('invalid_request', 'invalid instance spec')
+              }
+              if (parsed.data.id !== id) {
+                return errorResponse(
+                  'invalid_request',
+                  'request body id does not match path id'
+                )
+              }
+              return jsonResponse(await manager.create(parsed.data))
             }
-            if (parsed.data.id !== id) {
-              return errorResponse(
-                'invalid_request',
-                'request body id does not match path id'
+            case 'PATCH': {
+              const body = await readJson(request)
+              const parsed = agentExtendRequestSchema.safeParse(body)
+              if (!parsed.success) {
+                return errorResponse(
+                  'invalid_request',
+                  'invalid extend request'
+                )
+              }
+              return jsonResponse(
+                await manager.extend(id, parsed.data.expiresAtMs)
               )
             }
-            return jsonResponse(await manager.create(parsed.data))
-          }
-          case 'PATCH': {
-            const body = await readJson(request)
-            const parsed = agentExtendRequestSchema.safeParse(body)
-            if (!parsed.success) {
-              return errorResponse('invalid_request', 'invalid extend request')
+            case 'DELETE': {
+              return jsonResponse(await manager.delete(id))
             }
-            return jsonResponse(
-              await manager.extend(id, parsed.data.expiresAtMs)
-            )
+            default:
+              return errorResponse('invalid_request', 'method not allowed', 405)
           }
-          case 'DELETE': {
-            return jsonResponse(await manager.delete(id))
+        } catch (err) {
+          // The manager answers `not_found` (DELETE only after its tombstone is
+          // durable) or `expired`; the route is the only layer that knows the
+          // requested id, so stamp it here. Anything else keeps propagating.
+          if (err instanceof ProtocolError) {
+            return errorResponse(err.code, err.message, undefined, id)
           }
-          default:
-            return errorResponse('invalid_request', 'method not allowed', 405)
+          throw err
         }
       }
 
+      // Unmatched route: deliberately carries no instanceId. A proxy or a
+      // mid-deploy agent can produce this shape; it must stay AMBIGUOUS.
       return errorResponse('not_found', 'route not found')
     } catch (err) {
       if (err instanceof HttpProblem) {
