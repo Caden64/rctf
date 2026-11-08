@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import {
   access,
@@ -8,11 +9,14 @@ import {
   link,
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
+  rename,
   rm,
   rmdir,
   stat,
+  type FileHandle,
   writeFile,
 } from 'node:fs/promises'
 import { isIPv4, createConnection } from 'node:net'
@@ -46,12 +50,12 @@ import {
   type ExeIdentity,
   type ProcessExpectation,
   findInstanceProcesses,
+  hasInstanceIdArg,
   inspectProcess,
   inspectProcessLegacy,
   instanceIdFromArgv,
   listPids,
   processMatchesIdentity,
-  readProcCwd,
   readProcSnapshot,
   readStartTicks,
   statExeIdentity,
@@ -131,6 +135,10 @@ export interface VmDeps {
   spawn?: VmSpawn
   now?: Clock
   sleep?: (ms: number) => Promise<void>
+  /** Injectable `/proc/mounts` reader (tests assert cgroup2 accuracy). */
+  readMounts?: () => Promise<{ mountpoint: string; fstype: string }[]>
+  /** Injectable signal sender (tests can prove what is never signalled). */
+  killProcess?: (pid: number, signal: NodeJS.Signals) => void
 }
 
 const defaultSpawn: VmSpawn = (argv, opts) => {
@@ -314,6 +322,7 @@ export const createVmDriver = (
   const spawn = deps.spawn ?? defaultSpawn
   const now = deps.now ?? Date.now
   const sleep = deps.sleep ?? delay
+  const killProcess = deps.killProcess ?? process.kill
 
   const runDirAbs = path.resolve(config.runDir)
   const chrootBaseAbs = path.resolve(config.chrootBase)
@@ -345,6 +354,13 @@ export const createVmDriver = (
 
   const identityMarkerPath = (instanceId: string): string =>
     path.join(instanceDir(instanceId), 'vm-identity.json')
+
+  /** Log an ignored sidecar once per instance (repeated isAlive calls stay quiet). */
+  const ignoredIdentity = new Set<string>()
+
+  /** Sidecar owner must be the agent or root; group/other write makes it untrusted. */
+  const trustedOwner = (uid: number, mode: number): boolean =>
+    (uid === currentUid() || uid === 0) && (mode & 0o022) === 0
 
   /**
    * The uid a verified process must run as. In production the agent is root
@@ -394,7 +410,17 @@ export const createVmDriver = (
     }
     const dirs: string[] = []
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+      if (!entry.isDirectory() || entry.isSymbolicLink()) {
+        logger.debug(
+          {
+            op: 'vm.jailScan',
+            path: path.join(chrootBaseAbs, entry.name),
+            symlink: entry.isSymbolicLink(),
+          },
+          'skipping non-directory jail parent'
+        )
+        continue
+      }
       dirs.push(path.join(chrootBaseAbs, entry.name))
     }
     return dirs.sort()
@@ -404,13 +430,48 @@ export const createVmDriver = (
   const listJailRoots = async (instanceId: string): Promise<string[]> => {
     const roots: string[] = []
     for (const parent of await listJailParentDirs()) {
-      const candidate = path.join(parent, instanceId, 'root')
+      // Never follow an intermediate symlink: lstat every path component the
+      // driver did not create itself. A symlinked `<id>` must not turn an
+      // unrelated directory into a trust anchor (or into something destroy
+      // would remove).
+      const base = path.join(parent, instanceId)
+      let baseStat
       try {
-        const st = await lstat(candidate)
-        if (st.isDirectory() && !st.isSymbolicLink()) roots.push(candidate)
+        baseStat = await lstat(base)
+      } catch {
+        continue
+      }
+      if (baseStat.isSymbolicLink() || !baseStat.isDirectory()) {
+        logger.debug(
+          {
+            op: 'vm.jailScan',
+            path: base,
+            symlink: baseStat.isSymbolicLink(),
+          },
+          'skipping non-directory jail path (symlink or file)'
+        )
+        continue
+      }
+      const candidate = path.join(base, 'root')
+      let st
+      try {
+        st = await lstat(candidate)
       } catch {
         // not present
+        continue
       }
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        logger.debug(
+          {
+            op: 'vm.jailScan',
+            path: candidate,
+            symlink: st.isSymbolicLink(),
+          },
+          'skipping non-directory jail root (symlink or file)'
+        )
+        continue
+      }
+      roots.push(candidate)
     }
     return roots
   }
@@ -453,12 +514,61 @@ export const createVmDriver = (
   const persistedIdentity = async (
     instanceId: string
   ): Promise<PersistedIdentity | undefined> => {
-    let raw: string
-    try {
-      raw = await readFile(identityMarkerPath(instanceId), 'utf8')
-    } catch {
+    const marker = identityMarkerPath(instanceId)
+    const parent = instanceDir(instanceId)
+    const ignore = (reason: string, err?: unknown): undefined => {
+      if (!ignoredIdentity.has(marker)) {
+        ignoredIdentity.add(marker)
+        logger.warn(
+          {
+            instanceId,
+            op: 'vm.identity',
+            path: marker,
+            reason,
+            ...(err === undefined ? {} : errorFields(err)),
+          },
+          'ignoring untrusted vm identity sidecar'
+        )
+      }
       return undefined
     }
+
+    let handle: FileHandle | undefined
+    try {
+      // O_NOFOLLOW: a symlink is not an identity anchor. A regular file is
+      // then checked for owner and mode below.
+      handle = await open(marker, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        return ignore('open', err)
+      }
+      return undefined
+    }
+
+    let raw: string
+    try {
+      const st = await handle.stat()
+      if (!st.isFile() || !trustedOwner(st.uid, st.mode)) {
+        return ignore('file metadata')
+      }
+      let parentStat
+      try {
+        parentStat = await lstat(parent)
+      } catch (err) {
+        return ignore('parent', err)
+      }
+      if (
+        parentStat.isSymbolicLink() ||
+        !parentStat.isDirectory() ||
+        !trustedOwner(parentStat.uid, parentStat.mode)
+      ) {
+        return ignore('parent metadata')
+      }
+      raw = await handle.readFile('utf8')
+    } finally {
+      await handle.close().catch(() => undefined)
+    }
+
     try {
       const parsed = JSON.parse(raw) as Partial<PersistedIdentity>
       if (
@@ -511,13 +621,37 @@ export const createVmDriver = (
       apiSocket: handle.apiSocket,
       dir: handle.dir,
     }
-    await writeFile(
-      identityMarkerPath(handle.instanceId),
-      JSON.stringify(identity),
-      {
-        mode: 0o600,
+    const target = identityMarkerPath(handle.instanceId)
+    const dir = path.dirname(target)
+    // Atomic replace: tmp + fsync + rename, mode 0600. rename() replaces a
+    // symlink at the destination instead of writing through it, so even a
+    // stale/hostile marker cannot redirect the identity write.
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`
+    let file: FileHandle | undefined
+    try {
+      file = await open(tmp, 'w', 0o600)
+      await file.writeFile(JSON.stringify(identity))
+      await file.chmod(0o600)
+      await file.sync()
+      await file.close()
+      file = undefined
+      await rename(tmp, target)
+    } catch (err) {
+      await file?.close().catch(() => undefined)
+      await rm(tmp, { force: true }).catch(() => undefined)
+      throw err
+    }
+    // Best-effort directory fsync so the rename survives a crash.
+    try {
+      const dirHandle = await open(dir, 'r')
+      try {
+        await dirHandle.sync()
+      } finally {
+        await dirHandle.close()
       }
-    )
+    } catch {
+      // Some filesystems reject directory fsync; the file itself is synced.
+    }
   }
 
   /** The configured binary in direct mode, or this instance's jail copy. */
@@ -1084,27 +1218,45 @@ export const createVmDriver = (
       .sort()
   }
 
-  const readProcMounts = async (): Promise<
-    { mountpoint: string; fstype: string }[]
-  > => {
-    let raw: string
-    try {
-      raw = await readFile('/proc/mounts', 'utf8')
-    } catch {
-      return []
-    }
-    const mounts: { mountpoint: string; fstype: string }[] = []
-    for (const line of raw.split('\n')) {
-      const fields = line.trim().split(/\s+/)
-      if (fields.length < 3) continue
-      const [mountpoint, fstype] = [fields[1], fields[2]]
-      if (mountpoint === undefined || fstype === undefined) continue
-      mounts.push({ mountpoint: decodeMountPath(mountpoint), fstype })
-    }
-    return mounts
-  }
+  const readProcMounts =
+    deps.readMounts ??
+    (async (): Promise<{ mountpoint: string; fstype: string }[]> => {
+      let raw: string
+      try {
+        raw = await readFile('/proc/mounts', 'utf8')
+      } catch {
+        return []
+      }
+      const mounts: { mountpoint: string; fstype: string }[] = []
+      for (const line of raw.split('\n')) {
+        const fields = line.trim().split(/\s+/)
+        if (fields.length < 3) continue
+        const [mountpoint, fstype] = [fields[1], fields[2]]
+        if (mountpoint === undefined || fstype === undefined) continue
+        mounts.push({ mountpoint: decodeMountPath(mountpoint), fstype })
+      }
+      return mounts
+    })
 
-  const cgroupRootIsV2Mount = async (): Promise<boolean> => {
+  const cgroupRootIsUsable = async (): Promise<boolean> => {
+    // Exact mountpoint or a real descendant of a cgroup2 mount. A nonexistent
+    // descendant is not usable (jailer would fail), and the agent must be able
+    // to create the per-instance cgroup below it.
+    let st
+    try {
+      st = await stat(cgroupRootAbs)
+    } catch {
+      return false
+    }
+    if (!st.isDirectory()) return false
+    if (
+      !(await canAccess(
+        cgroupRootAbs,
+        fsConstants.R_OK | fsConstants.W_OK | fsConstants.X_OK
+      ))
+    ) {
+      return false
+    }
     const mounts = await readProcMounts()
     return mounts.some(
       mount =>
@@ -1150,25 +1302,10 @@ export const createVmDriver = (
     if (fromHandle !== undefined) {
       trusts = [fromHandle]
     } else {
-      const persisted = await persistedIdentity(handle.instanceId)
-      if (persisted !== undefined) {
-        trusts = [
-          {
-            instanceId: handle.instanceId,
-            exe: persisted.exe,
-            exePath: persisted.exePath,
-            uid: persisted.uid,
-            ...(persisted.jailRoot === undefined
-              ? {}
-              : { jailRoot: persisted.jailRoot }),
-          },
-        ]
-      } else {
-        // A handle written by an older agent (or one whose optional identity
-        // fields were stripped by the manager's persisted-record schema) still
-        // recovers its trust anchor from the jail copy/marker on disk.
-        trusts = await trustsForInstance(handle.instanceId)
-      }
+      // A valid-but-stale sidecar must not hide the other anchors (jail copy,
+      // configured binary), and a handle written by an older agent (or whose
+      // optional identity fields were stripped) still recovers one from disk.
+      trusts = await trustsForInstance(handle.instanceId)
     }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1372,136 +1509,188 @@ export const createVmDriver = (
   interface TerminationTarget {
     pid: number
     startTicks: number
-    trust?: InstanceTrust
+    expectation: ProcessExpectation
+  }
+
+  /** A now-closed window: three empty scans spread over at least 400ms. */
+  const ROLLBACK_EMPTY_SCANS = 3
+  const ROLLBACK_SETTLE_MS = 400
+  const ROLLBACK_SCAN_INTERVAL_MS = 100
+  const ROLLBACK_MAX_MS = 3000
+
+  /**
+   * The pre-exec jailer child. Jailer clones before it execs Firecracker, so
+   * the child still runs the *jailer* executable and keeps the jailer argv
+   * (`--id <id>`). This is the only pre-exec identity we accept: command-line
+   * text alone (e.g. a path mentioned as an argument) never authorizes a kill.
+   */
+  const preExecJailerExpectation = async (
+    instanceId: string
+  ): Promise<ProcessExpectation | undefined> => {
+    if (config.mode !== 'jailer') return undefined
+    const exe = await identityAt(jailerBinAbs)
+    if (exe === undefined) return undefined
+    return { instanceId, exe, uid: currentUid() }
+  }
+
+  const looksLikeVmExecutable = (exe: string): boolean => {
+    const target = exe.endsWith(' (deleted)')
+      ? exe.slice(0, -' (deleted)'.length)
+      : exe
+    return /^(?:firecracker|jailer)(?:[._-].*)?$/i.test(path.basename(target))
   }
 
   /**
-   * A jail-contained process that does not yet expose the Firecracker
-   * executable (jailer clones before the child drops credentials and execs).
-   * Such a child is ours when its root/cwd is inside the jail or its cmdline
-   * mentions the instance's jail path; the uid must be the jail uid or the
-   * agent uid (before setuid).
+   * Processes that claim this instance (`--id <id>`) and look like a
+   * Firecracker/Jailer binary but do not authenticate against ANY known anchor
+   * (sidecar, current jail executable, configured binaries). Such a process is
+   * never signalled: destroy must fail and keep the storage so the manager
+   * keeps the teardown pending for operator intervention.
    */
-  const findJailContainedProcesses = async (
+  const findUnresolvedProcesses = async (
     instanceId: string,
-    jailRoots: string[]
-  ): Promise<TerminationTarget[]> => {
-    if (jailRoots.length === 0) return []
-    const jailBases = jailRoots.map(root => path.dirname(root))
-    const initialUidSets = new Set<number>(
-      jailRoots.map(root => expectedUidFor(root))
-    )
-    initialUidSets.add(currentUid())
-    const found: TerminationTarget[] = []
+    trusts: InstanceTrust[]
+  ): Promise<{ pid: number; exe: string }[]> => {
+    const expectations = trusts.map(trustExpectation)
+    const preExec = await preExecJailerExpectation(instanceId)
+    const unresolved: { pid: number; exe: string }[] = []
     for (const pid of await listPids()) {
       const snapshot = await readProcSnapshot(pid)
       if (snapshot === undefined) continue
-      if (
-        snapshot.uid === undefined ||
-        ![...initialUidSets].some(uid => uid === snapshot.uid)
-      ) {
-        continue
+      if (!hasInstanceIdArg(snapshot.argv, instanceId)) continue
+      if (!looksLikeVmExecutable(snapshot.exe)) continue
+      let authenticated = false
+      for (const expectation of expectations) {
+        if ((await inspectProcess(pid, expectation)) !== undefined) {
+          authenticated = true
+          break
+        }
       }
-      const cwd = await readProcCwd(pid)
-      const roots = [snapshot.root, cwd].filter(
-        (value): value is string => value !== undefined
-      )
-      const rootInside = roots.some(root =>
-        jailRoots.some(
-          jailRoot => root === jailRoot || isPathInside(jailRoot, root)
-        )
-      )
-      const cmdlineHits = snapshot.argv.some(arg =>
-        [...jailRoots, ...jailBases].some(
-          jailPath => arg === jailPath || isPathInside(jailPath, arg)
-        )
-      )
-      if (!rootInside && !cmdlineHits) continue
-      found.push({ pid, startTicks: snapshot.startTicks })
+      if (
+        !authenticated &&
+        preExec !== undefined &&
+        (await inspectProcess(pid, preExec)) !== undefined
+      ) {
+        authenticated = true
+      }
+      if (!authenticated) unresolved.push({ pid, exe: snapshot.exe })
     }
-    return found
+    return unresolved
   }
 
   /**
    * Kill every process that can be authenticated for this instance.
    *
-   * Verification happens immediately before every signal (there is still a
-   * check-to-signal window because Bun has no pidfd API; start ticks are
-   * re-read in the same scan and compared again). Storage may only be removed
-   * after two consecutive scans find nothing, so a jailer child that appears
-   * between clone and exec is caught.
+   * Verification happens immediately before every signal. Storage may only be
+   * removed after three consecutive empty scans spread over at least 400ms, so
+   * a jailer child that appears between clone and exec (which can take longer
+   * than two quick scans) is still caught. The whole scan is bounded.
    */
   const terminateInstanceProcesses = async (
     instanceId: string,
     trusts?: InstanceTrust[]
   ): Promise<boolean> => {
     const anchors = trusts ?? (await trustsForInstance(instanceId))
-    const jailRoots = await listJailRoots(instanceId)
-    const deadline = now() + Math.max(config.killWaitMs, 1000)
+    const preExec = await preExecJailerExpectation(instanceId)
+    const deadline =
+      now() +
+      Math.min(
+        Math.max(
+          config.killWaitMs,
+          ROLLBACK_SETTLE_MS + ROLLBACK_SCAN_INTERVAL_MS
+        ),
+        ROLLBACK_MAX_MS
+      )
     let emptyScans = 0
+    let firstEmptyAt: number | undefined
     for (;;) {
+      const at = now()
       const targets = new Map<number, TerminationTarget>()
       for (const trust of anchors) {
-        for (const proc of await findInstanceProcesses(
-          trustExpectation(trust)
-        )) {
+        const expectation = trustExpectation(trust)
+        for (const proc of await findInstanceProcesses(expectation)) {
           targets.set(proc.pid, {
             pid: proc.pid,
             startTicks: proc.startTicks,
-            trust,
+            expectation,
           })
         }
       }
-      for (const proc of await findJailContainedProcesses(
-        instanceId,
-        jailRoots
-      )) {
-        if (!targets.has(proc.pid)) targets.set(proc.pid, proc)
+      if (preExec !== undefined) {
+        for (const proc of await findInstanceProcesses(preExec)) {
+          if (!targets.has(proc.pid)) {
+            targets.set(proc.pid, {
+              pid: proc.pid,
+              startTicks: proc.startTicks,
+              expectation: preExec,
+            })
+          }
+        }
       }
 
       if (targets.size === 0) {
         emptyScans += 1
-        if (emptyScans >= 2) return true
+        if (firstEmptyAt === undefined) firstEmptyAt = at
+        if (
+          emptyScans >= ROLLBACK_EMPTY_SCANS &&
+          at - firstEmptyAt >= ROLLBACK_SETTLE_MS
+        ) {
+          return true
+        }
       } else {
         emptyScans = 0
+        firstEmptyAt = undefined
         for (const target of targets.values()) {
           // Re-verify the exact process immediately before the signal.
-          let verified = false
-          if (target.trust !== undefined) {
-            verified = await processMatchesIdentity(
+          if (
+            !(await processMatchesIdentity(
               target.pid,
               target.startTicks,
-              trustExpectation(target.trust)
-            )
-          } else {
-            const current = await readProcSnapshot(target.pid)
-            verified =
-              current !== undefined &&
-              current.startTicks === target.startTicks &&
-              (await findJailContainedProcesses(instanceId, jailRoots)).some(
-                proc =>
-                  proc.pid === target.pid &&
-                  proc.startTicks === target.startTicks
-              )
+              target.expectation
+            ))
+          ) {
+            continue
           }
-          if (!verified) continue
           try {
-            process.kill(target.pid, 'SIGKILL')
+            killProcess(target.pid, 'SIGKILL')
           } catch (err) {
             if ((err as NodeJS.ErrnoException).code !== 'ESRCH') throw err
           }
         }
       }
 
-      if (now() >= deadline) return false
-      await sleep(50)
+      if (at >= deadline) return false
+      await sleep(ROLLBACK_SCAN_INTERVAL_MS)
     }
   }
 
   const destroy = async (instanceId: string): Promise<void> => {
     assertInstanceId(instanceId)
-    if (!(await terminateInstanceProcesses(instanceId))) {
+    const trusts = await trustsForInstance(instanceId)
+    if (!(await terminateInstanceProcesses(instanceId, trusts))) {
       throw new Error(`firecracker for ${instanceId} survived SIGKILL`)
+    }
+    // Never declare a process absent when it cannot be authenticated: a
+    // previous-binary VM without a sidecar must keep its storage so the
+    // manager retries the teardown (and an operator can intervene).
+    const unresolved = await findUnresolvedProcesses(instanceId, trusts)
+    if (unresolved.length > 0) {
+      logger.error(
+        {
+          instanceId,
+          op: 'vm.destroy',
+          unresolved: unresolved.map(proc => ({
+            pid: proc.pid,
+            exe: path.basename(proc.exe),
+          })),
+        },
+        'unresolved process for instance; refusing to remove storage'
+      )
+      throw new Error(
+        `unresolved process for ${instanceId} (pid ${unresolved
+          .map(proc => proc.pid)
+          .join(', ')})`
+      )
     }
     await removeInstanceStorage(instanceId)
     await removeCgroups(instanceId)
@@ -1632,8 +1821,8 @@ export const createVmDriver = (
       if (child !== undefined) await killChild(child, childStartTicks)
       // In jailer mode Firecracker is a child of a (usually already exited)
       // jailer, and the pid file may be missing entirely. Scan for every
-      // strictly-identified or jail-contained process instead of trusting the
-      // tracked pid.
+      // strictly-identified process (post-exec Firecracker or pre-exec jailer
+      // child) instead of trusting the tracked pid.
       const terminated = await terminateInstanceProcesses(request.instanceId)
       if (!terminated) {
         // Keep the storage: `listInstanceIds` still reports it, so the
@@ -1819,6 +2008,17 @@ export const createVmDriver = (
     }
   }
 
+  const isDirectoryReadable = async (target: string): Promise<boolean> => {
+    try {
+      const st = await stat(target)
+      if (!st.isDirectory()) return false
+      await access(target, fsConstants.R_OK | fsConstants.X_OK)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   const isDirectoryAccessible = async (target: string): Promise<boolean> => {
     try {
       const st = await stat(target)
@@ -1865,13 +2065,15 @@ export const createVmDriver = (
       firecrackerBin: await isExecutable(firecrackerBinAbs),
       jailerBin:
         config.mode === 'jailer' ? await isExecutable(jailerBinAbs) : true,
-      imagesDir: await isDirectoryAccessible(config.imagesDir),
+      imagesDir: await isDirectoryReadable(config.imagesDir),
       imagesTrusted: await checkImagesTrusted(config),
       runDir: await isDirectoryAccessible(runDirAbs),
       // Jailer discovers its cgroup-v2 hierarchy from /proc/mounts; if the
       // configured root is not a cgroup2 mount, jailer would create dirs on
-      // the wrong filesystem (or fail). Report it instead of guessing.
-      cgroupRoot: await cgroupRootIsV2Mount(),
+      // the wrong filesystem (or fail). Report it instead of guessing. The
+      // directory must exist and be writable (per-instance cgroups are
+      // created below it).
+      cgroupRoot: await cgroupRootIsUsable(),
       chrootBase:
         config.mode === 'jailer'
           ? await canAccess(chrootBaseAbs, fsConstants.W_OK | fsConstants.X_OK)

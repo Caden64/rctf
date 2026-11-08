@@ -118,6 +118,100 @@ describe('preflight', () => {
   })
 })
 
+describe('preflight: cgroup and images accuracy', () => {
+  test('cgroupRoot must exist, sit on cgroup2 and be writable', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const firecrackerBin = await bin(root, 'firecracker')
+    const config = await makeVmConfig({
+      dirs,
+      overrides: { firecrackerBin },
+    })
+    const readMounts = async (): Promise<
+      { mountpoint: string; fstype: string }[]
+    > => [{ mountpoint: dirs.cgroupRoot, fstype: 'cgroup2' }]
+    const driver = createVmDriver(config, {
+      logger: makeLogger().logger,
+      readMounts,
+    })
+    // Exists, on a cgroup2 mount, writable.
+    expect((await driver.preflight()).checks.cgroupRoot).toBe(true)
+
+    await chmod(dirs.cgroupRoot, 0o500)
+    expect((await driver.preflight()).checks.cgroupRoot).toBe(false)
+    await chmod(dirs.cgroupRoot, 0o700)
+
+    // A nonexistent descendant of a cgroup2 mount is not usable either.
+    const missing = await makeVmConfig({
+      dirs,
+      overrides: {
+        firecrackerBin,
+        cgroupRoot: path.join(dirs.cgroupRoot, 'does-not-exist'),
+      },
+    })
+    const missingDriver = createVmDriver(missing, {
+      logger: makeLogger().logger,
+      readMounts,
+    })
+    expect((await missingDriver.preflight()).checks.cgroupRoot).toBe(false)
+  })
+
+  test('a nonexistent descendant of the real cgroup2 mount is rejected', async () => {
+    const { readFile } = await import('node:fs/promises')
+    let mounts = ''
+    try {
+      mounts = await readFile('/proc/mounts', 'utf8')
+    } catch {
+      return
+    }
+    const mount = mounts
+      .split('\n')
+      .map(line => line.trim().split(/\s+/))
+      .find(fields => fields[2] === 'cgroup2')?.[1]
+    if (mount === undefined) return
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const firecrackerBin = await bin(root, 'firecracker')
+    const config = await makeVmConfig({
+      dirs,
+      overrides: {
+        firecrackerBin,
+        cgroupRoot: path.join(
+          mount.replaceAll('\\040', ' '),
+          `rctf-missing-${process.pid}`
+        ),
+      },
+    })
+    const driver = createVmDriver(config, { logger: makeLogger().logger })
+    expect((await driver.preflight()).checks.cgroupRoot).toBe(false)
+  })
+
+  test('imagesDir only needs read access (jailer drops to a non-root uid)', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const firecrackerBin = await bin(root, 'firecracker')
+    const jailerBin = await bin(root, 'jailer')
+    const config = await makeVmConfig({
+      dirs,
+      overrides: { mode: 'jailer', firecrackerBin, jailerBin },
+    })
+    await makeImage(config.imagesDir, 'web-demo')
+    await chmod(config.imagesDir, 0o500)
+    try {
+      const driver = createVmDriver(config, { logger: makeLogger().logger })
+      const result = await driver.preflight()
+      expect(result.checks.imagesDir).toBe(true)
+      expect(result.checks.runDir).toBe(true)
+      expect(result.images).toEqual(['web-demo'])
+    } finally {
+      await chmod(config.imagesDir, 0o700)
+    }
+  })
+})
+
 describe('preflight: API socket path length', () => {
   test('flags a runDir so deep that <runDir>/<id>/api.sock exceeds SUN_LEN', async () => {
     // Found by a real run: Firecracker exits with "path must be shorter than
