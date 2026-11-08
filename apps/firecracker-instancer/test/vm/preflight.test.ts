@@ -34,7 +34,7 @@ describe('preflight', () => {
     const jailerBin = await bin(root, 'jailer')
     const config = await makeVmConfig({
       dirs,
-      overrides: { firecrackerBin, jailerBin },
+      overrides: { firecrackerBin, jailerBin, mode: 'jailer' },
     })
     await makeImage(config.imagesDir, 'web-demo')
     const driver = createVmDriver(config, { logger: makeLogger().logger })
@@ -119,6 +119,26 @@ describe('preflight', () => {
 })
 
 describe('preflight: cgroup and images accuracy', () => {
+  test('direct mode does not require a usable cgroupRoot', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const firecrackerBin = await bin(root, 'firecracker')
+    const config = await makeVmConfig({
+      dirs,
+      overrides: {
+        firecrackerBin,
+        mode: 'direct',
+        cgroupRoot: path.join(dirs.cgroupRoot, 'does-not-exist'),
+      },
+    })
+    const driver = createVmDriver(config, {
+      logger: makeLogger().logger,
+      readMounts: async () => [],
+    })
+    expect((await driver.preflight()).checks.cgroupRoot).toBe(true)
+  })
+
   test('cgroupRoot must exist, sit on cgroup2 and be writable', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
     roots.push(root)
@@ -126,7 +146,7 @@ describe('preflight: cgroup and images accuracy', () => {
     const firecrackerBin = await bin(root, 'firecracker')
     const config = await makeVmConfig({
       dirs,
-      overrides: { firecrackerBin },
+      overrides: { firecrackerBin, mode: 'jailer' },
     })
     const readMounts = async (): Promise<
       { mountpoint: string; fstype: string }[]
@@ -147,6 +167,7 @@ describe('preflight: cgroup and images accuracy', () => {
       dirs,
       overrides: {
         firecrackerBin,
+        mode: 'jailer',
         cgroupRoot: path.join(dirs.cgroupRoot, 'does-not-exist'),
       },
     })
@@ -178,6 +199,7 @@ describe('preflight: cgroup and images accuracy', () => {
       dirs,
       overrides: {
         firecrackerBin,
+        mode: 'jailer',
         cgroupRoot: path.join(
           mount.replaceAll('\\040', ' '),
           `rctf-missing-${process.pid}`

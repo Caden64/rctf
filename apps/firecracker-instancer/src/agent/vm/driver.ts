@@ -2072,8 +2072,9 @@ export const createVmDriver = (
       // configured root is not a cgroup2 mount, jailer would create dirs on
       // the wrong filesystem (or fail). Report it instead of guessing. The
       // directory must exist and be writable (per-instance cgroups are
-      // created below it).
-      cgroupRoot: await cgroupRootIsUsable(),
+      // created below it). Direct mode never uses cgroups, so it is not
+      // required there (like chrootBase).
+      cgroupRoot: config.mode === 'jailer' ? await cgroupRootIsUsable() : true,
       chrootBase:
         config.mode === 'jailer'
           ? await canAccess(chrootBaseAbs, fsConstants.W_OK | fsConstants.X_OK)
