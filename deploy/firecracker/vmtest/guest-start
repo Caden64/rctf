@@ -1,0 +1,44 @@
+#!/bin/sh
+# Test-only guest service (installed as /app/start by provision.sh).
+#
+# The reference smoke guest copies the flag onto /www (the ext4 rootfs), which
+# makes "the flag is nowhere on host disk" impossible to assert. This service
+# keeps the flag on the tmpfs mounted at /run and only ever reads it from
+# $RCTF_FLAGS_DIR. It also continuously measures, from inside the guest:
+#
+#   PROBE_PEERS    space-separated guest IPs; probes http://<ip>:8080/index.html
+#   PROBE_OUTSIDE  host:port of an "outside" HTTP service; probes http://<host:port>/
+#
+# Results are served as /probe.txt from tmpfs. Both are non-secret env values
+# delivered through the MMDS document, like a real challenge's environment.
+set -u
+
+WWW=/run/www
+mkdir -p "$WWW"
+cp "$RCTF_FLAGS_DIR/main" "$WWW/flag.txt"
+chmod 0644 "$WWW/flag.txt"
+echo ok >"$WWW/index.html"
+PEERS=${PROBE_PEERS:-}
+OUTSIDE=${PROBE_OUTSIDE:-}
+
+(
+  SELF=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+  while :; do
+    line=
+    for ip in $PEERS; do
+      [ "$ip" = "$SELF" ] && continue
+      st=blocked
+      wget -T 1 -qO- "http://$ip:8080/index.html" >/dev/null 2>&1 && st=REACHED
+      line="$line peer:$ip=$st"
+    done
+    if [ -n "$OUTSIDE" ]; then
+      st=blocked
+      wget -T 2 -qO- "http://$OUTSIDE/" >/dev/null 2>&1 && st=REACHED
+      line="$line outside=$st"
+    fi
+    printf '%s\n' "${line# }" >"$WWW/probe.tmp" && mv "$WWW/probe.tmp" "$WWW/probe.txt"
+    sleep 1
+  done
+) &
+
+exec httpd -f -p 8080 -h "$WWW"
