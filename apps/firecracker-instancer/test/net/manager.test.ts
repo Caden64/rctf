@@ -1289,6 +1289,31 @@ describe('quarantine persistence', () => {
     expect(lease.publicPorts[0]).toBe(20000)
   })
 
+  test('a quarantine write failure does not block release; in-memory quarantine still applies', async () => {
+    const { clock } = mutableClock()
+    const config = await makeTempConfig()
+    // The parent does not exist at construction (load -> missing), then becomes
+    // an un-creatable path (a file) before release -> save fails.
+    const quarantineDir = join(config.traefikDynamicDir, '..', 'qdir')
+    config.quarantineFile = join(quarantineDir, 'net-quarantine.json')
+    const host = new FakeHost()
+    const manager = createNetworkManager(config, { runner: host, clock })
+    const lease = await manager.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    })
+    await writeFile(quarantineDir, 'not a directory')
+    await manager.release(lease.instanceId)
+    expect(host.links.has(lease.tapName)).toBe(false)
+    const next = await manager.allocate({
+      instanceId: instanceId(2),
+      egress: false,
+      expose: [],
+    })
+    expect(next.guestIp).not.toBe(lease.guestIp)
+  })
+
   test('writes only resource ids + expiry to a 0600 file', async () => {
     const { config, manager } = await setup()
     const lease = await manager.allocate({
