@@ -94,6 +94,22 @@ export interface Residue {
   hostnames: number
 }
 
+/** A controllable async gate for delayed/stalled fake operations. */
+export interface Gate {
+  promise: Promise<void>
+  open: () => void
+}
+
+export const makeGate = (): Gate => {
+  let open!: () => void
+  const promise = new Promise<void>(resolve => {
+    open = resolve
+  })
+  return { promise, open }
+}
+
+export const never = (): Promise<void> => new Promise<void>(() => {})
+
 const isTcpKind = (kind: string): boolean => kind === 'tcp' || kind === 'raw'
 
 let leaseCounter = 0
@@ -151,7 +167,18 @@ export class FakeNetworkManager implements NetworkManager {
   failPublish = false
   failUnpublish = false
   failRelease = false
+  failRestore = false
   allocateError?: Error
+  publishError?: Error
+  unpublishError?: Error
+  releaseError?: Error
+  restoreError?: Error
+  allocateGate?: Promise<void>
+  publishGate?: Promise<void>
+  publishStartGate?: Promise<void>
+  restoreGate?: Promise<void>
+  unpublishGate?: Promise<void>
+  releaseGate?: Promise<void>
 
   constructor(
     readonly publicHost = 'fc.example.com',
@@ -164,6 +191,7 @@ export class FakeNetworkManager implements NetworkManager {
     expose: NetExposeRequest[]
   }): Promise<NetLease> {
     this.allocateCalls += 1
+    if (this.allocateGate) await this.allocateGate
     if (this.allocateError) throw this.allocateError
     if (this.failAllocate) throw new Error('allocate failed')
     const existing = this.leases.get(req.instanceId)
@@ -175,18 +203,25 @@ export class FakeNetworkManager implements NetworkManager {
 
   async publish(lease: NetLease, _expose: NetExposeRequest[]): Promise<void> {
     this.publishCalls += 1
+    if (this.publishStartGate) await this.publishStartGate
+    if (this.publishError) throw this.publishError
     if (this.failPublish) throw new Error('publish failed')
     this.published.add(lease.instanceId)
+    if (this.publishGate) await this.publishGate
   }
 
   async unpublish(instanceId: string): Promise<void> {
     this.unpublishCalls += 1
+    if (this.unpublishGate) await this.unpublishGate
+    if (this.unpublishError) throw this.unpublishError
     if (this.failUnpublish) throw new Error('unpublish failed')
     this.published.delete(instanceId)
   }
 
   async release(instanceId: string): Promise<void> {
     this.releaseCalls += 1
+    if (this.releaseGate) await this.releaseGate
+    if (this.releaseError) throw this.releaseError
     if (this.failRelease) throw new Error('release failed')
     this.published.delete(instanceId)
     this.leases.delete(instanceId)
@@ -212,6 +247,9 @@ export class FakeNetworkManager implements NetworkManager {
 
   async restore(leases: NetLease[]): Promise<{ removedOrphans: string[] }> {
     this.restoreCalls += 1
+    if (this.restoreGate) await this.restoreGate
+    if (this.restoreError) throw this.restoreError
+    if (this.failRestore) throw new Error('restore failed')
     this.lastRestored = leases
     const keep = new Set(leases.map(lease => lease.instanceId))
     const removedOrphans: string[] = []
@@ -259,7 +297,22 @@ export class FakeVmDriver implements VmDriver {
   adoptCalls = 0
   failLaunch = false
   failWaitReady = false
+  failStop = false
+  failDestroy = false
+  failAdopt = false
+  failIsAlive = false
+  failList = false
   launchError?: Error
+  waitReadyError?: Error
+  stopError?: Error
+  destroyError?: Error
+  adoptError?: Error
+  isAliveError?: Error
+  listError?: Error
+  launchGate?: Promise<void>
+  launchStartGate?: Promise<void>
+  stopGate?: (instanceId: string) => Promise<void> | undefined
+  destroyGate?: (instanceId: string) => Promise<void> | undefined
   waitReadyHook?: (
     instanceId: string,
     signal: AbortSignal | undefined
@@ -268,6 +321,7 @@ export class FakeVmDriver implements VmDriver {
 
   async launch(request: VmLaunchRequest): Promise<VmHandle> {
     this.launchCalls += 1
+    if (this.launchStartGate) await this.launchStartGate
     if (this.launchError) throw this.launchError
     if (this.failLaunch) throw new Error('launch failed')
     const handle: VmHandle = {
@@ -279,10 +333,15 @@ export class FakeVmDriver implements VmDriver {
     }
     this.handles.set(request.instanceId, handle)
     this.alive.add(request.instanceId)
+    // Crash injection: side effects happen, then the process "dies" before the
+    // manager can persist the returned handle.
+    if (this.launchGate) await this.launchGate
     return handle
   }
 
   async isAlive(handle: VmHandle): Promise<boolean> {
+    if (this.isAliveError) throw this.isAliveError
+    if (this.failIsAlive) throw new Error('isAlive failed')
     return this.alive.has(handle.instanceId)
   }
 
@@ -292,6 +351,7 @@ export class FakeVmDriver implements VmDriver {
     signal?: AbortSignal
   ): Promise<void> {
     this.waitReadyCalls += 1
+    if (this.waitReadyError) throw this.waitReadyError
     if (this.failWaitReady) throw new Error('readiness failed')
     if (this.waitReadyHook) {
       await this.waitReadyHook(handle.instanceId, signal)
@@ -304,22 +364,34 @@ export class FakeVmDriver implements VmDriver {
 
   async stop(handle: VmHandle, _opts: { graceMs: number }): Promise<void> {
     this.stopCalls += 1
+    const gate = this.stopGate?.(handle.instanceId)
+    if (gate) await gate
+    if (this.stopError) throw this.stopError
+    if (this.failStop) throw new Error('stop failed')
     this.alive.delete(handle.instanceId)
   }
 
   async destroy(instanceId: string): Promise<void> {
     this.destroyCalls += 1
+    const gate = this.destroyGate?.(instanceId)
+    if (gate) await gate
+    if (this.destroyError) throw this.destroyError
+    if (this.failDestroy) throw new Error('destroy failed')
     this.destroyedIds.push(instanceId)
     this.alive.delete(instanceId)
     this.handles.delete(instanceId)
   }
 
   async listInstanceIds(): Promise<string[]> {
+    if (this.listError) throw this.listError
+    if (this.failList) throw new Error('list failed')
     return [...new Set([...this.handles.keys(), ...this.extraOrphans])]
   }
 
   async adopt(instanceId: string): Promise<VmHandle | undefined> {
     this.adoptCalls += 1
+    if (this.adoptError) throw this.adoptError
+    if (this.failAdopt) throw new Error('adopt failed')
     return this.alive.has(instanceId) ? this.handles.get(instanceId) : undefined
   }
 
@@ -366,7 +438,15 @@ export const readTree = async (
       const full = path.join(current, entry.name)
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name
       if (entry.isDirectory()) await walk(full, rel)
-      else if (entry.isFile()) out[rel] = await readFile(full, 'utf8')
+      else if (entry.isFile()) {
+        try {
+          out[rel] = await readFile(full, 'utf8')
+        } catch (err) {
+          // A concurrent atomic rename can remove a file between readdir and
+          // read; treat that as "not present in this snapshot".
+          if ((err as { code?: string }).code !== 'ENOENT') throw err
+        }
+      }
     }
   }
   await walk(dir, '')

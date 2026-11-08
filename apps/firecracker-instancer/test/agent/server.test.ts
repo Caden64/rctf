@@ -24,12 +24,17 @@ interface ServerHarness {
   headers: Record<string, string>
 }
 
-const setup = async (): Promise<ServerHarness> => {
+const setup = async (deps?: {
+  maxRequestBodyBytes?: number
+}): Promise<ServerHarness> => {
   const harness = await createHarness()
   harnesses.push(harness)
   const server = createAgentServer({
     config: harness.config,
     manager: harness.mgr,
+    ...(deps?.maxRequestBodyBytes === undefined
+      ? {}
+      : { maxRequestBodyBytes: deps.maxRequestBodyBytes }),
   })
   servers.push(server)
   return {
@@ -217,9 +222,38 @@ describe('agent HTTP instance routes', () => {
       body: 'x'.repeat(MAX_REQUEST_BODY_BYTES + 1),
     })
     expect(response.status).toBe(413)
+  })
+
+  it('cancels chunked bodies that stream past 1 MiB', async () => {
+    // Raise Bun's transport cap so the handler's streaming byte count is the
+    // mechanism under test (production keeps the transport cap at the limit).
+    const ctx = await setup({ maxRequestBodyBytes: MAX_REQUEST_BODY_BYTES * 4 })
+    const spec = makeSpec()
+    const chunk = new Uint8Array(64 * 1024).fill(120)
+    const total = Math.ceil((MAX_REQUEST_BODY_BYTES + 1) / chunk.byteLength) + 8
+    let sent = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= total) {
+          controller.close()
+          return
+        }
+        sent += 1
+        controller.enqueue(chunk)
+      },
+    })
+    const response = await fetch(`${ctx.base}/v1/instances/${spec.id}`, {
+      method: 'PUT',
+      headers: ctx.headers,
+      body,
+      duplex: 'half',
+    })
+    expect(response.status).toBe(413)
     expect(agentErrorSchema.parse(await response.json()).code).toBe(
       'invalid_request'
     )
+    // The request was cancelled mid-stream, not read to completion.
+    expect(sent).toBeLessThan(total)
   })
 
   it('returns 404 for unknown routes and instances', async () => {

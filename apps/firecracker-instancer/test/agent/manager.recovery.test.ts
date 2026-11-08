@@ -88,7 +88,11 @@ describe('agent restart recovery', () => {
     await mgr2.start()
     await mgr2.start()
 
-    expect((await mgr2.get(spec.id))?.state).toBe('running')
+    const recovered = await waitFor(async () => {
+      const current = await mgr2.get(spec.id)
+      return current?.state === 'running' ? current : undefined
+    })
+    expect(recovered.state).toBe('running')
     expect(harness.vm.destroyedIds).not.toContain(spec.id)
   })
 
@@ -121,7 +125,7 @@ describe('agent restart recovery', () => {
     )
   })
 
-  it('drops a creating record that has no live VM', async () => {
+  it('abandons a creating record without a live VM and keeps an errored tombstone', async () => {
     const harness = await setup()
     const spec = makeSpec()
     const lease = leaseToJson(makeLease(spec.id, toExpose(spec.expose)))
@@ -137,9 +141,11 @@ describe('agent restart recovery', () => {
     const mgr2 = harness.spawn({ net: net2 })
     await mgr2.start()
 
-    expect(await mgr2.get(spec.id)).toBeUndefined()
+    const recovered = await mgr2.get(spec.id)
+    expect(recovered?.state).toBe('errored')
+    expect(recovered?.message).toBe('agent restarted during provisioning')
     expect(net2.releaseCalls).toBeGreaterThan(0)
-    expect(Object.keys(await readTree(harness.dir))).not.toContain(
+    expect(Object.keys(await readTree(harness.dir))).toContain(
       `${spec.id}.json`
     )
   })
