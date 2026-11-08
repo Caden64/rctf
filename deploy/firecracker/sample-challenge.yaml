@@ -1,0 +1,29 @@
+# One Firecracker microVM per team. See deploy/firecracker/guest/README.md for the image.
+name: Firecracker Web Demo
+category: web
+description: A tiny web service running in its own microVM per team.
+flags:
+  - provider: flags/static
+    config:
+      flag: rctf{example}
+instancerConfig:
+  instancer: firecracker # key in the rctf.d `instancers` map
+  challengeIntegrationId: fc-web-demo # never change after launch
+  timeoutMilliseconds: 1800000
+  extendable: true
+  config:
+    image: web-demo # <imagesDir>/web-demo/{vmlinux,rootfs.ext4} on every host
+    vcpus: 1
+    memMiB: 256
+    diskMiB: 1024
+    egress: false
+    bootTimeoutSeconds: 60
+    readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
+    env:
+      CHALLENGE: fc-web-demo
+  expose:
+    - kind: https
+      hostPrefix: fc-web-demo
+      containerName: app # must be 'app' for the Firecracker instancer
+      containerPort: 8080
+      title: Challenge

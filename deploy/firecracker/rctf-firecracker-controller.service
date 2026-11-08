@@ -1,0 +1,31 @@
+[Unit]
+Description=rCTF Firecracker controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Unprivileged: the controller only needs the network and its SQLite file.
+User=rctf-fc
+Group=rctf-fc
+EnvironmentFile=/etc/rctf-firecracker/controller.env
+ExecStart=/usr/local/bin/bun /opt/rctf/apps/firecracker-instancer/src/controller/index.ts /etc/rctf-firecracker/controller.yaml
+Restart=on-failure
+RestartSec=2
+# Give in-flight creates/deletes time to finish (the controller drains for up to 30s).
+TimeoutStopSec=45
+StateDirectory=rctf-firecracker
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=multi-user.target

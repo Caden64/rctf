@@ -1,0 +1,37 @@
+# rCTF Firecracker host agent. Runs as root on every KVM host.
+# Secret: FIRECRACKER_AGENT_TOKEN (the same value as the controller's FIRECRACKER_HOST_TOKEN_<ID>).
+hostId: fc1 # must match hosts[].id in the controller config
+listen:
+  host: 10.0.0.11 # PRIVATE address reachable only from the controller (never 0.0.0.0 on a public NIC)
+  port: 7001
+stateDir: /var/lib/rctf-firecracker/state
+capacity: # what this host may run (the controller reserves against min(its config, this))
+  vcpus: 32
+  memMiB: 65536
+  diskMiB: 400000
+  maxInstances: 64
+expiryGraceSeconds: 120 # destroy a VM this long after its deadline even if the controller is gone
+
+vm:
+  mode: jailer # 'direct' is for development only
+  firecrackerBin: /usr/local/bin/firecracker
+  jailerBin: /usr/local/bin/jailer
+  imagesDir: /var/lib/rctf-firecracker/images # <name>/{vmlinux,rootfs.ext4}
+  runDir: /var/lib/rctf-firecracker/run # use a reflink-capable fs (xfs reflink=1 / btrfs) for fast per-VM copies
+  chrootBase: /var/lib/rctf-firecracker/jailer
+  jailUid: 10000
+  jailGid: 10000
+  cgroupLimits: [] # e.g. ['pids.max=512']
+
+network:
+  publicHost: fc1.ctf.example.com # returned for tcp/raw endpoints (DNAT ports)
+  httpDomain: fc1.ctf.example.com # http/https/tcp-ssl hostnames are <hostPrefix>-<id>.<httpDomain>
+  externalInterface: eth0
+  httpPort: 80
+  httpsPort: 443
+  tcpSslPort: 443
+  tcpPortRange: { from: 20000, to: 29999 }
+  subnetPool: 10.200.0.0/16 # one /30 per VM
+  traefikDynamicDir: /etc/traefik/dynamic/rctf-firecracker
+  tapUser: '10000' # must equal vm.jailUid / jailGid
+  tapGroup: '10000'

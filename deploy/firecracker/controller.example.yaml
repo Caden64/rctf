@@ -1,0 +1,33 @@
+# rCTF Firecracker controller. Runs on one machine (no privileges, no KVM needed).
+# Secrets (authToken, adminToken, teamKeySecret, hosts[].token) should come from the
+# environment, not this file:
+#   FIRECRACKER_CONTROLLER_AUTH_TOKEN   rCTF API  -> controller
+#   FIRECRACKER_CONTROLLER_ADMIN_TOKEN  operator  -> controller (must differ from the one above)
+#   FIRECRACKER_TEAM_KEY_SECRET         HMAC secret for the per-team key sent to hosts (REQUIRED)
+#   FIRECRACKER_HOST_TOKEN_<HOST_ID>    controller -> agent token, e.g. FIRECRACKER_HOST_TOKEN_FC1
+listen:
+  host: 127.0.0.1 # put a TLS reverse proxy in front, or bind a private address
+  port: 7000
+databasePath: /var/lib/rctf-firecracker/controller.sqlite
+
+hosts:
+  - id: fc1
+    url: https://fc1.internal.example.com:7001 # the agent's listen address
+    # caCertificate: |            # PEM to trust when the agent uses a private CA
+    #   -----BEGIN CERTIFICATE-----
+    capacity: # must not exceed what the host can really run
+      vcpus: 32
+      memMiB: 65536
+      diskMiB: 400000
+      maxInstances: 64
+  # - id: fc2 ...
+
+# overcommit:           # default: none. Reservations may exceed capacity by these factors.
+#   vcpu: 2
+#   mem: 1
+heartbeatIntervalSeconds: 5
+hostTimeoutSeconds: 20 # no successful heartbeat => host is unhealthy (no placements)
+hostLostSeconds: 300 # unhealthy this long => its instances are written off (team may recreate elsewhere)
+createFenceSeconds: 45 # ambiguous create with no sign of a VM is fenced + deleted after this
+maxClockSkewSeconds: 10 # host clocks must agree with the controller within this (use chrony/NTP)
+# maxLifetimeSeconds: 14400   # hard cap on a single instance's total lifetime
