@@ -268,6 +268,8 @@ export const createInstanceManager = (deps: {
   let recovered = false
   /** False until the state/tombstone files were read successfully. */
   let stateLoaded = false
+  /** True once every persisted record has been read into `entries` (a failed read leaves it empty). */
+  let recordsLoaded = false
   let recoveryInFlight: Promise<void> | undefined
   let activeOps = 0
   /** Orphan VM ids whose destruction has not been confirmed yet. */
@@ -986,17 +988,46 @@ export const createInstanceManager = (deps: {
     }
   }
 
+  /**
+   * Until recovery has loaded every record, `entries` is incomplete: answering
+   * GET/list/extend/DELETE from it would report a live, owned instance as
+   * "not found" or already deleted (the controller would then free its row
+   * while the VM keeps running). Only `info()` stays available.
+   */
+  const assertRecovered = (): void => {
+    if (!recovered) {
+      throw new ProtocolError(
+        'host_unavailable',
+        'agent recovery is incomplete'
+      )
+    }
+  }
+
+  const assertRecordsLoaded = (): void => {
+    if (!recordsLoaded) {
+      throw new ProtocolError(
+        'host_unavailable',
+        'agent recovery is incomplete'
+      )
+    }
+  }
+
   const get = async (id: string): Promise<AgentInstance | undefined> => {
+    // Read-only and accurate once the records are loaded, even while later
+    // recovery stages (net.restore, orphan cleanup) are still pending.
+    assertRecordsLoaded()
     const record = entries.get(id)?.record
     return record ? toAgentInstance(record) : undefined
   }
 
-  const list = async (): Promise<AgentInstance[]> =>
-    [...entries.values()]
+  const list = async (): Promise<AgentInstance[]> => {
+    assertRecordsLoaded()
+    return [...entries.values()]
       .map(entry => entry.record)
       .filter((record): record is StoredInstance => record !== undefined)
       .sort((a, b) => a.createdAtMs - b.createdAtMs)
       .map(toAgentInstance)
+  }
 
   const extend = async (
     id: string,
@@ -1005,6 +1036,7 @@ export const createInstanceManager = (deps: {
     if (!Number.isFinite(expiresAtMs)) {
       throw new ProtocolError('invalid_request', 'invalid expiry')
     }
+    assertRecovered()
     beginOp()
     try {
       const entry = await obtainEntry(id)
@@ -1063,6 +1095,7 @@ export const createInstanceManager = (deps: {
     if (!INSTANCE_ID_REGEX.test(id)) {
       throw new ProtocolError('invalid_request', 'invalid instance id')
     }
+    assertRecovered()
     beginOp()
     try {
       const entry = await obtainEntry(id)
@@ -1321,6 +1354,7 @@ export const createInstanceManager = (deps: {
         pendingOps: new Set(),
       })
     }
+    recordsLoaded = true
 
     // Learn every lease (live + retiring) before touching any record. If this
     // fails, recovery stays closed and the sweep retries it; a create cannot
@@ -1454,6 +1488,7 @@ export const createInstanceManager = (deps: {
     shuttingDown = false
     recovered = false
     stateLoaded = false
+    recordsLoaded = false
     recoveryInFlight = undefined
     orphanBacklog.clear()
     sweepsSinceOrphanScan = 0

@@ -168,6 +168,42 @@ describe('unreadable state files fail recovery closed', () => {
   })
 })
 
+describe('ownership-dependent operations are unavailable until recovery completes', () => {
+  it('answers GET/list/PATCH/DELETE with host_unavailable, never "not found", while recovery has failed', async () => {
+    // Reproduced by review: with a transient state-read failure the agent
+    // served GET from an empty map (404) and confirmed DELETE (404 + tombstone)
+    // for an instance whose VM was still running, so the controller freed the
+    // team's row while the VM stayed alive.
+    const harness = await setup({ sweepIntervalMs: 1_000_000 })
+    const spec = makeSpec()
+    await harness.mgr.create(spec)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id))?.state === 'running' ? true : undefined
+    )
+    await harness.mgr.stop()
+
+    let failReads = true
+    const store = new StateStore(harness.dir, logger(), {
+      readFile: fileName =>
+        failReads && fileName === `${spec.id}.json` ? ioError() : undefined,
+    })
+    const broken = harness.spawn({ store, sweepIntervalMs: 1_000_000 })
+    await broken.start()
+    expect((await broken.info()).checks.recovered).toBe(false)
+
+    expect(await rejectionCode(broken.get(spec.id))).toBe('host_unavailable')
+    expect(await rejectionCode(broken.list())).toBe('host_unavailable')
+    expect(
+      await rejectionCode(broken.extend(spec.id, Date.now() + 60_000))
+    ).toBe('host_unavailable')
+    expect(await rejectionCode(broken.delete(spec.id))).toBe('host_unavailable')
+    // The VM is untouched and no fence was written for its id.
+    expect(harness.vm.alive.has(spec.id)).toBe(true)
+    expect(harness.vm.destroyedIds).not.toContain(spec.id)
+    failReads = false
+  })
+})
+
 describe('malformed files are quarantined and conservatively fenced', () => {
   it('replaces a malformed tombstone with a durable conservative fence', async () => {
     const harness = await setup({ sweepIntervalMs: 1_000_000 })
