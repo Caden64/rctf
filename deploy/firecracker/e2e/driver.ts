@@ -26,14 +26,15 @@ import type { CreateInstanceOptions } from '../../../apps/api/src/providers/inst
 import {
   Report,
   errorMessage,
-  filesContaining,
   httpRequest,
   must,
   pidsMatching,
   processAlive,
+  readableFile,
   readControllerRows,
   readJson,
   readProcCmdline,
+  scanFilesContaining,
   shell,
   short,
   sleep,
@@ -45,6 +46,7 @@ import {
   type ControllerRow,
   type ManagedProcess,
 } from './harness'
+import { inspectLease, nftText, tapsInNetns } from './probes'
 import { FaultProxy, type CapturedRequest } from './proxy'
 
 // ---------------------------------------------------------------------------
@@ -93,6 +95,7 @@ for (const dir of [
   CONTROLLER_DIR,
   LOGS,
   path.join(AGENT_DIR, 'jailer'),
+  path.join(RUN, 'pids'),
 ]) {
   mkdirSync(dir, { recursive: true })
 }
@@ -168,6 +171,20 @@ const childEnv = (): Record<string, string | undefined> => ({
   NO_PROXY: '*',
   no_proxy: '*',
 })
+
+/**
+ * Record a PID we started so `inner.sh`'s crash trap can kill exactly our
+ * children (and nothing else in the shared PID namespace).
+ */
+const recordPid = (name: string, pid: number): void => {
+  try {
+    const dir = path.join(RUN, 'pids')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, `${name}.pid`), `${pid}\n`)
+  } catch {
+    // The /proc scan in inner.sh is the fallback; never fail a run for this.
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Real provider (the rCTF API code path)
@@ -290,7 +307,15 @@ interface AgentInstance {
 
 const agentList = async (): Promise<AgentInstance[]> => {
   const result = await agentReq('GET', '/v1/instances')
-  return result.status === 200 ? (result.json as AgentInstance[]) : []
+  if (result.status !== 200) {
+    throw new Error(
+      `agent list -> ${result.status}: ${short(result.text)} (agent must be up for this assertion)`
+    )
+  }
+  if (!Array.isArray(result.json)) {
+    throw new Error(`agent list returned a non-array: ${short(result.json)}`)
+  }
+  return result.json
 }
 
 const agentGet = async (id: string): Promise<AgentInstance | null> => {
@@ -401,22 +426,40 @@ const guestFlagMatches = async (guestIp: string): Promise<boolean> => {
 const tapExists = (tap: string): boolean =>
   shell(['ip', 'link', 'show', tap]).code === 0
 
-const tapsInNetns = (): string[] => {
-  const result = shell(['ip', '-o', 'link', 'show', 'type', 'tun'])
-  if (result.code !== 0) return []
-  return result.stdout
-    .split('\n')
-    .map(line => /^\d+:\s+([^:@]+)[:@]/.exec(line)?.[1])
-    .filter((name): name is string => name !== undefined && name.length > 0)
-}
+const nftHasLeaseRules = (text: string): boolean => /fctap\d+/.test(text)
 
-const nftText = (): string => {
-  const parts: string[] = []
-  for (const table of ['inet rctf_fc', 'arp rctf_fc_arp']) {
-    const result = shell(['nft', 'list', 'table', ...table.split(' ')])
-    if (result.code === 0) parts.push(result.stdout)
+/**
+ * Every teardown/identity assertion requires the real lease identity the agent
+ * persisted while the VM was running. A missing pid/tap/guest IP is a harness
+ * bug or a product bug — never "clean".
+ */
+const requireIdentity = (
+  record: AgentRecord | undefined,
+  id: string
+): { pid: number; tap: string; guestIp: string } => {
+  if (record === undefined) {
+    throw new Error(`agent record missing for ${id}`)
   }
-  return parts.join('\n')
+  if (
+    record.vm === undefined ||
+    !Number.isInteger(record.vm.pid) ||
+    record.vm.pid <= 0
+  ) {
+    throw new Error(
+      `agent record ${id} has no usable vm.pid: ${short(record.vm)}`
+    )
+  }
+  if (record.lease === undefined || !record.lease.tapName) {
+    throw new Error(`agent record ${id} has no lease.tapName`)
+  }
+  if (!record.lease.guestIp) {
+    throw new Error(`agent record ${id} has no lease.guestIp`)
+  }
+  return {
+    pid: record.vm.pid,
+    tap: record.lease.tapName,
+    guestIp: record.lease.guestIp,
+  }
 }
 
 const runDirEntries = (): string[] => {
@@ -466,18 +509,21 @@ interface Teardown {
 
 const probeTeardown = async (
   id: string,
-  pid: number | undefined,
-  tap: string | undefined,
-  guestIp: string | undefined
+  pid: number,
+  tap: string,
+  guestIp: string
 ): Promise<Teardown> => {
-  const process = pid === undefined ? true : !processAlive(pid, id)
+  if (!Number.isInteger(pid) || pid <= 0) {
+    throw new Error(`probeTeardown(${id}): invalid pid ${pid}`)
+  }
+  if (!tap) throw new Error(`probeTeardown(${id}): missing tap name`)
+  if (!guestIp) throw new Error(`probeTeardown(${id}): missing guest IP`)
+  const process = !processAlive(pid, id)
   const stateFile = !existsSync(recordPath(id))
   const runDir = !existsSync(path.join(AGENT_RUN, id))
-  const tapGone = tap === undefined ? true : !tapExists(tap)
+  const tapGone = !tapExists(tap)
   const nft = nftText()
-  const nftGone =
-    (tap === undefined || !nft.includes(tap)) &&
-    (guestIp === undefined || !nft.includes(guestIp))
+  const nftGone = !nft.includes(tap) && !nft.includes(guestIp)
   const agent = (await agentGet(id)) === null
   return {
     process,
@@ -492,9 +538,9 @@ const probeTeardown = async (
 
 const waitTeardown = async (
   id: string,
-  pid: number | undefined,
-  tap: string | undefined,
-  guestIp: string | undefined,
+  pid: number,
+  tap: string,
+  guestIp: string,
   timeoutMs = 25_000
 ): Promise<Teardown> => {
   const deadline = Date.now() + timeoutMs
@@ -578,6 +624,7 @@ const startAgent = async (): Promise<void> => {
     env: { ...childEnv(), FIRECRACKER_AGENT_TOKEN: AGENT_TOKEN },
     logPath: path.join(LOGS, `agent-${agentStarts}.log`),
   })
+  recordPid(`agent-${agentStarts}`, agentProcess.pid)
   try {
     await waitForTrue(
       'agent recovered and accepting',
@@ -627,6 +674,7 @@ const startController = async (
     },
     logPath: path.join(LOGS, `controller-${label}-${controllerStarts}.log`),
   })
+  recordPid(`controller-${controllerStarts}`, controllerProcess.pid)
   try {
     await waitForTrue(
       'controller /healthz',
@@ -849,7 +897,7 @@ const scenarioLifecycle = async (): Promise<void> => {
         throw new Error(`agent record/lease missing for ${id}`)
       }
       const lease = record.lease
-      const pid = record.vm?.pid
+      const { pid, tap, guestIp } = requireIdentity(record, id)
 
       report.check(
         '1.2',
@@ -858,6 +906,17 @@ const scenarioLifecycle = async (): Promise<void> => {
           typeof running.timeLeftMilliseconds === 'number' &&
           running.timeLeftMilliseconds > 0,
         short(running)
+      )
+      // Live calibration: without this, every later "no tap / no nft rule"
+      // assertion would pass even if the probes were blind.
+      const live = inspectLease(argv => shell(argv), tap, guestIp)
+      report.check(
+        '1.2a',
+        'probe calibration: the running lease has a visible tap and nft references its tap and guest IP',
+        live.ok,
+        live.ok
+          ? `taps=${live.taps.length} tap=${tap} guestIp=${guestIp}`
+          : live.problems.join('; ')
       )
       report.check(
         '1.3',
@@ -887,30 +946,60 @@ const scenarioLifecycle = async (): Promise<void> => {
         `len=${served.length} sha256=${new Bun.CryptoHasher('sha256').update(served).digest('hex')}`
       )
 
-      const perArea = {
-        'agent state': filesContaining(AGENT_STATE, FLAG).length,
-        'agent traefik dir': filesContaining(TRAEFIK_DIR, FLAG).length,
-        'per-instance disk/run dir': filesContaining(
-          path.join(AGENT_RUN, id),
+      const instanceDir = path.join(AGENT_RUN, id)
+      const rootfsPath = path.join(instanceDir, 'rootfs.ext4')
+      const identityPath = path.join(instanceDir, 'vm-identity.json')
+      const rootfs = readableFile(rootfsPath)
+      const identity = readableFile(identityPath)
+      const scans = {
+        'agent state': scanFilesContaining([AGENT_STATE], FLAG),
+        'agent traefik dir': scanFilesContaining([TRAEFIK_DIR], FLAG),
+        // The whole instance run dir covers rootfs.ext4, vm-identity.json and
+        // any future MMDS/vsock/config sidecar the agent writes there.
+        'per-instance disk/run dir': scanFilesContaining([instanceDir], FLAG),
+        'per-instance rootfs.ext4 (explicit)': scanFilesContaining(
+          [rootfsPath],
           FLAG
-        ).length,
-        'controller sqlite': filesContaining(CONTROLLER_DIR, FLAG).length,
-        logs: filesContaining(LOGS, FLAG).length,
-        'whole run tree (configs, driver output, everything)': filesContaining(
-          RUN,
+        ),
+        'per-instance vm-identity.json': scanFilesContaining(
+          [identityPath],
           FLAG
-        ).length,
+        ),
+        'controller sqlite': scanFilesContaining([CONTROLLER_DIR], FLAG),
+        logs: scanFilesContaining([LOGS], FLAG),
+        'whole run tree (configs, driver output, everything)':
+          scanFilesContaining([RUN], FLAG),
       }
+      const perArea = Object.fromEntries(
+        Object.entries(scans).map(([area, scan]) => [area, scan.hits.length])
+      )
+      const unreadable = Object.entries(scans).flatMap(([area, scan]) =>
+        scan.unreadable.map(file => `${area}: ${file}`)
+      )
+      const scanned = Object.values(scans).reduce(
+        (total, scan) => total + scan.scanned,
+        0
+      )
       report.check(
         '1.6',
-        'the flag appears nowhere in controller sqlite, agent state, logs or the guest disk image',
-        Object.values(perArea).every(count => count === 0),
-        JSON.stringify(perArea)
+        'the flag appears nowhere in controller sqlite, agent state, logs or the guest disk image (and every scanned file was readable)',
+        rootfs.ok &&
+          identity.ok &&
+          Object.values(perArea).every(count => count === 0) &&
+          unreadable.length === 0,
+        JSON.stringify({
+          ...perArea,
+          scannedFiles: scanned,
+          rootfs: rootfs.ok ? 'readable' : `UNREADABLE: ${rootfs.reason}`,
+          identity: identity.ok ? 'readable' : `UNREADABLE: ${identity.reason}`,
+          unreadable,
+        })
       )
       report.check(
         '1.7',
         'the flag is absent from the firecracker process command line',
-        pid === undefined || !readProcCmdline(pid).includes(FLAG)
+        !readProcCmdline(pid).includes(FLAG),
+        `pid=${pid}`
       )
       report.check(
         '1.8',
@@ -955,8 +1044,14 @@ const scenarioLifecycle = async (): Promise<void> => {
         short(deleted)
       )
       await waitStopped(team)
-      const gone = await waitTeardown(id, pid, lease.tapName, lease.guestIp)
+      const gone = await waitTeardown(id, pid, tap, guestIp)
       report.check('1.13', 'firecracker process gone', gone.process)
+      report.check(
+        '1.13a',
+        'no firecracker process for this run remains',
+        fcProcessesForRun().length === 0,
+        `pids=${fcProcessesForRun().join(',') || 'none'}`
+      )
       report.check('1.14', 'tap device removed', gone.tap)
       report.check(
         '1.15',
@@ -985,7 +1080,7 @@ const scenarioIdempotency = async (): Promise<void> => {
       await waitRunning(team)
       const id1 = await idFor(team)
       const record = agentRecord(id1)
-      if (record === undefined) throw new Error('agent record missing')
+      const identity = requireIdentity(record, id1)
 
       const second = await provider.createInstance(createOptions(team))
       const id2 = await idFor(team)
@@ -1040,9 +1135,9 @@ const scenarioIdempotency = async (): Promise<void> => {
       await waitStopped(team)
       const gone = await waitTeardown(
         id1,
-        record.vm?.pid,
-        record.lease?.tapName,
-        record.lease?.guestIp
+        identity.pid,
+        identity.tap,
+        identity.guestIp
       )
       report.check('2.8', 'cleanup after the idempotency scenario', gone.all)
     }
@@ -1154,11 +1249,7 @@ const scenarioExpiry = async (): Promise<void> => {
       report.check('3.1', 'short-lifetime create accepted', isDetails(created))
       await waitRunning(team)
       const id = await idFor(team)
-      const record = agentRecord(id)
-      if (record === undefined) throw new Error('agent record missing')
-      const pid = record.vm?.pid
-      const tap = record.lease?.tapName
-      const guestIp = record.lease?.guestIp
+      const identity = requireIdentity(agentRecord(id), id)
 
       await waitForTrue(
         'reaper removed the expired row',
@@ -1166,7 +1257,12 @@ const scenarioExpiry = async (): Promise<void> => {
         25_000,
         200
       )
-      const gone = await waitTeardown(id, pid, tap, guestIp)
+      const gone = await waitTeardown(
+        id,
+        identity.pid,
+        identity.tap,
+        identity.guestIp
+      )
       report.check(
         '3.2',
         'the reaper destroyed the real VM and released the row on time',
@@ -1181,56 +1277,63 @@ const scenarioExpiry = async (): Promise<void> => {
         short(after)
       )
 
-      // Race 1: extend inside the lifetime window.
+      // Race 1: extend well inside the lifetime window. This must ALWAYS win:
+      // expiry winning here is a failure, not an alternative outcome.
       const team1 = 'race-1'
       const c1 = await provider.createInstance(
-        createOptions(team1, { timeoutMilliseconds: 6_000 })
+        createOptions(team1, { timeoutMilliseconds: 10_000 })
       )
       if (!isDetails(c1)) throw new Error(`race-1 create: ${short(c1)}`)
       await waitRunning(team1)
       const id1 = await idFor(team1)
       const r1 = agentRecord(id1)
-      if (r1 === undefined) throw new Error('race-1 record missing')
-      await sleep(1_500)
+      const identity1 = requireIdentity(r1, id1)
+      const originalDeadline1 = r1!.expiresAtMs
+      // Extend at a fixed point six seconds before the deadline, independent of
+      // how long the guest took to boot. This leaves a wide, non-flaky margin.
+      const waitUntil1 = originalDeadline1 - 6_000 - Date.now()
+      if (waitUntil1 > 0) await sleep(waitUntil1)
+      const extendIssuedAt1 = Date.now()
+      report.check(
+        '3.4a',
+        'race 1: the extend is issued early, with margin before the original deadline',
+        extendIssuedAt1 <= originalDeadline1 - 5_000,
+        `issuedAt=${extendIssuedAt1} originDeadline=${originalDeadline1} marginMs=${originalDeadline1 - extendIssuedAt1}`
+      )
       const ext1 = await provider.extendInstance({
         ...query(team1),
         timeoutMilliseconds: 600_000,
       })
       const ext1Won = isDetails(ext1) && ext1.status === 'running'
-      await sleep(4_500) // past the original 6s deadline
+      report.check(
+        '3.4b',
+        'race 1: the early extend is accepted and reports running',
+        ext1Won,
+        short(ext1)
+      )
+      if (!ext1Won) {
+        throw new Error(
+          `race 1: the early extend lost before the deadline (${short(ext1)})`
+        )
+      }
+      const waitPastDeadline1 = originalDeadline1 + 2_500 - Date.now()
+      if (waitPastDeadline1 > 0) await sleep(waitPastDeadline1)
       const get1 = await provider.getInstance(query(team1))
-      if (ext1Won) {
-        report.check(
-          '3.4',
-          'race 1: extend won and the VM survived the original deadline',
-          (await guestFlagMatches(r1.lease?.guestIp ?? '')) &&
-            processAlive(r1.vm?.pid ?? 0, id1) &&
-            isDetails(get1) &&
-            get1.status === 'running',
-          `extend=${short(ext1)} get=${short(get1)}`
-        )
-      } else {
-        const gone1 = await waitTeardown(
-          id1,
-          r1.vm?.pid,
-          r1.lease?.tapName,
-          r1.lease?.guestIp
-        )
-        report.check(
-          '3.4',
-          'race 1: expiry won, extend was rejected and no VM survived',
-          gone1.all &&
-            isDetails(get1) &&
-            (get1.status === 'stopped' || get1.status === 'errored'),
-          `extend=${short(ext1)} get=${short(get1)}`
-        )
-      }
-      if (isDetails(get1) && get1.status === 'running') {
-        await provider.deleteInstance(query(team1))
-        await waitStopped(team1)
-      }
+      report.check(
+        '3.4',
+        'race 1: the early extend kept the VM alive past the original deadline',
+        Date.now() > originalDeadline1 &&
+          processAlive(identity1.pid, id1) &&
+          (await guestFlagMatches(identity1.guestIp)) &&
+          isDetails(get1) &&
+          get1.status === 'running',
+        `extend=${short(ext1)} get=${short(get1)} now=${Date.now()} originDeadline=${originalDeadline1}`
+      )
+      await provider.deleteInstance(query(team1))
+      await waitStopped(team1)
 
-      // Race 2: extend after the deadline must be rejected and the VM must die.
+      // Race 2 (separate): an extend issued after the deadline must be
+      // rejected and the real VM must be gone.
       const team2 = 'race-2'
       const c2 = await provider.createInstance(
         createOptions(team2, { timeoutMilliseconds: 5_000 })
@@ -1239,8 +1342,16 @@ const scenarioExpiry = async (): Promise<void> => {
       await waitRunning(team2)
       const id2 = await idFor(team2)
       const r2 = agentRecord(id2)
-      if (r2 === undefined) throw new Error('race-2 record missing')
-      await sleep(4_000) // now past the 5s lifetime
+      const identity2 = requireIdentity(r2, id2)
+      const waitPastDeadline2 = r2!.expiresAtMs + 1_500 - Date.now()
+      if (waitPastDeadline2 > 0) await sleep(waitPastDeadline2)
+      const extendIssuedAt2 = Date.now()
+      report.check(
+        '3.5a',
+        'race 2: the extend is genuinely issued after the lease deadline',
+        extendIssuedAt2 > r2!.expiresAtMs,
+        `issuedAt=${extendIssuedAt2} deadline=${r2!.expiresAtMs}`
+      )
       const ext2 = await provider.extendInstance({
         ...query(team2),
         timeoutMilliseconds: 600_000,
@@ -1249,9 +1360,9 @@ const scenarioExpiry = async (): Promise<void> => {
         isFailure(ext2) && /expired|no longer|no instance/i.test(ext2.message)
       const gone2 = await waitTeardown(
         id2,
-        r2.vm?.pid,
-        r2.lease?.tapName,
-        r2.lease?.guestIp,
+        identity2.pid,
+        identity2.tap,
+        identity2.guestIp,
         20_000
       )
       const get2 = await provider.getInstance(query(team2))
@@ -1278,8 +1389,7 @@ const scenarioControllerRestart = async (): Promise<void> => {
       if (!isDetails(created)) throw new Error(`create: ${short(created)}`)
       await waitRunning(team)
       const id = await idFor(team)
-      const record = agentRecord(id)
-      if (record === undefined) throw new Error('agent record missing')
+      const identity = requireIdentity(agentRecord(id), id)
 
       await restartController(CONTROLLER_CONFIG, 'main')
       const after = await waitRunning(team, 40_000)
@@ -1293,7 +1403,7 @@ const scenarioControllerRestart = async (): Promise<void> => {
         '4.2',
         'the restart did not duplicate the VM',
         (await agentList()).length === 1 &&
-          processAlive(record.vm?.pid ?? 0, id) &&
+          processAlive(identity.pid, id) &&
           fcProcessesForRun().length === 1
       )
       const duplicate = await provider.createInstance(createOptions(team))
@@ -1355,19 +1465,19 @@ const scenarioControllerRestart = async (): Promise<void> => {
         'the mid-flight adoption did not duplicate the VM',
         (await agentList()).length === 1 && fcProcessesForRun().length === 1
       )
-      const record2 = agentRecord(id2)
+      const identity2 = requireIdentity(agentRecord(id2), id2)
       report.check(
         '4.7',
         'the adopted instance still serves the flag',
-        await guestFlagMatches(record2?.lease?.guestIp ?? '')
+        await guestFlagMatches(identity2.guestIp)
       )
       await provider.deleteInstance(query(team2))
       await waitStopped(team2)
       const gone = await waitTeardown(
         id2,
-        record2?.vm?.pid,
-        record2?.lease?.tapName,
-        record2?.lease?.guestIp
+        identity2.pid,
+        identity2.tap,
+        identity2.guestIp
       )
       report.check('4.8', 'cleanup after the restart scenario', gone.all)
     }
@@ -1384,23 +1494,19 @@ const scenarioAgentKill = async (): Promise<void> => {
       if (!isDetails(created)) throw new Error(`create: ${short(created)}`)
       await waitRunning(team)
       const id = await idFor(team)
-      const record = agentRecord(id)
-      if (record === undefined) throw new Error('agent record missing')
-      const pid = record.vm?.pid
-      const tap = record.lease?.tapName
-      const guestIp = record.lease?.guestIp
+      const { pid, tap, guestIp } = requireIdentity(agentRecord(id), id)
 
       await stopAgent('SIGKILL')
       report.check(
         '5.1',
         'the microVM survives an agent SIGKILL',
-        processAlive(pid ?? 0, id),
+        processAlive(pid, id),
         `pid=${pid}`
       )
       report.check(
         '5.2',
         'the guest still serves the flag while the agent is dead',
-        await guestFlagMatches(guestIp ?? '')
+        await guestFlagMatches(guestIp)
       )
 
       await startAgent()
@@ -1421,15 +1527,13 @@ const scenarioAgentKill = async (): Promise<void> => {
         '5.4',
         'the restarted agent re-adopted the same VM (one VM, same pid)',
         (await agentList()).length === 1 &&
-          processAlive(pid ?? 0, id) &&
+          processAlive(pid, id) &&
           fcProcessesForRun().length === 1
       )
       report.check(
         '5.5',
         'the tap and guest survived the agent restart',
-        tap !== undefined &&
-          tapExists(tap) &&
-          (await guestFlagMatches(guestIp ?? ''))
+        tapExists(tap) && (await guestFlagMatches(guestIp))
       )
       await provider.deleteInstance(query(team))
       await waitStopped(team)
@@ -1482,14 +1586,16 @@ const scenarioOrphan = async (): Promise<void> => {
         40_000,
         200
       )
-      const orphanRecord = agentRecord(orphanId)
-      if (orphanRecord === undefined) throw new Error('orphan record missing')
+      const orphanIdentity = requireIdentity(agentRecord(orphanId), orphanId)
+      const orphanNft = nftText()
       report.check(
         '8.2',
-        'the orphan is a real VM with a real tap',
-        processAlive(orphanRecord.vm?.pid ?? 0, orphanId) &&
-          tapExists(orphanRecord.lease?.tapName ?? ''),
-        `pid=${orphanRecord.vm?.pid} tap=${orphanRecord.lease?.tapName}`
+        'the orphan is a real VM with a real tap and nft rule',
+        processAlive(orphanIdentity.pid, orphanId) &&
+          tapExists(orphanIdentity.tap) &&
+          orphanNft.includes(orphanIdentity.tap) &&
+          orphanNft.includes(orphanIdentity.guestIp),
+        `pid=${orphanIdentity.pid} tap=${orphanIdentity.tap} guestIp=${orphanIdentity.guestIp}`
       )
       await waitForTrue(
         'controller reconciler deleted the orphan',
@@ -1499,9 +1605,9 @@ const scenarioOrphan = async (): Promise<void> => {
       )
       const gone = await waitTeardown(
         orphanId,
-        orphanRecord.vm?.pid,
-        orphanRecord.lease?.tapName,
-        orphanRecord.lease?.guestIp
+        orphanIdentity.pid,
+        orphanIdentity.tap,
+        orphanIdentity.guestIp
       )
       report.check(
         '8.3',
@@ -1516,8 +1622,11 @@ const scenarioOrphan = async (): Promise<void> => {
       )
       report.check(
         '8.5',
-        'no orphan process, run dir or nft rule is left behind',
-        fcProcessesForRun().length === 0 && !/fctap\d+/.test(nftText())
+        'no orphan process, tap, run dir or nft rule is left behind',
+        fcProcessesForRun().length === 0 &&
+          tapsInNetns().length === 0 &&
+          runDirEntries().length === 0 &&
+          !nftHasLeaseRules(nftText())
       )
     }
   )
@@ -1533,8 +1642,7 @@ const scenarioDrain = async (): Promise<void> => {
       if (!isDetails(created)) throw new Error(`create: ${short(created)}`)
       await waitRunning(teamA)
       const id = await idFor(teamA)
-      const record = agentRecord(id)
-      if (record === undefined) throw new Error('agent record missing')
+      const identity = requireIdentity(agentRecord(id), id)
 
       const drained = await adminReq('POST', '/v1/hosts/fc1/drain')
       report.check(
@@ -1564,7 +1672,7 @@ const scenarioDrain = async (): Promise<void> => {
       report.check(
         '9.4',
         'the existing guest is still reachable while draining',
-        await guestFlagMatches(record.lease?.guestIp ?? '')
+        await guestFlagMatches(identity.guestIp)
       )
       const undrained = await adminReq('POST', '/v1/hosts/fc1/undrain')
       report.check(
@@ -1587,10 +1695,20 @@ const scenarioDrain = async (): Promise<void> => {
         await provider.deleteInstance(query(name))
         await waitStopped(name)
       }
+      const agentAfterDrain = await agentList()
+      const fcAfterDrain = fcProcessesForRun()
+      const tapsAfterDrain = tapsInNetns()
+      const runDirsAfterDrain = runDirEntries()
+      const rowsAfterDrain = controllerRows()
       report.check(
         '9.7',
-        'cleanup after the drain scenario',
-        (await agentList()).length === 0 && controllerRows().length === 0
+        'cleanup after the drain scenario: agent is up, no lease/process/tap/run dir/row remains',
+        agentAfterDrain.length === 0 &&
+          rowsAfterDrain.length === 0 &&
+          fcAfterDrain.length === 0 &&
+          tapsAfterDrain.length === 0 &&
+          runDirsAfterDrain.length === 0,
+        `agent=${agentAfterDrain.length} rows=${rowsAfterDrain.length} fc=${fcAfterDrain.length} taps=${tapsAfterDrain.length} runDirs=${runDirsAfterDrain.length}`
       )
     }
   )
@@ -1606,8 +1724,7 @@ const scenarioHostRemoval = async (): Promise<void> => {
       if (!isDetails(created)) throw new Error(`create: ${short(created)}`)
       await waitRunning(team)
       const id = await idFor(team)
-      const record = agentRecord(id)
-      if (record === undefined) throw new Error('agent record missing')
+      const identity = requireIdentity(agentRecord(id), id)
 
       const healthyRemoval = await adminReq('DELETE', '/v1/hosts/fc1')
       report.check(
@@ -1654,9 +1771,9 @@ const scenarioHostRemoval = async (): Promise<void> => {
       )
       const gone = await waitTeardown(
         id,
-        record.vm?.pid,
-        record.lease?.tapName,
-        record.lease?.guestIp
+        identity.pid,
+        identity.tap,
+        identity.guestIp
       )
       report.check(
         '12.5',
@@ -1708,22 +1825,28 @@ const scenarioCycles = async (): Promise<void> => {
         await waitRunning(team)
         const id = await idFor(team)
         const record = agentRecord(id)
-        if (record === undefined) {
+        let identity: { pid: number; tap: string; guestIp: string }
+        try {
+          identity = requireIdentity(record, id)
+        } catch (error) {
           report.fail(
             `11.${index}`,
             `cycle ${index}: create/run/delete leaves no leak`,
-            'agent record missing'
+            errorMessage(error)
           )
           continue
         }
-        const served = await guestFlagMatches(record.lease?.guestIp ?? '')
+        const served = await guestFlagMatches(identity.guestIp)
+        // Calibrate the absence probes while the lease is definitely live.
+        const live = inspectLease(shell, identity.tap, identity.guestIp)
+        const calibrated = live.ok
         const deleted = await provider.deleteInstance(query(team))
         await waitStopped(team)
         const gone = await waitTeardown(
           id,
-          record.vm?.pid,
-          record.lease?.tapName,
-          record.lease?.guestIp
+          identity.pid,
+          identity.tap,
+          identity.guestIp
         )
         const list = await agentList()
         const info = await agentInfo()
@@ -1735,10 +1858,11 @@ const scenarioCycles = async (): Promise<void> => {
           rows: controllerRows().length,
           agentInstances: list.length,
           usageInstances: info.usage.instances,
-          nftLeases: /fctap\d+/.test(nftText()),
+          nftLeases: nftHasLeaseRules(nftText()),
         }
         const clean =
           served &&
+          calibrated &&
           isDetails(deleted) &&
           deleted.status === 'stopped' &&
           gone.all &&
@@ -1749,9 +1873,9 @@ const scenarioCycles = async (): Promise<void> => {
           `11.${index}`,
           `cycle ${index}: create/run/delete leaves no leak`,
           clean,
-          `served=${served} gone=${JSON.stringify(gone)} global=${JSON.stringify(
-            global
-          )} ${Date.now() - started}ms`
+          `served=${served} calibrated=${calibrated} gone=${JSON.stringify(
+            gone
+          )} global=${JSON.stringify(global)} ${Date.now() - started}ms`
         )
       }
     }
@@ -1816,7 +1940,7 @@ const scenarioAmbiguousCreate = async (): Promise<void> => {
         40_000,
         200
       )
-      const recordA = agentRecord(idA)
+      const identityA = requireIdentity(agentRecord(idA), idA)
       report.check(
         '7.4',
         'the reconciler adopts the live VM after an ambiguous create (same id, one VM)',
@@ -1828,7 +1952,7 @@ const scenarioAmbiguousCreate = async (): Promise<void> => {
       report.check(
         '7.5',
         'the adopted guest still serves the flag',
-        await guestFlagMatches(recordA?.lease?.guestIp ?? '')
+        await guestFlagMatches(identityA.guestIp)
       )
       await provider.deleteInstance(query(teamA))
       await waitStopped(teamA)
@@ -1915,16 +2039,24 @@ const scenarioAmbiguousCreate = async (): Promise<void> => {
 // Leftovers / cleanup
 // ---------------------------------------------------------------------------
 
+let cleanupFailures = 0
+
 const cleanupAllInstances = async (): Promise<void> => {
   if (agentProcess === undefined) return
   try {
     for (const instance of await agentList()) {
-      await agentReq(
+      const result = await agentReq(
         'DELETE',
         `/v1/instances/${instance.id}`,
         undefined,
         30_000
       )
+      if (result.status < 200 || result.status >= 300) {
+        cleanupFailures += 1
+        report.line(
+          `cleanup warning: DELETE ${instance.id} -> ${result.status}: ${short(result.text)}`
+        )
+      }
     }
     await waitForTrue(
       'all agent instances removed',
@@ -1932,33 +2064,67 @@ const cleanupAllInstances = async (): Promise<void> => {
       20_000,
       200
     )
-  } catch {
-    // reported by the leftover checks
+  } catch (error) {
+    cleanupFailures += 1
+    report.line(
+      `cleanup warning: instance cleanup failed: ${errorMessage(error)}`
+    )
   }
 }
 
 const reportLeftovers = async (): Promise<void> => {
   report.line('\n== leftovers')
   const pids = harnessPids()
-  const taps = tapsInNetns()
   const runDirs = runDirEntries()
   const stateFiles = readdirSync(AGENT_STATE).filter(name =>
     name.endsWith('.json')
   )
-  const nft = nftText()
+  let taps: string[] | undefined
+  let tapsError: string | undefined
+  try {
+    taps = tapsInNetns()
+  } catch (error) {
+    tapsError = errorMessage(error)
+  }
+  let nft: string | undefined
+  let nftError: string | undefined
+  try {
+    nft = nftText()
+  } catch (error) {
+    nftError = errorMessage(error)
+  }
   report.line(
     `pids matching ${RUN}: ${pids.length === 0 ? 'none' : pids.join(',')}`
   )
-  report.line(`taps: ${taps.length === 0 ? 'none' : taps.join(',')}`)
+  report.line(
+    `taps: ${
+      tapsError !== undefined
+        ? `PROBE FAILED: ${tapsError}`
+        : taps!.length === 0
+          ? 'none'
+          : taps!.join(',')
+    }`
+  )
   report.line(`run dirs: ${runDirs.length === 0 ? 'none' : runDirs.join(',')}`)
   report.line(
     `agent state files: ${stateFiles.length === 0 ? 'none' : stateFiles.join(',')}`
   )
   report.line(
-    `nft per-lease rules: ${/fctap\d+/.test(nft) ? 'PRESENT' : 'none'}`
+    `nft per-lease rules: ${
+      nftError !== undefined
+        ? `PROBE FAILED: ${nftError}`
+        : nftHasLeaseRules(nft!)
+          ? 'PRESENT'
+          : 'none'
+    }`
   )
   report.check('L.1', 'no harness process was left behind', pids.length === 0)
-  report.check('L.2', 'no tap device was left behind', taps.length === 0)
+  report.check(
+    'L.2',
+    'no tap device was left behind (probe must not fail)',
+    tapsError === undefined && taps!.length === 0,
+    tapsError ?? (taps!.length === 0 ? '' : taps!.join(','))
+  )
   report.check(
     'L.3',
     'no per-instance run dir was left behind',
@@ -1971,8 +2137,15 @@ const reportLeftovers = async (): Promise<void> => {
   )
   report.check(
     'L.5',
-    'no per-lease nftables rule was left behind',
-    !/fctap\d+/.test(nft)
+    'no per-lease nftables rule was left behind (probe must not fail)',
+    nftError === undefined && !nftHasLeaseRules(nft!),
+    nftError ?? ''
+  )
+  report.check(
+    'L.6',
+    'pre-shutdown instance cleanup completed without swallowed errors',
+    cleanupFailures === 0,
+    `cleanupFailures=${cleanupFailures}`
   )
   // Final cleanup: only PIDs whose argv references OUR unique run dir. The
   // leak was already recorded above; this just leaves the machine tidy.
@@ -2003,11 +2176,15 @@ const finish = async (exitCode: number): Promise<never> => {
   await shutdown()
   if (!leftoversReported) {
     leftoversReported = true
-    await reportLeftovers()
+    try {
+      await reportLeftovers()
+    } catch (error) {
+      report.fail('L', 'leftover report failed', errorMessage(error))
+    }
     report.summary()
     report.writeJson(RESULTS_JSON)
   }
-  process.exit(exitCode)
+  process.exit(report.failed === 0 ? 0 : Math.max(1, exitCode))
 }
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {

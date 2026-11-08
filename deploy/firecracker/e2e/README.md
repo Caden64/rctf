@@ -38,6 +38,18 @@ export SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke   # read-only
 deploy/firecracker/e2e/run.sh
 ```
 
+Before (or after) a harness run, prove the absence probes themselves can fail:
+
+```sh
+export PATH=$HOME/.local/bin:$PATH
+deploy/firecracker/e2e/selftest.sh
+```
+
+`selftest.sh` runs `selftest.ts` inside `unshare -Urn`. It checks that the tap probe
+throws on a non-zero `ip` exit, the nft probe throws on a non-zero `nft` exit and on
+missing base tables, live calibration fails in a netns with no taps, and calibration
+passes for a visible lease. It needs no KVM and writes nothing.
+
 Useful knobs:
 
 | Variable            | Default                  | Meaning                                           |
@@ -91,21 +103,21 @@ Typical runtime on the reference host: **~2 minutes** (20 VM boots + all fault s
 The driver prints `PASS [id] name -- detail` for each assertion. IDs are grouped by the requested
 check:
 
-| Group | Scenario                                                                                                                                                                                                                                                                    |
-| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Full lifecycle through the provider: create → get running with endpoint → flag byte-for-byte in the guest → flag absent from all durable state → extend → delete → full teardown.                                                                                           |
-| 2     | Idempotent create: same team/challenge returns the same row/instance and no second VM; a changed spec is rejected by the **agent** with `409 spec_mismatch` (the controller documents idempotency by key and returns the live row).                                         |
-| 3     | Expiry: a 6 s lifetime is reaped on time (real VM/tap/row gone); extend inside the window keeps the VM alive past the old deadline; extend after the deadline is rejected and the VM dies.                                                                                  |
-| 4     | Controller restart: a running instance is adopted from SQLite; a duplicate create launches nothing; a `SIGKILL` **mid-create** is adopted after restart with the same id and one VM.                                                                                        |
-| 5     | Agent `kill -9`: the VM survives, the guest keeps serving, the restarted agent re-adopts the same pid and tap.                                                                                                                                                              |
-| 6     | Capacity: 8 concurrent creates for one team race to exactly one row/VM; `maxInstances` exhaustion surfaces as a clean `instancerError` mentioning capacity with no VM leak; capacity returns after a delete.                                                                |
-| 7     | Ambiguous create (proxy): the swallowed-response case is **adopted** (row `creating` → `running`, one VM); the never-delivered case stays `creating`, is fenced with `DELETE`, the id is tombstoned durably, the delayed PUT gets `409 conflict`, and a later create works. |
-| 8     | Orphan: a VM created directly on the agent (unknown to the controller) is deleted by the reconciler, with its tap/run dir/process.                                                                                                                                          |
-| 9     | Drain: new creates refused (`no capacity: all hosts are draining`), existing instance keeps running and serving, undrain restores creates.                                                                                                                                  |
-| 10    | Auth: missing/wrong/cross tokens rejected on controller and agent; the provider surfaces auth failure as a clean `instancerError`.                                                                                                                                          |
-| 11    | 20 sequential create/delete cycles: after each cycle no leaked Firecracker process, tap, nft per-lease rule, run dir, agent state record, controller row, or agent lease/usage.                                                                                             |
-| 12    | (extra) Host removal: a healthy host is not removable (409); an unhealthy host is removable (204), its rows become `lost`, it stays draining; the returning agent deletes the written-off VM; undrain restores service.                                                     |
-| L     | Final leftovers: no harness process, tap, run dir, state record or per-lease nft rule.                                                                                                                                                                                      |
+| Group | Scenario                                                                                                                                                                                                                                                                                                              |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Full lifecycle through the provider: create → get running with endpoint → probe calibration (visible tap + nft rule) → flag byte-for-byte in the guest → flag absent from all durable state (including an explicit readable `rootfs.ext4`) → extend → delete → full teardown with no Firecracker process for the run. |
+| 2     | Idempotent create: same team/challenge returns the same row/instance and no second VM; a changed spec is rejected by the **agent** with `409 spec_mismatch` (the controller documents idempotency by key and returns the live row).                                                                                   |
+| 3     | Expiry: a 6 s lifetime is reaped on time (real VM/tap/row gone); an early extend **must win** and keep the VM alive past the original deadline; a separate case extends after the deadline, is rejected, and the VM is gone.                                                                                          |
+| 4     | Controller restart: a running instance is adopted from SQLite; a duplicate create launches nothing; a `SIGKILL` **mid-create** is adopted after restart with the same id and one VM.                                                                                                                                  |
+| 5     | Agent `kill -9`: the VM survives, the guest keeps serving, the restarted agent re-adopts the same pid and tap.                                                                                                                                                                                                        |
+| 6     | Capacity: 8 concurrent creates for one team race to exactly one row/VM; `maxInstances` exhaustion surfaces as a clean `instancerError` mentioning capacity with no VM leak; capacity returns after a delete.                                                                                                          |
+| 7     | Ambiguous create (proxy): the swallowed-response case is **adopted** (row `creating` → `running`, one VM); the never-delivered case stays `creating`, is fenced with `DELETE`, the id is tombstoned durably, the delayed PUT gets `409 conflict`, and a later create works.                                           |
+| 8     | Orphan: a VM created directly on the agent (unknown to the controller) is deleted by the reconciler, with its tap/run dir/process.                                                                                                                                                                                    |
+| 9     | Drain: new creates refused (`no capacity: all hosts are draining`), existing instance keeps running and serving, undrain restores creates.                                                                                                                                                                            |
+| 10    | Auth: missing/wrong/cross tokens rejected on controller and agent; the provider surfaces auth failure as a clean `instancerError`.                                                                                                                                                                                    |
+| 11    | 20 sequential create/delete cycles: after each cycle no leaked Firecracker process, tap, nft per-lease rule, run dir, agent state record, controller row, or agent lease/usage.                                                                                                                                       |
+| 12    | (extra) Host removal: a healthy host is not removable (409); an unhealthy host is removable (204), its rows become `lost`, it stays draining; the returning agent deletes the written-off VM; undrain restores service.                                                                                               |
+| L     | Final leftovers: no harness process, tap, run dir, state record or per-lease nft rule.                                                                                                                                                                                                                                |
 
 ### Scenario 7 in detail (why two faults)
 
@@ -125,19 +137,30 @@ which makes “row is still `creating`” and “the fence ran” deterministic 
 
 - `run.sh` creates a unique run dir with `mktemp`; nothing is shared with parallel workers.
 - The namespace is private, so taps/nftables cannot collide with other workers or the host.
-- Processes are only ever killed by **PID**, and only PIDs whose full argv contains this run's unique
-  directory (the agent/controller YAML path or `$RUN/agent/run/<id>`). No `pkill` by process name.
+- Processes are only ever killed by **PID**, and only if the PID is ours: same uid, `argv[0]`
+  is one of the known binaries (`bun`/`bun.exe` for the agent/controller, the smoke
+  `firecracker` binary), and its argv contains this run's unique directory. The driver records
+  the agent/controller PIDs under `$RUN/pids/`; `inner.sh` also reads Firecracker PIDs from the
+  agent state files and scans `/proc`. No `pkill` by name and no `kill -9` on unmatched PIDs.
 - `inner.sh` has an `EXIT/INT/TERM` trap that kills only those PIDs and prints the leftover
   processes/taps/nft tables. The driver installs its own `SIGTERM`/`SIGINT` handler, deletes any
   remaining instances through the real agent, stops the controller and agent, then reports leftovers.
 - Fixed loopback ports (17000 controller, 17001 agent, 17002 proxy) are safe because the network
   namespace is private.
+- Absence probes are strict: `tapsInNetns` throws when `ip` fails; `nftText` throws when `nft`
+  fails or either base table is missing. Every run calibrates them while a VM is live (tap
+  listed and nft text references the lease tap + guest IP) before trusting "nothing was left".
+- `scanFilesContaining` reports unreadable files instead of skipping them; assertion 1.6 fails if
+  any file in the scanned trees (including the per-instance `rootfs.ext4` and
+  `vm-identity.json`) cannot be read.
 
 ## Files
 
 - `run.sh` — outer wrapper: checks prerequisites, creates the short run dir, `exec`s `unshare`.
-- `inner.sh` — namespace setup (lo, dummy0, ip_forward), trap, runs the driver.
+- `inner.sh` — namespace setup (lo, dummy0, ip_forward), PID-safe trap, runs the driver.
 - `driver.ts` — real provider + process orchestration + scenarios/assertions + leftover report.
-- `harness.ts` — assertions/report, polling, HTTP, SQLite observation, filesystem grep, process control.
+- `harness.ts` — assertions/report, polling, HTTP, SQLite observation, filesystem scan, process control.
+- `probes.ts` — strict tap/nft absence probes and live lease calibration (also used by the selftest).
+- `selftest.ts` / `selftest.sh` — mutation sanity check proving the probes can fail.
 - `proxy.ts` — the TCP fault proxy used only by scenario 7.
-- `RESULTS.md` — dated log of the actual run with excerpts.
+- `RESULTS.md` — dated log of the actual runs with excerpts.
