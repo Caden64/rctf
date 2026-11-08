@@ -7,19 +7,27 @@
 #   1. mount /proc, /sys, /dev and a private tmpfs on /run,
 #   2. refuse to continue unless /run really is tmpfs (flags must never touch
 #      the persistent ext4 rootfs),
-#   3. bring eth0 up and route 169.254.169.254/32 via it (kernel `ip=` does
+#   3. require jq (the bundled /rctf/jq, or one on PATH): without it the
+#      metadata document cannot be validated,
+#   4. bring eth0 up and route 169.254.169.254/32 via it (kernel `ip=` does
 #      the actual addressing; the guest kernel needs CONFIG_IP_PNP),
-#   4. fetch an MMDS V2 token (PUT /latest/api/token),
-#   5. GET / with that token and `Accept: application/json`,
-#   6. write each flag to /run/rctf/flags/<sanitised provider> (tmpfs, mode 0400),
-#   7. export rctf.env and the instance/hostname variables from the document,
+#   5. fetch an MMDS V2 token (PUT /latest/api/token) and the document
+#      (GET /), retrying both within one boot budget,
+#   6. validate the complete v1 metadata schema, and fail closed on any
+#      mismatch (an empty `flags` array is valid),
+#   7. write each flag to /run/rctf/flags/<sanitised provider> (tmpfs, 0400)
+#      and prepare /run/rctf/env.sh; both steps are mandatory,
 #   8. exec the challenge service.
+#
+# Every failure between step 2 and step 8 is fatal: init exits non-zero and
+# never starts the service. As PID 1 that ends in the documented panic/reboot
+# loop (`panic=1 reboot=k`), so the instance never passes readiness.
 #
 # The service is $RCTF_SERVICE if set, else /app/start, /sbin/rctf-service or
 # /etc/rctf/service (first executable that exists), else /bin/sh.
 #
 # Requirements: busybox (or coreutils) sh, ip, mount, nc or curl, and jq for
-# JSON parsing. Flags never touch disk: /run is tmpfs and files are 0400.
+# JSON parsing. Flags never touch the rootfs: /run is tmpfs and files are 0400.
 # Keep this file POSIX sh (no bashisms).
 set -u
 
@@ -36,11 +44,52 @@ RUN_MOUNT=${RCTF_RUN_MOUNT:-/run}
 FLAGS_DIR=$RUN_ROOT/flags
 ENV_FILE=$RUN_ROOT/env.sh
 PROC_MOUNTS=${RCTF_PROC_MOUNTS:-/proc/mounts}
+# Metadata bodies are written here first. RUN_ROOT is the verified tmpfs, so a
+# document that carries flags never lands on the ext4 rootfs.
+MMDS_BODY_FILE=${RCTF_MMDS_BODY_FILE:-$RUN_ROOT/.mmds-body}
 TOKEN_TTL=21600
-BOOT_RETRIES=60
+# Total time the guest may spend getting a token and the document. Kept below
+# the driver's default bootTimeoutSeconds (60) so a failed fetch is reported as
+# a readiness timeout instead of racing the host's deadline. Each request is
+# also bounded, so one hung socket cannot consume the whole budget.
+BOOT_BUDGET=${RCTF_BOOT_BUDGET:-45}
+FETCH_TIMEOUT=${RCTF_FETCH_TIMEOUT:-3}
+RETRY_INTERVAL=${RCTF_RETRY_INTERVAL:-1}
 
 log() {
   printf 'rctf-init: %s\n' "$*" >&2
+}
+
+is_uint() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Maximum number of fetch rounds. A round costs at most one request timeout
+# plus the retry pause; the wall-clock deadline below is the primary bound and
+# this is the fallback when the guest has no usable clock.
+max_attempts() {
+  if ! is_uint "$BOOT_BUDGET" || ! is_uint "$FETCH_TIMEOUT" ||
+    ! is_uint "$RETRY_INTERVAL"; then
+    printf '1'
+    return 0
+  fi
+  divisor=$((FETCH_TIMEOUT + RETRY_INTERVAL))
+  [ "$divisor" -ge 1 ] || divisor=1
+  attempts=$((BOOT_BUDGET / divisor))
+  [ "$attempts" -ge 1 ] || attempts=1
+  printf '%s' "$attempts"
+}
+
+# boot_expired <deadline-epoch|empty>; true when the boot budget is spent.
+boot_expired() {
+  deadline=$1
+  [ -n "$deadline" ] || return 1
+  now=$(date +%s 2>/dev/null) || return 1
+  is_uint "$now" || return 1
+  [ "$now" -ge "$deadline" ]
 }
 
 # Provider names become file names. Everything outside the allow-list becomes
@@ -99,7 +148,7 @@ raw_http() {
       printf '%s\r\n' "$header"
     done
     printf '\r\n'
-  } | nc -w 3 "$MMDS_HOST" "$MMDS_PORT"
+  } | nc -w "$FETCH_TIMEOUT" "$MMDS_HOST" "$MMDS_PORT"
 }
 
 # Emit the body only for a 200 status line. Anything else (non-200, malformed,
@@ -118,16 +167,42 @@ http_body() {
       print
     }
     /^\r?$/ { body = 1 }
-    END { if (bad) exit 1 }
+    END { if (NR == 0 || bad) exit 1 }
   '
+}
+
+# One curl request. Success requires exactly HTTP 200 (curl -f would also
+# accept 2xx and 3xx), and the body is only ever read from MMDS_BODY_FILE on
+# the verified tmpfs. On failure the body file is removed so a non-200 error
+# document cannot linger.
+curl_request() {
+  method=$1
+  req_path=$2
+  shift 2
+  [ -n "$MMDS_BODY_FILE" ] || return 1
+  code=$(curl -sS -m "$FETCH_TIMEOUT" -X "$method" \
+    -o "$MMDS_BODY_FILE" -w '%{http_code}' "$@" \
+    "http://$MMDS_HOST:$MMDS_PORT$req_path" 2>/dev/null) || {
+    rm -f "$MMDS_BODY_FILE"
+    return 1
+  }
+  if [ "$code" != "200" ]; then
+    rm -f "$MMDS_BODY_FILE"
+    return 1
+  fi
+  cat "$MMDS_BODY_FILE" || {
+    rm -f "$MMDS_BODY_FILE"
+    return 1
+  }
+  rm -f "$MMDS_BODY_FILE"
+  return 0
 }
 
 fetch_token() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 3 -X PUT \
+    curl_request PUT /latest/api/token \
       -H 'Content-Length: 0' \
-      -H "X-metadata-token-ttl-seconds: $TOKEN_TTL" \
-      "http://$MMDS_HOST/latest/api/token" 2>/dev/null
+      -H "X-metadata-token-ttl-seconds: $TOKEN_TTL"
   else
     # Firecracker's MMDS does not answer a PUT that lacks Content-Length
     # (verified against a real Firecracker 1.17 guest).
@@ -140,10 +215,9 @@ fetch_token() {
 fetch_metadata() {
   token=$1
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS -m 3 \
+    curl_request GET / \
       -H "X-metadata-token: $token" \
-      -H 'Accept: application/json' \
-      "http://$MMDS_HOST/" 2>/dev/null
+      -H 'Accept: application/json'
   else
     raw_http GET / \
       "X-metadata-token: $token" \
@@ -151,11 +225,81 @@ fetch_metadata() {
   fi
 }
 
+# Fetch token and document, retrying both within one boot budget. Prints the
+# document and returns 0, or prints nothing and returns 1 once the budget is
+# spent. A failed fetch is never mistaken for an empty document.
+fetch_metadata_document() {
+  attempts=$(max_attempts)
+  is_uint "$attempts" || attempts=1
+  [ "$attempts" -ge 1 ] || attempts=1
+
+  deadline=
+  if is_uint "$BOOT_BUDGET"; then
+    now=$(date +%s 2>/dev/null) || now=
+    if is_uint "$now"; then
+      deadline=$((now + BOOT_BUDGET))
+    fi
+  fi
+
+  token=
+  attempt=0
+  while [ "$attempt" -lt "$attempts" ]; do
+    attempt=$((attempt + 1))
+    if [ -z "$token" ]; then
+      # Capture the exit status on its own: piping into tr would hide a failed
+      # fetch behind tr's success.
+      if raw_token=$(fetch_token); then
+        token=$(printf '%s' "$raw_token" | tr -d '\r\n')
+      else
+        token=
+      fi
+    fi
+    if [ -n "$token" ]; then
+      if document=$(fetch_metadata "$token"); then
+        if [ -n "$document" ]; then
+          printf '%s' "$document"
+          return 0
+        fi
+      fi
+    fi
+    [ "$attempt" -lt "$attempts" ] || break
+    boot_expired "$deadline" && break
+    sleep "$RETRY_INTERVAL"
+  done
+  return 1
+}
+
+# Complete v1 schema check. `flags` may be empty (flagless challenges), but it
+# must be an array of objects carrying string provider/flag values; `env` must
+# be an object. version/instanceId/hostname are required.
+METADATA_SCHEMA='
+  (.rctf | type) == "object"
+  and (.rctf.version == 1)
+  and ((.rctf.instanceId | type) == "string")
+  and ((.rctf.instanceId | length) > 0)
+  and ((.rctf.hostname | type) == "string")
+  and ((.rctf.hostname | length) > 0)
+  and ((.rctf.env | type) == "object")
+  and ((.rctf.flags | type) == "array")
+  and ([.rctf.flags[]
+        | (type == "object")
+          and ((.provider | type) == "string")
+          and ((.flag | type) == "string")]
+       | all)
+'
+
+# validate_metadata <document>; never prints the document or jq diagnostics.
+validate_metadata() {
+  [ -n "$1" ] || return 1
+  printf '%s' "$1" | jq -e "$METADATA_SCHEMA" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # Write every flag with `jq -j` by index: no @tsv/read/printf round trip, so
 # backslashes, tabs, newlines, quotes and non-ASCII bytes are preserved.
 write_flags() {
   metadata=$1
-  count=$(printf '%s' "$metadata" | jq -r '.rctf.flags | length // 0') ||
+  count=$(printf '%s' "$metadata" | jq -r '.rctf.flags | length') ||
     return 1
   case "$count" in
     '' | *[!0-9]*)
@@ -166,7 +310,7 @@ write_flags() {
   index=0
   while [ "$index" -lt "$count" ]; do
     provider=$(printf '%s' "$metadata" |
-      jq -r --argjson i "$index" '.rctf.flags[$i].provider // ""') ||
+      jq -r --argjson i "$index" '.rctf.flags[$i].provider') ||
       return 1
     safe=$(sanitize_provider "$provider")
     if [ -z "$safe" ]; then
@@ -200,11 +344,19 @@ write_flags() {
 # overwrite init's own variables.
 write_env_file() {
   metadata=$1
-  : >"$ENV_FILE" || return 1
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq is required to prepare the challenge environment"
+    return 1
+  fi
+  # A redirection error on the special built-in `:` is fatal to a non-interactive
+  # POSIX shell, so create the file in a subshell and report the failure here.
+  ( : >"$ENV_FILE" ) 2>/dev/null || {
+    log "could not create $ENV_FILE"
+    return 1
+  }
   chmod 0600 "$ENV_FILE" 2>/dev/null || true
-  command -v jq >/dev/null 2>&1 || return 0
   skipped=$(printf '%s' "$metadata" |
-    jq -r '.rctf.env // {} | keys[] | select(startswith("RCTF_"))') ||
+    jq -r '.rctf.env | keys[] | select(startswith("RCTF_"))') ||
     skipped=
   if [ -n "$skipped" ]; then
     printf '%s\n' "$skipped" | while IFS= read -r key; do
@@ -214,8 +366,38 @@ write_env_file() {
     done
   fi
   printf '%s' "$metadata" |
-    jq -r '.rctf.env // {} | to_entries[] | select(.key | startswith("RCTF_") | not) | "export \(.key)=\(.value | @sh)"' \
+    jq -r '.rctf.env | to_entries[] | select(.key | startswith("RCTF_") | not) | "export \(.key)=\(.value | @sh)"' \
       >>"$ENV_FILE"
+}
+
+# Turn a validated document into on-disk state. Flags and the environment are
+# both mandatory; the service must not start if either fails.
+apply_metadata() {
+  metadata=$1
+  instance_id=$(printf '%s' "$metadata" | jq -r '.rctf.instanceId') ||
+    return 1
+  hostname=$(printf '%s' "$metadata" | jq -r '.rctf.hostname') || return 1
+  write_flags "$metadata" || return 1
+  write_env_file "$metadata" || return 1
+  return 0
+}
+
+# Metadata phase of boot: fetch, validate and apply, or return non-zero. main
+# exits on non-zero, so no failure here can ever reach run_service.
+prepare_metadata() {
+  if ! document=$(fetch_metadata_document); then
+    log "could not fetch MMDS metadata within the boot budget"
+    return 1
+  fi
+  if ! validate_metadata "$document"; then
+    log "MMDS metadata does not match the v1 schema"
+    return 1
+  fi
+  if ! apply_metadata "$document"; then
+    log "could not prepare flags and environment from MMDS metadata"
+    return 1
+  fi
+  return 0
 }
 
 # Run the service in a subshell: the challenge environment is sourced there,
@@ -258,6 +440,18 @@ main() {
     exit 1
   fi
 
+  # jq validates the document, so a missing jq is fatal, not skippable.
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq is required in the guest image; refusing to start the service"
+    exit 1
+  fi
+
+  if ! is_uint "$BOOT_BUDGET" || ! is_uint "$FETCH_TIMEOUT" ||
+    ! is_uint "$RETRY_INTERVAL" || [ "$FETCH_TIMEOUT" -lt 1 ]; then
+    log "invalid RCTF_BOOT_BUDGET/RCTF_FETCH_TIMEOUT/RCTF_RETRY_INTERVAL"
+    exit 1
+  fi
+
   # --- network -------------------------------------------------------------
   ip link set lo up 2>/dev/null || true
   ip link set eth0 up 2>/dev/null || true
@@ -265,53 +459,12 @@ main() {
   # but the route must point at eth0.
   ip route add "$MMDS_HOST/32" dev eth0 2>/dev/null || true
 
-  # --- fetch the metadata document ----------------------------------------
-  token=
-  attempt=0
-  while [ "$attempt" -lt "$BOOT_RETRIES" ]; do
-    token=$(fetch_token | tr -d '\r\n')
-    if [ -n "$token" ]; then
-      break
-    fi
-    attempt=$((attempt + 1))
-    sleep 1
-  done
-
-  metadata=
-  if [ -n "$token" ]; then
-    metadata=$(fetch_metadata "$token")
-  fi
-
-  if [ -z "$metadata" ]; then
-    log "could not fetch MMDS metadata; starting the service without flags"
-    metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
-  fi
-
-  if ! command -v jq >/dev/null 2>&1; then
-    log "jq is missing; flags cannot be parsed"
-  elif ! printf '%s' "$metadata" | jq -e . >/dev/null 2>&1; then
-    log "MMDS metadata is not valid JSON"
-    metadata='{"rctf":{"version":1,"instanceId":"","hostname":"","env":{},"flags":[]}}'
-  fi
-
-  # --- flags: one 0400 file per provider, in tmpfs only --------------------
-  if command -v jq >/dev/null 2>&1; then
-    if ! write_flags "$metadata"; then
-      log "not starting the service: could not write flags safely"
-      exit 1
-    fi
-  fi
-
-  # --- environment (service-only) -----------------------------------------
-  if command -v jq >/dev/null 2>&1; then
-    instance_id=$(printf '%s' "$metadata" | jq -r '.rctf.instanceId // ""')
-    hostname=$(printf '%s' "$metadata" | jq -r '.rctf.hostname // ""')
-  else
-    instance_id=
-    hostname=
-  fi
-  if ! write_env_file "$metadata"; then
-    log "could not write the challenge environment; starting without it"
+  # --- metadata, flags and environment ------------------------------------
+  # Fatal on any failure: a challenge that does not need its flags would
+  # otherwise pass readiness while running without them.
+  if ! prepare_metadata; then
+    log "not starting the service: MMDS boot contract failed"
+    exit 1
   fi
 
   if [ -n "$hostname" ]; then
