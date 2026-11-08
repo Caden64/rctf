@@ -1,5 +1,93 @@
 # Multi-host verification — results
 
+## Final run (lifecycle/observation hardening) — 2026-11-08 15:19:52–15:24:49 (America/Denver)
+
+Command:
+
+```sh
+./deploy/firecracker/multihost/run.sh
+```
+
+Dynamic identifiers for this run: run dir `/tmp/opencode/fcmh-ZmpSUT`, ssh ports
+`43817` / `60533`, controller forward `44799`, private link
+`/tmp/opencode/fcmh-ZmpSUT/link/{host-a,host-b}.sock` (QEMU unix-datagram, no
+multicast group or port). Exit code **0**.
+
+```
+==> pidfile authentication selftest (unprivileged decoy processes)
+pidfile selftest passed (72 checks)
+...
+private-link checks: 24 passed, 0 failed
+private link works and is host-local only
+...
+PASS [run.complete] every scenario ran to completion -- 12/12 scenarios
+RESULT: 138 passed, 0 failed, 138 assertions
+driver exit code: 0
+```
+
+Both QEMUs were stopped through their authenticated pidfiles by the EXIT trap;
+`pgrep -f qemu-system-x86_64` returned nothing afterwards, `vm.sh status`
+printed `stopped name=host-a` / `stopped name=host-b`, the two link socket
+files were removed (the `link/` directory remains mode 0700), and both
+overlays were removed only after that definitive status. The host ran no
+privileged command: only QEMU, the seed HTTP servers and the ssh client ran as
+the login user.
+
+### What changed in this pass
+
+1. **Pidfile outcomes are distinct and fail closed.** `pidguard.py` is now
+   `version=3` and records the PID namespace (`/proc/<pid>/ns/pid`) in addition
+   to the boot id, start ticks, executable and argv. Exit codes are `0`
+   authenticated/stopped, `1` definitely dead/stale (the only case that may
+   remove a pidfile), `4` identity mismatch (a live process exists that is not
+   the record; keep the record) and `3` observation failure (keep the record
+   and everything it protects). `stop_recorded` propagates `3`/`4`;
+   `destroy` refuses to remove the overlay/console/seed when shutdown is
+   unconfirmed; `run.sh` removes an overlay only when the authenticated status
+   says the VM stopped. A link endpoint is unlinked only in the definitive
+   stopped state.
+2. **Observers do not mutate; mutators are serialised.** `status`/`pid` use a
+   non-mutating observer. `create`/`start`/`stop`/`destroy`/`kill` hold the
+   per-VM lifecycle `flock`, and both spawned daemons close fd 9. QEMU writes
+   its bare numeric pidfile to `qemu.pid.raw`; the authenticated record is
+   atomically renamed onto `qemu.pid`, so a concurrent status can never delete
+   a live VM's pidfile or observe a bare intermediate. The selftest runs 60
+   concurrent observes while the record is rewritten 60 times and requires the
+   live record to survive.
+3. **Names and link endpoints are constrained.** VM names must match
+   `^[A-Za-z0-9][A-Za-z0-9_-]*$` (no `.`, `..`, dots or separators) and the
+   resolved VM directory must be a direct child of the resolved `MH_VM_ROOT`.
+   `linkguard.py` (new) requires the link directory to be a direct child of the
+   trusted root (`MH_LINK_ROOT`, set by `run.sh` to the 0700 run directory),
+   with no symlink and no group/other write up to that root, and removes an
+   endpoint relative to an opened `O_DIRECTORY|O_NOFOLLOW` fd after `lstat`
+   through the same fd (only an AF_UNIX socket owned by this uid). The selftest
+   covers `.`/`..`/separator/dot names, a symlink escape, a symlinked or
+   0755 link directory, an endpoint outside the directory, a regular file, a
+   symlink and a live socket.
+4. **Interrupted drivers cannot report success.** `driver.ts` tracks the 12
+   expected scenarios and adds a `run.complete` assertion. SIGINT/SIGTERM
+   record a failure, keep the real `130`/`143` exit code, and a normal exit is
+   0 only when every assertion passed and every scenario completed.
+   `globalCleanup` now collects its best-effort errors into `cleanupErrors`, so
+   L.6 no longer claims "without swallowed errors" while discarding reasons.
+5. **nft observation covers both tables.** `hoststats.sh` counts per-lease
+   entries in `arp rctf_fc_arp` as well as `inet rctf_fc`, and reports `-1` +
+   `observationErrors` if `nft list tables` or either table read fails.
+
+### Honest notes
+
+- No product bug was found; `apps/**/src` and `packages/**` were not edited.
+- The task text at the previous pass said the lifecycle overview in
+  `apps/firecracker-instancer/ARCHITECTURE.md` released the reservation on a
+  transport error. It now states the normative behaviour (definitive
+  rejection → release/fail over; ambiguous transport/5xx → keep the row,
+  reservation and key until adoption or confirmed fencing), matching
+  `src/controller/service.ts`.
+- The link is still a host-local unix-datagram point-to-point segment, not a
+  physical LAN; host loss is a QEMU SIGKILL, not a power cut.
+
+
 Dated log of what actually ran. All runs are on the reference development host:
 
 - Arch Linux, kernel `7.2.14-arch1-1`, 16 vCPU, 54 GiB RAM, `/dev/kvm` with
@@ -25,7 +113,7 @@ Dated log of what actually ran. All runs are on the reference development host:
   Results below dated before this hardening pass describe the multicast link
   that was in use then; they are kept as history.
 
-## Final run (pidfd + fail-closed observation hardening) — 2026-11-08 14:25:48–14:33:02 (America/Denver)
+## Previous run (pidfd + fail-closed observation hardening) — 2026-11-08 14:25:48–14:33:02 (America/Denver)
 
 Command:
 

@@ -1127,36 +1127,51 @@ const waitDestroyed = async (
   }
 }
 
+const cleanupErrors: string[] = []
+
 const globalCleanup = async (): Promise<void> => {
+  const note = (where: string, error: unknown): void => {
+    cleanupErrors.push(`${where}: ${errorMessage(error)}`)
+  }
   try {
     for (const row of rows()) {
       try {
         await del(row.team_id, row.challenge_integration_id)
-      } catch {
-        // best effort
+      } catch (error) {
+        note(`delete controller row ${row.team_id}/${row.challenge_integration_id}`, error)
       }
     }
-  } catch {
-    // controller might be down
+  } catch (error) {
+    note('list controller rows', error)
   }
   for (const host of [A, B]) {
     try {
       for (const instance of await agentList(host)) {
-        await agentDelete(host, instance.id)
+        try {
+          const status = await agentDelete(host, instance.id)
+          if (status !== 200 && status !== 202 && status !== 404) {
+            cleanupErrors.push(
+              `agent ${host} delete ${instance.id} -> HTTP ${status}`
+            )
+          }
+        } catch (error) {
+          note(`agent ${host} delete ${instance.id}`, error)
+        }
       }
-    } catch {
-      // host down: run.sh stops the VMs anyway
+    } catch (error) {
+      note(`agent ${host} list`, error)
     }
   }
   try {
     await waitControllerEmpty(20_000)
-  } catch {
-    // recorded by the leftovers section
+  } catch (error) {
+    // recorded by the leftovers section; still keep the reason for L.6
+    note('wait for controller rows to empty', error)
   }
   try {
     await waitAgentsClean(20_000)
-  } catch {
-    // recorded by the leftovers section
+  } catch (error) {
+    note('wait for both agents to be clean', error)
   }
 }
 
@@ -3268,8 +3283,12 @@ const leftovers = async (): Promise<void> => {
   report.check(
     'L.6',
     'instance cleanup completed without swallowed errors',
-    cleanupFailures === 0,
-    `failures=${cleanupFailures}`
+    cleanupFailures === 0 && cleanupErrors.length === 0,
+    `failures=${cleanupFailures} collected=${cleanupErrors.length}${
+      cleanupErrors.length === 0
+        ? ''
+        : `: ${short(cleanupErrors.join('; '), 400)}`
+    }`
   )
   // Surface probe failures as failures, not silent zeroes.
   report.check(
@@ -3289,9 +3308,49 @@ const leftovers = async (): Promise<void> => {
 
 let shuttingDown = false
 
-const finish = async (code: number): Promise<never> => {
+// The scenarios that must all run for a green result. Completion is tracked
+// separately from assertions: a signal or a thrown setup error can leave the
+// assertion list with zero failures while most of the suite never ran.
+const scenarioRuns: Array<[string, () => Promise<void>]> = [
+  ['hosts', scenarioHosts],
+  ['spread', scenarioSpread],
+  ['drain', scenarioDrain],
+  ['capacity', scenarioCapacity],
+  ['isolation', scenarioIsolation],
+  ['controller-restart', scenarioControllerRestart],
+  ['partition', scenarioPartition],
+  ['host-loss', scenarioHostLoss],
+  ['clock-skew', scenarioClockSkew],
+  ['token-mismatch', scenarioTokenMismatch],
+  ['ambiguous-create', scenarioAmbiguousCreate],
+  ['agent-restart', scenarioAgentRestart],
+]
+const completedScenarios: string[] = []
+
+const finish = async (requested: number): Promise<never> => {
   if (!shuttingDown) {
     shuttingDown = true
+    if (requested === 130 || requested === 143) {
+      const reason = requested === 143 ? 'SIGTERM' : 'SIGINT'
+      // An interrupted driver is never a success, even when no assertion had
+      // failed yet. Record it so results.json says so too.
+      report.fail(
+        'run',
+        `driver interrupted (${reason})`,
+        'the run did not complete; the exit code is nonzero'
+      )
+    }
+    const missing = scenarioRuns
+      .map(([name]) => name)
+      .filter(name => !completedScenarios.includes(name))
+    report.check(
+      'run.complete',
+      'every scenario ran to completion',
+      missing.length === 0,
+      missing.length === 0
+        ? `${completedScenarios.length}/${scenarioRuns.length} scenarios`
+        : `missing: ${missing.join(', ')}`
+    )
     try {
       await leftovers()
     } catch (error) {
@@ -3300,7 +3359,11 @@ const finish = async (code: number): Promise<never> => {
     report.summary()
     report.writeJson(RESULTS_JSON)
   }
-  process.exit(report.failed === 0 ? 0 : Math.max(1, code))
+  // Real termination codes are preserved (130/143); otherwise a failed or
+  // incomplete run exits 1 and only a fully green, fully completed run is 0.
+  const exitCode =
+    requested !== 0 ? Math.max(1, requested) : report.failed === 0 ? 0 : 1
+  process.exit(exitCode)
 }
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
@@ -3321,18 +3384,10 @@ const main = async (): Promise<void> => {
   await startController('normal')
   await waitHostsHealthy(90_000)
 
-  await scenarioHosts()
-  await scenarioSpread()
-  await scenarioDrain()
-  await scenarioCapacity()
-  await scenarioIsolation()
-  await scenarioControllerRestart()
-  await scenarioPartition()
-  await scenarioHostLoss()
-  await scenarioClockSkew()
-  await scenarioTokenMismatch()
-  await scenarioAmbiguousCreate()
-  await scenarioAgentRestart()
+  for (const [name, scenario] of scenarioRuns) {
+    await scenario()
+    completedScenarios.push(name)
+  }
 }
 
 try {

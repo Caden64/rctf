@@ -230,6 +230,12 @@ Version parsing reads only the first line of `--version` and the first
 unprivileged check of the same parser, `./host-setup.sh --check-version-only`
 prints the two parsed versions and exits without touching the host.
 
+The script applies **only** the file it installs,
+`/etc/sysctl.d/90-rctf-firecracker.conf`, with `sysctl -q -p` and then verifies
+every key/value in that file. It deliberately does not run `sysctl --system`,
+so unrelated drop-ins under `/etc/sysctl.d`, `/run/sysctl.d` or
+`/usr/lib/sysctl.d` are neither applied nor overwritten by this installer.
+
 It does **not** start/stop services, flush firewalls or delete anything.
 
 Then:
@@ -346,8 +352,9 @@ user+network namespace, two real Firecracker v1.17.0 microVMs, direct mode):
 255.4-1ubuntu8.18, kernel 6.8, Firecracker/jailer v1.17.0, nested KVM; the host ran only
 unprivileged QEMU):
 
-- `host-setup.sh` on a fresh distro, including parsing Firecracker 1.17's `--version` and an
-  idempotent rerun;
+- `host-setup.sh` on a fresh distro, including parsing Firecracker 1.17's `--version`, applying only its own
+  `/etc/sysctl.d/90-rctf-firecracker.conf` (an unrelated `99-` drop-in stays unapplied; all three intended keys
+  verified) and an idempotent rerun;
 - jailer mode: create/delete over the real agent API, uid/gid 10000, chroot, per-VM cgroup, real
   tap with the durable alias, MMDS flag delivery, no flag on host disk;
 - the **shipped** systemd unit (byte-identical, no drop-in) actually launching the jailer

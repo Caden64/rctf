@@ -60,6 +60,11 @@ OVERLAY=$VM_DIR/overlay.qcow2
 SSH_KEY=$VM_DIR/id_ed25519
 SEED_DIR=$VM_DIR/seed
 QEMU_PID=$VM_DIR/qemu.pid
+# QEMU's own -pidfile target: a bare numeric file written by QEMU. The
+# authenticated record is built from it and atomically renamed onto
+# $QEMU_PID, so a concurrent observer never sees a bare intermediate at the
+# canonical path.
+QEMU_RAW_PID=$QEMU_PID.raw
 SEED_PID=$VM_DIR/seed-http.pid
 CONSOLE=$VM_DIR/console.log
 
@@ -68,6 +73,23 @@ die() {
   printf 'vm.sh: %s\n' "$*" >&2
   exit 1
 }
+
+# ---------------------------------------------------------------------------
+# Lifecycle serialisation
+# ---------------------------------------------------------------------------
+# Every command that can create, remove or rewrite a pidfile holds an
+# exclusive flock for the whole operation. Observational commands (`status`,
+# `pid`) take no lock because they never mutate the pidfile (see
+# pidfile_observe). Daemons started below close fd 9 explicitly (9>&-) so they
+# do not inherit the lock for their lifetime.
+case "${1:-}" in
+  create | start | stop | destroy)
+    mkdir -p "$VM_DIR"
+    exec 9>"$VM_DIR/.lifecycle.lock"
+    flock -w "${VM_LOCK_TIMEOUT:-300}" 9 ||
+      die "could not acquire the lifecycle lock $VM_DIR/.lifecycle.lock"
+    ;;
+esac
 
 ssh_opts=(
   -i "$SSH_KEY"
@@ -94,9 +116,10 @@ ssh_opts=(
 # has a window in which the target exits and the PID is reused. All signalling
 # therefore goes through pidguard.py, which opens a pidfd FIRST, validates the
 # recorded identity while holding it, re-reads the start ticks immediately
-# before the signal and sends TERM/KILL only through that same pidfd. Any
-# mismatch is a stale pidfile: it is removed with a warning and no process is
-# signalled.
+# before the signal and sends TERM/KILL only through that same pidfd. A
+# definitely dead record (exit 1) is removed with a warning; an identity
+# mismatch (4) or observation failure (3) keeps the pidfile and signals
+# nothing, because a live process may still exist behind it.
 PIDGUARD=$(cd -- "$(dirname -- "$0")" && pwd)/pidguard.py
 [ -f "$PIDGUARD" ] || die "pidguard helper is missing at $PIDGUARD"
 # Only the self-test populates this (with --test-hook=... entries).
@@ -105,6 +128,7 @@ PIDGUARD_HOOKS=()
 current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 process_start_ticks() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 process_exe() { readlink "/proc/$1/exe" 2>/dev/null; }
+process_pid_ns() { readlink "/proc/$1/ns/pid" 2>/dev/null; }
 
 # Required argv elements per process kind, as --require-arg=... options for
 # pidguard.py. Recorded arguments from the pidfile are always checked too; the
@@ -112,7 +136,7 @@ process_exe() { readlink "/proc/$1/exe" 2>/dev/null; }
 pidguard_fill_required() { # <kind>; sets PIDGUARD_REQ
   PIDGUARD_REQ=()
   case "$1" in
-    qemu) PIDGUARD_REQ=(--require-arg=-pidfile "--require-arg=$QEMU_PID") ;;
+    qemu) PIDGUARD_REQ=(--require-arg=-pidfile "--require-arg=$QEMU_RAW_PID") ;;
     seed)
       PIDGUARD_REQ=(
         --require-arg=-m --require-arg=http.server
@@ -128,30 +152,38 @@ pidguard_fill_required() { # <kind>; sets PIDGUARD_REQ
 pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
   local file=$1 kind=$2 pid=$3 a tmp=$1.tmp.$$
   shift 3
-  local boot start exe
+  local boot start exe pid_ns
   boot=$(current_boot_id) || return 1
   start=$(process_start_ticks "$pid") || return 1
   exe=$(process_exe "$pid") || return 1
-  [ -n "$boot" ] && [ -n "$start" ] && [ -n "$exe" ] || return 1
+  pid_ns=$(process_pid_ns "$pid") || return 1
+  [ -n "$boot" ] && [ -n "$start" ] && [ -n "$exe" ] && [ -n "$pid_ns" ] ||
+    return 1
   {
-    printf 'version=2\nkind=%s\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
-      "$kind" "$pid" "$boot" "$start" "$exe"
+    printf 'version=3\nkind=%s\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\npid_ns=%s\n' \
+      "$kind" "$pid" "$boot" "$start" "$exe" "$pid_ns"
     for a in "$@"; do printf 'arg=%s\n' "$a"; done
   } >"$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$file"
 }
 
-pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID, returns 0 on match
+pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID/REASON/STATUS
+  # Returns the pidguard outcome unchanged: 0 authenticated, 1 definitely
+  # stale (the record does not describe a live process), 3 observation failure
+  # (the identity could not be read; nothing may be deleted or signalled).
   local file=$1 kind=$2 errf rc out
   PIDFILE_PID=
   PIDFILE_REASON=
+  PIDFILE_STATUS=stale
   if ! pidguard_fill_required "$kind"; then
     PIDFILE_REASON="unknown process kind '$kind'"
-    return 1
+    PIDFILE_STATUS=error
+    return 2
   fi
   errf=$(mktemp "${TMPDIR:-/tmp}/rctf-pidguard.XXXXXX") || {
     PIDFILE_REASON="could not create a temporary file"
-    return 1
+    PIDFILE_STATUS=error
+    return 3
   }
   rc=0
   out=$(python3 "$PIDGUARD" verify --pidfile "$file" --kind "$kind" \
@@ -159,40 +191,75 @@ pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID, returns 0 o
   PIDFILE_REASON=$(tr '\n' ' ' <"$errf" | sed -e 's/[[:space:]]*$//')
   rm -f "$errf"
   case "$rc" in
-    0) PIDFILE_PID=$out; return 0 ;;
-    1) return 1 ;;
+    0)
+      PIDFILE_PID=$out
+      PIDFILE_STATUS=running
+      return 0
+      ;;
+    1)
+      [ -n "$PIDFILE_REASON" ] || PIDFILE_REASON="stale pidfile"
+      return 1
+      ;;
+    4)
+      [ -n "$PIDFILE_REASON" ] || PIDFILE_REASON="identity mismatch"
+      PIDFILE_STATUS=error
+      return 4
+      ;;
     *)
       [ -n "$PIDFILE_REASON" ] ||
         PIDFILE_REASON="pidguard verify failed (exit $rc)"
-      return 1
+      PIDFILE_STATUS=error
+      return 3
       ;;
   esac
 }
 
-pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and return 1
+# Observation only: never removes or rewrites a pidfile. `status`/`pid` and any
+# other read-only command use this so a concurrent lifecycle command can never
+# lose its record to a reader. Prints the authenticated pid on success.
+pidfile_observe() { # pidfile_observe <file> <kind>
   local file=$1 kind=$2
-  [ -f "$file" ] || return 1
-  if pidfile_verify "$file" "$kind"; then
-    printf '%s\n' "$PIDFILE_PID"
-    return 0
-  fi
-  log "WARNING: removing stale pidfile $file ($PIDFILE_REASON); not signalling any process"
-  rm -f "$file"
-  return 1
+  [ -f "$file" ] || {
+    PIDFILE_STATUS=stopped
+    return 1
+  }
+  pidfile_verify "$file" "$kind"
 }
 
-is_running() { pidfile_take "$QEMU_PID" qemu >/dev/null; }
+pidfile_take() { # pidfile_take <file> <kind>: mutate callers only; see pidfile_observe
+  local file=$1 kind=$2
+  [ -f "$file" ] || return 1
+  pidfile_verify "$file" "$kind"
+  case "$?" in
+    0) printf '%s\n' "$PIDFILE_PID"; return 0 ;;
+    1)
+      log "WARNING: removing stale pidfile $file ($PIDFILE_REASON); not signalling any process"
+      rm -f "$file"
+      return 1
+      ;;
+    *)
+      log "WARNING: could not observe $file ($PIDFILE_REASON); leaving it in place and not signalling"
+      return 3
+      ;;
+  esac
+}
+
+is_running() { pidfile_observe "$QEMU_PID" qemu >/dev/null; }
 
 # Stop a process recorded in a pidfile. pidguard.py does the whole
 # authenticate -> TERM -> wait -> KILL sequence in one invocation, opening the
 # pidfd before it validates and signalling only through that fd (see the file
 # header). A stale record is removed and no process is signalled.
 stop_recorded() { # stop_recorded <file> <kind> <label> <term-wait-ticks>
+  # Returns 0 only when the recorded process is stopped or the record is
+  # definitely stale. An observation failure (rc 3) or unsupported pidfd (rc 2)
+  # returns nonzero and leaves the pidfile in place, so the caller must keep
+  # every resource it protects (socket, overlay, seed dir).
   local file=$1 kind=$2 label=$3 wait=$4 rc out reason
   [ -f "$file" ] || return 0
   if ! pidguard_fill_required "$kind"; then
     log "WARNING: refusing to stop $label: unknown process kind '$kind'"
-    return 0
+    return 2
   fi
   rc=0
   out=$(python3 "$PIDGUARD" stop --pidfile "$file" --kind "$kind" \
@@ -203,13 +270,20 @@ stop_recorded() { # stop_recorded <file> <kind> <label> <term-wait-ticks>
     0)
       [ -z "$out" ] || printf '%s\n' "$out" >&2
       rm -f "$file"
+      return 0
       ;;
     1)
       log "WARNING: removing stale pidfile $file ($reason); not signalling any process"
       rm -f "$file"
+      return 0
+      ;;
+    4)
+      log "WARNING: identity mismatch for $label ($reason); keeping $file and not signalling"
+      return 4
       ;;
     *)
-      log "WARNING: could not authenticate $label ($reason); leaving $file in place and not signalling"
+      log "WARNING: could not stop $label ($reason); leaving $file in place and not signalling"
+      return 3
       ;;
   esac
 }
@@ -256,8 +330,14 @@ check_port_free() { # check_port_free <port> <allowed-pid> <description>
 
 check_boot_ports() {
   local qpid= spid=
-  if pidfile_verify "$QEMU_PID" qemu; then qpid=$PIDFILE_PID; fi
-  if pidfile_verify "$SEED_PID" seed; then spid=$PIDFILE_PID; fi
+  if pidfile_observe "$QEMU_PID" qemu; then qpid=$PIDFILE_PID
+  elif [ "$PIDFILE_STATUS" = error ]; then
+    die "cannot determine whether the recorded VM is running ($PIDFILE_REASON); refusing to boot"
+  fi
+  if pidfile_observe "$SEED_PID" seed; then spid=$PIDFILE_PID
+  elif [ "$PIDFILE_STATUS" = error ]; then
+    die "cannot determine whether the recorded seed server is running ($PIDFILE_REASON); refusing to boot"
+  fi
   check_port_free "$VM_SSH_PORT" "$qpid" "VM ssh"
   check_port_free "$VM_SEED_PORT" "$spid" "cloud-init seed"
 }
@@ -417,7 +497,7 @@ start_seed_server() {
   fi
   command -v python3 >/dev/null || die "python3 is required to serve the cloud-init seed"
   nohup python3 -m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" \
-    >"$VM_DIR/seed-http.log" 2>&1 &
+    >"$VM_DIR/seed-http.log" 2>&1 9>&- &
   local spid=$!
   pidfile_record "$SEED_PID" seed "$spid" \
     -m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" ||
@@ -458,15 +538,18 @@ boot() {
   mkdir -p "$VM_DIR"
   check_boot_ports
   local qpid
-  if qpid=$(pidfile_take "$QEMU_PID" qemu); then
-    log "VM already running (pid $qpid)"
+  if pidfile_observe "$QEMU_PID" qemu; then
+    log "VM already running (pid $PIDFILE_PID)"
     return 0
+  fi
+  if [ "$PIDFILE_STATUS" = error ]; then
+    die "cannot determine whether the VM is running ($PIDFILE_REASON); refusing to boot"
   fi
   ensure_base_image
   ensure_ssh_key
   write_seed
   start_seed_server
-  rm -f "$QEMU_PID" "$CONSOLE"
+  rm -f "$CONSOLE" "$QEMU_RAW_PID"
   if [ ! -f "$OVERLAY" ]; then
     log "creating qcow2 overlay (${VM_DISK})"
     qemu-img create -q -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$OVERLAY" "$VM_DISK"
@@ -475,20 +558,51 @@ boot() {
   qemu-system-x86_64 \
     -enable-kvm -cpu host -m "$VM_MEM" -smp "$VM_SMP" \
     -display none -serial "file:$CONSOLE" \
-    -pidfile "$QEMU_PID" -daemonize \
+    -pidfile "$QEMU_RAW_PID" -daemonize \
     -drive "if=virtio,file=$OVERLAY,cache=writeback,discard=unmap" \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
-    -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${VM_SEED_PORT}/"
-  qpid=$(cat "$QEMU_PID" 2>/dev/null) || qpid=
-  [ -n "$qpid" ] || die "qemu did not write $QEMU_PID"
-  pidfile_record "$QEMU_PID" qemu "$qpid" -pidfile "$QEMU_PID" ||
+    -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${VM_SEED_PORT}/" 9>&-
+  qpid=$(cat "$QEMU_RAW_PID" 2>/dev/null) || qpid=
+  [ -n "$qpid" ] || die "qemu did not write $QEMU_RAW_PID"
+  pidfile_record "$QEMU_PID" qemu "$qpid" -pidfile "$QEMU_RAW_PID" ||
     die "could not record authenticated qemu pidfile $QEMU_PID"
+  # The bare numeric file is only an input to the authenticated record; remove
+  # it so a concurrent observer can never read it as the live pidfile.
+  rm -f "$QEMU_RAW_PID"
   if ! wait_ssh; then
     tail -40 "$CONSOLE" >&2 || true
     die "VM did not become reachable over ssh"
   fi
   wait_cloud_init
+}
+
+# Stop the recorded VM. Returns 0 only when shutdown is confirmed (stopped or
+# definitively stale); an observation failure leaves the pidfile and returns
+# nonzero so callers must keep the overlay/console/seed.
+stop_vm() {
+  local rc=0
+  stop_recorded "$QEMU_PID" qemu "VM" 50 || rc=$?
+  stop_seed_server || {
+    [ "$rc" -ne 0 ] || rc=3
+  }
+  rm -f "$QEMU_RAW_PID"
+  return "$rc"
+}
+
+# Destroy is allowed only after stop_vm confirmed the VM is gone. On an
+# observation error every file is retained and the command exits nonzero.
+destroy_vm() {
+  local rc=0
+  stop_vm || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "REFUSING to remove $OVERLAY and the seed directory: VM shutdown is unconfirmed"
+    return "$rc"
+  fi
+  log "removing overlay $OVERLAY"
+  rm -f "$OVERLAY" "$CONSOLE"
+  rm -rf "$SEED_DIR"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -498,9 +612,10 @@ boot() {
 # process is never signalled (while a correctly recorded one still is).
 # ---------------------------------------------------------------------------
 selftest() {
-  local fail=0 line decoy start replacement
+  local fail=0 line decoy start replacement rc
   local save_vm_dir=$VM_DIR save_qpid=$QEMU_PID save_spid=$SEED_PID
-  local save_seed=$SEED_DIR save_sport=$VM_SEED_PORT
+  local save_seed=$SEED_DIR save_sport=$VM_SEED_PORT save_raw=$QEMU_RAW_PID
+  local save_overlay=$OVERLAY save_console=$CONSOLE
   SELFTEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vmtest-selftest.XXXXXX")
   SELFTEST_DECOYS=()
   selftest_cleanup() {
@@ -510,11 +625,13 @@ selftest() {
   }
   trap selftest_cleanup EXIT
   local tmp=$SELFTEST_TMP
-  local -a decoys=()
   VM_DIR=$tmp
   QEMU_PID=$tmp/qemu.pid
+  QEMU_RAW_PID=$tmp/qemu.pid.raw
   SEED_PID=$tmp/seed-http.pid
   SEED_DIR=$tmp/seed
+  OVERLAY=$tmp/overlay.qcow2
+  CONSOLE=$tmp/console.log
   VM_SEED_PORT=$((20000 + RANDOM % 20000))
   mkdir -p "$SEED_DIR"
 
@@ -534,8 +651,15 @@ selftest() {
   st_removed() { # st_removed <label>
     if [ -e "$QEMU_PID" ] || [ -e "$SEED_PID" ]; then st_bad "$1: stale pidfile was not removed"; else st_ok "$1: stale pidfile was removed"; fi
   }
+  st_exists() { # st_exists <path> <label>
+    if [ -e "$1" ] || [ -L "$1" ]; then st_ok "$2"; else st_bad "$2 (missing)"; fi
+  }
+  st_absent() { # st_absent <path> <label>
+    if [ -e "$1" ] || [ -L "$1" ]; then st_bad "$2 (still present)"; else st_ok "$2"; fi
+  }
 
   printf 'pidfile authentication selftest (no VM, no root)\n'
+  set +e
 
   # 1. Old-format pidfile (bare PID): cannot be authenticated at all.
   sleep 300 >/dev/null 2>&1 &
@@ -552,24 +676,26 @@ selftest() {
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   {
-    printf 'version=2\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
-      "$decoy" "$(current_boot_id)" "$(process_start_ticks "$decoy")" "$(process_exe "$decoy")"
-    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+    printf 'version=3\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\npid_ns=%s\n' \
+      "$decoy" "$(current_boot_id)" "$(process_start_ticks "$decoy")" \
+      "$(process_exe "$decoy")" "$(process_pid_ns "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_RAW_PID"
   } >"$QEMU_PID"
   stop_recorded "$QEMU_PID" qemu "selftest cmdline decoy" 2 >"$tmp/stop.out" 2>&1
   st_alive "$decoy" "command-line mismatch"
   st_message "command-line mismatch" "lacks required argument"
-  st_removed "command-line mismatch"
+  st_exists "$QEMU_PID" "command-line mismatch KEEPS the pidfile (the process may be the VM)"
 
   # 3. Correct executable/args but a different boot id (stale after reboot).
-  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   sleep 0.2
   {
-    printf 'version=2\nkind=qemu\npid=%s\nboot_id=00000000-0000-0000-0000-000000000000\nstart_ticks=%s\nexe=%s\n' \
-      "$decoy" "$(process_start_ticks "$decoy")" "$(process_exe "$decoy")"
-    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+    printf 'version=3\nkind=qemu\npid=%s\nboot_id=00000000-0000-0000-0000-000000000000\nstart_ticks=%s\nexe=%s\npid_ns=%s\n' \
+      "$decoy" "$(process_start_ticks "$decoy")" "$(process_exe "$decoy")" \
+      "$(process_pid_ns "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_RAW_PID"
   } >"$QEMU_PID"
   stop_recorded "$QEMU_PID" qemu "selftest boot-id decoy" 2 >"$tmp/stop.out" 2>&1
   st_alive "$decoy" "boot-id mismatch"
@@ -577,60 +703,79 @@ selftest() {
   st_removed "boot-id mismatch"
 
   # 4. Correct boot/exe/args but a different start time (PID reused).
-  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   sleep 0.2
   start=$(process_start_ticks "$decoy")
   {
-    printf 'version=2\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
-      "$decoy" "$(current_boot_id)" "$((start + 1))" "$(process_exe "$decoy")"
-    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+    printf 'version=3\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\npid_ns=%s\n' \
+      "$decoy" "$(current_boot_id)" "$((start + 1))" \
+      "$(process_exe "$decoy")" "$(process_pid_ns "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_RAW_PID"
   } >"$QEMU_PID"
   stop_recorded "$QEMU_PID" qemu "selftest start-time decoy" 2 >"$tmp/stop.out" 2>&1
   st_alive "$decoy" "start-time mismatch"
   st_message "start-time mismatch" "pid reused"
-  st_removed "start-time mismatch"
+  st_exists "$QEMU_PID" "start-time mismatch KEEPS the pidfile"
 
-  # 5. Positive control: a process whose identity matches exactly IS stopped.
-  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  # 5. Correct PID/boot/start/exe/argv but a different PID namespace. The same
+  # numeric PID in another namespace is a different process and must never be
+  # signalled when the *current* namespace does not match the record.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   sleep 0.2
-  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+  {
+    printf 'version=3\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\npid_ns=pid:[0]\n' \
+      "$decoy" "$(current_boot_id)" "$(process_start_ticks "$decoy")" \
+      "$(process_exe "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_RAW_PID"
+  } >"$QEMU_PID"
+  stop_recorded "$QEMU_PID" qemu "selftest pid-ns decoy" 2 >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "pid-namespace mismatch"
+  st_message "pid-namespace mismatch" "different PID namespace"
+  st_removed "pid-namespace mismatch"
+
+  # 6. Positive control: a process whose identity matches exactly IS stopped.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_RAW_PID" ||
     st_bad "could not record the positive-control pidfile"
   stop_recorded "$QEMU_PID" qemu "selftest positive control" 25 >"$tmp/stop.out" 2>&1
   st_dead "$decoy" "positive control"
   st_removed "positive control"
 
-  # 6. PID-reuse race at the signal: the record validates, then the live start
+  # 7. PID-reuse race at the signal: the record validates, then the live start
   # ticks change before TERM (simulated through the helper's test hook). The
   # helper must re-check immediately before signalling and refuse.
-  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   sleep 0.2
-  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_RAW_PID" ||
     st_bad "could not record the pid-reuse-race pidfile"
   PIDGUARD_HOOKS=(--test-hook=start-delta-after-validate=1)
   stop_recorded "$QEMU_PID" qemu "selftest pid-reuse decoy" 2 >"$tmp/stop.out" 2>&1
   PIDGUARD_HOOKS=()
   st_alive "$decoy" "pid-reuse race"
   st_message "pid-reuse race" "changed identity before SIGTERM"
-  st_removed "pid-reuse race"
+  st_exists "$QEMU_PID" "pid-reuse race KEEPS the pidfile"
 
-  # 7. A naive implementation re-resolves the PID after validation and could
+  # 8. A naive implementation re-resolves the PID after validation and could
   # signal the recycled PID. The hook makes the helper re-resolve to a second
   # live decoy; the pidfd still holds the validated target, so only that one is
   # stopped and the replacement is never signalled.
-  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
   python3 -c 'import time; time.sleep(300)' >/dev/null 2>&1 &
   replacement=$!
   SELFTEST_DECOYS+=("$replacement")
   sleep 0.2
-  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_RAW_PID" ||
     st_bad "could not record the pid-reuse replacement pidfile"
   PIDGUARD_HOOKS=(--test-hook="reuse-after-validate=$replacement")
   stop_recorded "$QEMU_PID" qemu "selftest pid-reuse replacement" 25 >"$tmp/stop.out" 2>&1
@@ -640,7 +785,103 @@ selftest() {
   st_message "pid-reuse replacement" "signalling only through the pidfd"
   st_removed "pid-reuse replacement"
 
-  # 8. A stale seed-server pidfile is also not signalled.
+  # 9. An observation failure is NOT a stale identity: stop must return
+  # nonzero, keep the pidfile, and leave the (live, authenticated) process
+  # alone. Callers must then keep the socket/overlay/seed dir.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_RAW_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_RAW_PID" ||
+    st_bad "could not record the observation-error pidfile"
+  PIDGUARD_HOOKS=(--test-hook=force-probe-error)
+  rc=0
+  stop_recorded "$QEMU_PID" qemu "selftest observation error" 2 >"$tmp/stop.out" 2>&1 || rc=$?
+  PIDGUARD_HOOKS=()
+  if [ "$rc" -ne 0 ]; then st_ok "observation error: stop propagates a failure (rc=$rc)"; else
+    st_bad "observation error: stop reported success"
+  fi
+  st_alive "$decoy" "observation error"
+  st_exists "$QEMU_PID" "observation error: the pidfile was retained"
+  st_message "observation error" "simulated observation failure"
+
+  # 10. status/pid are observational: an injected observation failure must
+  # return nonzero and leave the record intact (never delete it).
+  cat >"$tmp/fake-guard.py" <<'PYGUARD'
+import sys
+print("simulated observation failure", file=sys.stderr)
+sys.exit(3)
+PYGUARD
+  local save_guard=$PIDGUARD
+  PIDGUARD=$tmp/fake-guard.py
+  rc=0
+  pidfile_observe "$QEMU_PID" qemu >/dev/null 2>&1 || rc=$?
+  PIDGUARD=$save_guard
+  if [ "$rc" -eq 3 ]; then st_ok "status observation failure is exit 3 (distinct from stopped)"; else
+    st_bad "status observation failure returned $rc, expected 3"
+  fi
+  if [ "$PIDFILE_STATUS" = error ]; then st_ok "observation failure is reported as 'unknown', not 'stopped'"; else
+    st_bad "observation failure was reported as $PIDFILE_STATUS"
+  fi
+  st_exists "$QEMU_PID" "status never removed the pidfile"
+
+  # 11. Concurrent observational status while the record is repeatedly
+  # rewritten must never remove a live VM's pidfile. The observer runs 60
+  # times while the writer re-records the same live process.
+  (
+    obs_fail=0
+    for _ in $(seq 1 60); do
+      pidfile_observe "$QEMU_PID" qemu >/dev/null 2>&1 || obs_fail=$((obs_fail + 1))
+    done
+    printf '%s\n' "$obs_fail" >"$tmp/concurrent.fail"
+  ) &
+  local obs=$!
+  for _ in $(seq 1 60); do
+    pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_RAW_PID" || {
+      st_bad "concurrent rewrite failed"
+      break
+    }
+  done
+  wait "$obs"
+  if [ "$(cat "$tmp/concurrent.fail")" = 0 ]; then st_ok "concurrent status never observed a missing/mutated live pidfile"; else
+    st_bad "concurrent status failed $(cat "$tmp/concurrent.fail") time(s)"
+  fi
+  if pidfile_observe "$QEMU_PID" qemu; then st_ok "live pidfile still authenticates after concurrent status/rewrite"; else
+    st_bad "live pidfile was lost by concurrent status"
+  fi
+
+  # 12. destroy must refuse while the authenticated VM is still alive: the
+  # overlay and seed directory are kept and the exit is nonzero.
+  : >"$OVERLAY"
+  : >"$CONSOLE"
+  mkdir -p "$SEED_DIR"
+  # Force the stop observation to fail: shutdown is unconfirmed while the VM
+  # is still alive, so destroy must refuse.
+  PIDGUARD_HOOKS=(--test-hook=force-probe-error)
+  rc=0
+  destroy_vm >"$tmp/destroy.out" 2>&1 || rc=$?
+  PIDGUARD_HOOKS=()
+  if [ "$rc" -ne 0 ]; then st_ok "destroy refuses while the VM is alive (rc=$rc)"; else
+    st_bad "destroy reported success while the VM was alive"
+  fi
+  st_alive "$decoy" "destroy while alive"
+  st_exists "$OVERLAY" "destroy while alive: overlay retained"
+  st_exists "$CONSOLE" "destroy while alive: console retained"
+  st_exists "$SEED_DIR" "destroy while alive: seed directory retained"
+  st_exists "$QEMU_PID" "destroy while alive: pidfile retained"
+
+  # 13. Once the authenticated VM is stopped, destroy removes the overlay.
+  stop_recorded "$QEMU_PID" qemu "selftest destroy owner" 25 >"$tmp/stop.out" 2>&1
+  st_dead "$decoy" "destroy owner"
+  rc=0
+  destroy_vm >"$tmp/destroy.out" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then st_ok "destroy succeeds after a confirmed stop"; else
+    st_bad "destroy failed after a confirmed stop (rc=$rc): $(tr '\n' ' ' <"$tmp/destroy.out")"
+  fi
+  st_absent "$OVERLAY" "confirmed destroy removed the overlay"
+  st_absent "$SEED_DIR" "confirmed destroy removed the seed directory"
+
+  # 14. A stale seed-server pidfile is also not signalled.
   sleep 300 >/dev/null 2>&1 &
   decoy=$!
   SELFTEST_DECOYS+=("$decoy")
@@ -651,8 +892,11 @@ selftest() {
 
   VM_DIR=$save_vm_dir
   QEMU_PID=$save_qpid
+  QEMU_RAW_PID=$save_raw
   SEED_PID=$save_spid
   SEED_DIR=$save_seed
+  OVERLAY=$save_overlay
+  CONSOLE=$save_console
   VM_SEED_PORT=$save_sport
 
   printf 'RESULT: pidfile selftest %s (%d failure(s))\n' \
@@ -671,24 +915,30 @@ case "$cmd" in
     exec ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 "$@"
     ;;
   status)
-    if pid=$(pidfile_take "$QEMU_PID" qemu); then
-      echo "running pid=$pid ssh=127.0.0.1:$VM_SSH_PORT"
+    if pidfile_observe "$QEMU_PID" qemu; then
+      echo "running pid=$PIDFILE_PID ssh=127.0.0.1:$VM_SSH_PORT"
+    elif [ "$PIDFILE_STATUS" = error ]; then
+      echo "unknown ($PIDFILE_REASON)"
+      exit 2
     else
       echo "stopped"
       exit 1
     fi
     ;;
+  pid)
+    if pidfile_observe "$QEMU_PID" qemu; then
+      printf '%s\n' "$PIDFILE_PID"
+    elif [ "$PIDFILE_STATUS" = error ]; then
+      printf 'unknown (%s)\n' "$PIDFILE_REASON" >&2
+      exit 2
+    else
+      exit 1
+    fi
+    ;;
   ip) echo "127.0.0.1:$VM_SSH_PORT" ;;
-  stop)
-    stop_recorded "$QEMU_PID" qemu "VM" 50
-    stop_seed_server
-    ;;
+  stop) stop_vm ;;
   selftest) selftest ;;
-  destroy)
-    "$0" stop
-    log "removing overlay $OVERLAY"
-    rm -f "$OVERLAY" "$CONSOLE"
-    ;;
+  destroy) destroy_vm ;;
   *)
     sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     exit 2

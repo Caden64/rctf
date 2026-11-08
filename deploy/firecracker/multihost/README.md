@@ -89,7 +89,7 @@ interface or listener on `10.77.0.10/11`. Logs, `results.json`,
 checks passed.
 
 Typical runtime on the reference host: **8–20 minutes** (the final run took
-7m14s: 137 driver assertions, 24 link checks, 35 pidfile-selftest checks), dominated
+4m57s: 138 driver assertions, 24 link checks, 72 pidfile-selftest checks), dominated
 by the two cloud-init boots, `bun install` inside each VM and the injected
 faults. The host checkout needs its workspace dependencies installed once
 (`bun install --frozen-lockfile`), because `driver.ts` imports the real
@@ -175,7 +175,8 @@ and writes `results.json`. Groups:
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run.sh`            | host driver: unique ports/dirs, pidfile selftest, boots + provisions both VMs, asserts the private link, opens the ssh forward, runs `driver.ts`, always stops the VMs. |
 | `vm.sh`             | named QEMU VM helper (copy/extension of `vmtest/vm.sh`): per-VM overlay/seed/ssh port, the second unix-datagram link NIC, authenticated pidfiles + pidfd signalling, per-VM lifecycle `flock`, and `selftest`. |
-| `pidguard.py` (shared) | `../vmtest/pidguard.py`: authenticate a v2 pidfile and TERM/KILL it through a pidfd; used by both `vm.sh` scripts.                                                              |
+| `pidguard.py` (shared) | `../vmtest/pidguard.py`: authenticate a v3 pidfile (boot id, start ticks, exe, PID namespace, argv) and TERM/KILL it through a pidfd; exit codes preserve running / stale / identity-mismatch / observation-error. |
+| `linkguard.py`      | validates the link directory against a trusted root and unlinks an endpoint relative to an opened directory fd (no path-based `rm`).                                      |
 | `provision-host.sh` | runs as root in each VM: packages, bun, checkout, host-setup.sh, images, shipped agent unit + jailer config, controller config on host-a.                               |
 | `hoststats.sh`      | read-only per-host observation (agent list, Firecracker/tap/state/nft counts) used by the driver; every failed enumeration reports -1 + `observationErrors`, which the driver rejects. |
 | `faultproxy.ts`     | runs inside host-a: wraps `../e2e/proxy.ts` around host-b's agent for the ambiguous-create scenario (hold a request or swallow the response).                           |
@@ -188,20 +189,40 @@ and writes `results.json`. Groups:
 
 - Only `qemu-system-x86_64` runs unprivileged on the host. Both QEMU and the
   cloud-init seed server are stopped only through authenticated pidfiles that
-  record the boot id, process start ticks, executable and run-specific argv.
-  All TERM/KILL signals go through `pidguard.py`, which opens a pidfd first,
+  record the boot id, process start ticks, executable, PID namespace
+  (`/proc/<pid>/ns/pid`) and run-specific argv. QEMU writes its bare numeric
+  pidfile to `qemu.pid.raw`; the authenticated record is atomically renamed onto
+  `qemu.pid`, so a concurrent observer never sees a bare intermediate. All
+  TERM/KILL signals go through `pidguard.py`, which opens a pidfd first,
   validates the identity while holding it, re-reads the start ticks immediately
   before the signal, and signals only through that fd (a reused PID is never
-  signalled). A stale or mismatched pidfile is removed with a warning and no
-  process is signalled (never `pkill`/name). `vm.sh --name selftest selftest`
-  proves this with unprivileged decoy processes (35 checks, including simulated
-  PID-reuse races) and runs before every boot.
+  signalled).
+
+  The four outcomes are kept distinct: authenticated/stopped (0), definitely
+  dead/stale (1, the only case that removes a pidfile), identity mismatch (4,
+  keep the record: a live process exists that is not this record) and
+  observation failure (3, keep the record, socket and disk). `status`/`pid` are
+  non-mutating observations; every pidfile mutation holds the per-VM lifecycle
+  `flock`. A failed stop is propagated, `destroy` refuses to remove the overlay
+  while shutdown is unconfirmed, and `run.sh` keeps an overlay unless the
+  authenticated status says the VM stopped (never `pkill`/name).
+  `vm.sh --name selftest selftest` proves this with unprivileged decoy
+  processes (**72 checks**, including the PID-namespace mismatch,
+  observation-error retention, destroy refusal, name/symlink validation, link
+  validation, and a concurrent status/rewrite loop) and runs before every boot.
 - Every run uses unique directories, ssh/seed/controller ports and two unique
-  unix-socket paths in a 0700 directory for the private link. Link endpoints are
-  removed only after the authenticated pidfile says the VM is gone, and only an
-  AF_UNIX socket owned by this uid inside a validated 0700 directory is ever
-  unlinked (a regular file given as `--link-local` is left untouched).
-  `create`/`start`/`stop`/`destroy`/`kill` are serialised with a per-VM `flock`.
+  unix-socket paths in a 0700 directory for the private link. The link
+  directory must be a direct child of `$MH_LINK_ROOT` (the per-run directory),
+  with no symlink up to that trusted root. `linkguard.py` validates it and
+  unlinks an endpoint relative to an opened directory fd after an `lstat`
+  through the same fd, and only for an AF_UNIX socket owned by this uid (a
+  regular file or symlink given as `--link-local` is left untouched). Endpoints
+  are removed only after the authenticated pidfile says the VM is gone; an
+  observation error never unlinks. `create`/`start`/`stop`/`destroy`/`kill` are
+  serialised with a per-VM `flock`.
+- VM names are restricted to `^[A-Za-z0-9][A-Za-z0-9_-]*$` (no dots, no `.`
+  or `..`) and the resolved VM directory must be a direct child of the resolved
+  `MH_VM_ROOT`, so no name or symlink can point `destroy` outside the run.
 - The private link cannot leave the host: it is two `AF_UNIX` datagram sockets,
   not multicast/UDP/TCP, and there is no host bridge or tap. Ports cannot
   collide across parallel workers because there is no shared port at all.

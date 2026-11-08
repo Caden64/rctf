@@ -23,15 +23,27 @@ KEEP_VM=1 ./run.sh       # leave it running for debugging
 Defaults are ssh `127.0.0.1:2422` and cloud-init seed `127.0.0.1:8201`;
 override with `VM_SSH_PORT` / `VM_SEED_PORT`. `vm.sh` refuses to boot when
 either port is already bound by a process it did not record (it never kills by
-process name). Pidfiles are versioned and record the machine boot id, the
-process start time (`/proc/<pid>/stat` field 22), the executable and the
-run-specific argv elements. All signalling goes through `pidguard.py`, which
+process name). Pidfiles are versioned (`version=3`) and record the machine boot
+id, the process start time (`/proc/<pid>/stat` field 22), the executable, the
+PID-namespace identity (`/proc/<pid>/ns/pid`) and the run-specific argv
+elements. QEMU writes its bare numeric pidfile to `qemu.pid.raw`; the
+authenticated record is atomically renamed onto `qemu.pid`, so no bare
+intermediate is observable. All signalling goes through `pidguard.py`, which
 opens a pidfd first, validates that identity while holding it, re-reads the
 start ticks immediately before the signal, and sends TERM/KILL only through the
-same pidfd (so a reused PID is never signalled). A mismatch is a stale pidfile:
-it is removed with a warning and nothing is signalled. `./vm.sh selftest` runs
-that check unprivileged on the host (decoy processes, no VM; 23 checks,
-including two simulated PID-reuse races) and `run.sh` runs it before booting.
+same pidfd (so a reused PID is never signalled).
+
+The helper has three distinct outcomes and the wrappers preserve them: `0`
+authenticated/stopped, `1` definitely dead/stale (only this may delete a
+pidfile), `4` identity mismatch (a live process exists but is not this record;
+keep the pidfile) and `3` observation failure (pidfd/`/proc` unreadable; keep
+the pidfile and every resource it protects). `status`/`pid` are non-mutating
+observations; every pidfile mutation is serialised by a lifecycle `flock`.
+`stop` returns nonzero when shutdown is unconfirmed, and `destroy` refuses to
+remove the overlay/console/seed when it is. `./vm.sh selftest` runs these checks
+unprivileged on the host (decoy processes, no VM; **45 checks**, including the
+PID-namespace mismatch, observation-error retention, destroy refusal and a
+concurrent status/rewrite loop) and `run.sh` runs it before booting.
 
 ## Requirements
 
@@ -60,13 +72,13 @@ its zip is checked against the official `SHASUMS256.txt` plus a pinned digest.
 
 | Check                         | Assertions                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `00-host-setup.sh`            | `host-setup.sh` on a fresh host as shipped (no wrapper); `--check-version-only` parses Firecracker 1.17's extra `exit_code=0` line; directories and modes; sysctl (`ip_forward`, `rp_filter`); idempotent rerun.                                                                                                                                                                                                                                                     |
+| `00-host-setup.sh`            | `host-setup.sh` on a fresh host as shipped (no wrapper); `--check-version-only` parses Firecracker 1.17's extra `exit_code=0` line; directories and modes; only its own sysctl file is applied and every key in it verified (an unrelated 99- drop-in must stay unapplied); idempotent rerun. |
 | `10-agent-systemd.sh`         | The repository unit (byte-identical, **no drop-in**) starts the agent under real systemd; `KillMode=process`; preflight `accepting:true` in jailer mode; every blocking preflight check true; both images visible; `CAP_SETUID` is the only ambient capability and `CAP_SETGID` stays effective; the agent's `CapBnd`/`CapPrm`/`CapEff`/`CapAmb` match the documented `0x82c31eb`/`0x80` set and `NoNewPrivs=1`.                                                                                                                                                                                                         |
-| `20-jailer-instance.sh`       | The installed unit is byte-identical and has no drop-in; HTTP create in jailer mode; Firecracker uid 10000; executable inside the jail; `/proc/<pid>/root` == jail root (non-empty inode pairs, aborts if the process is dead); **the live Firecracker process (and any child) has `CapPrm`/`CapEff`/`CapAmb` == 0 and `NoNewPrivs=1`**; per-instance cgroup + `pids.max`; real tun/tap with `rctf-fc:rctf-fc` alias and /30; MMDS v2 flag byte-exact; flag absent from agent state, run dir, jail tree, Traefik dir, whole journal, cmdline, rootfs and base images, with searchable-tree/file counts and planted-canary positive controls for the tree, journal and binary scans; delete removes process/jail/cgroup/tap/nft rules; tombstone fencing. |
-| `30-restart-survival.sh`      | `systemctl restart` and `kill -9` leave the VM alive and re-adopted: agent-reported `.vm.pid` stays the original PID and `vm-identity.json` (`jailRoot`, `exePath`, exe dev:ino, uid) is compared against live `/proc/<pid>/{exe,root,status}` after each event; **the zero-capability/`NoNewPrivs` assertion is repeated after each re-adoption and the agent's documented capability set is re-checked**; `KillMode=process`; CAP_SYS_PTRACE drop-in experiment records the exact outcome (hard requirement: VM alive/unsignalled with same starttime and an errored auth-failure record) and recovery clean-up after restoring the cap. |
+| `20-jailer-instance.sh`       | The installed unit is byte-identical and has no drop-in; HTTP create in jailer mode; Firecracker uid 10000; executable inside the jail; `/proc/<pid>/root` == jail root (non-empty inode pairs, aborts if the process is dead); **the live Firecracker process (and any child) has `CapPrm`/`CapEff`/`CapAmb` == 0 and `NoNewPrivs=1`**; per-instance cgroup + `pids.max`; real tun/tap with `rctf-fc:rctf-fc` alias and /30; MMDS v2 flag byte-exact; flag absent from agent state, run dir, jail tree, Traefik dir, whole journal, cmdline, rootfs and base images, with searchable-tree/file counts and planted-canary positive controls for the tree, journal and binary scans; delete removes process/jail/cgroup/tap/nft rules with a positive tap/nft calibration before delete and fail-closed `ip`/`nft` probes after it; tombstone fencing. |
+| `30-restart-survival.sh`      | `systemctl restart` and `kill -9` leave the VM alive and re-adopted: agent-reported `.vm.pid` stays the original PID and `vm-identity.json` (`jailRoot`, `exePath`, exe dev:ino, uid) is compared against live `/proc/<pid>/{exe,root,status}` after each event; **the zero-capability/`NoNewPrivs` assertion is repeated after each re-adoption and the agent's documented capability set is re-checked**; `KillMode=process`; CAP_SYS_PTRACE drop-in experiment records the exact outcome (hard requirement: VM alive/unsignalled with same starttime and an errored auth-failure record) and recovery clean-up after restoring the cap; teardown tap/process probes are fail-closed with a live-tap calibration. |
 | `40-net-tests.sh`             | `FC_REAL=1 bun test test/net` as root (105 tests, 0 fail); the unprivileged namespace suite as `ubuntu` (real nft via a temp file, not Bun's stdin socketpair).                                                                                                                                                                                                                                                                                                      |
-| `50-conntrack-quarantine.sh`  | A real DNAT TCP flow (guest in the reply-source direction) and a masqueraded egress flow (guest in the original-source direction) are tracked; `conntrack -L` must exit 0 after delete; every entry for the guest address, both flowed tuples and the public port are flushed; the freed /30 index and public port are durably quarantined and not reused.                                                                                                                  |
-| `60-egress-dnat-isolation.sh` | `egress:true` masquerade to an outside netns service (plus a conntrack masquerade proof); `egress:false` blocked; public DNAT from the outside netns; team isolation measured inside the guests with a flush control; `nmap` from outside over ports 1-10000 plus the configured `tcpPortRange` sees only the published ports.                                                                                                                                              |
+| `50-conntrack-quarantine.sh`  | A real DNAT TCP flow (guest in the reply-source direction) and a masqueraded egress flow (guest in the original-source direction) are tracked; `conntrack -L` must exit 0 after delete; every entry for the guest address, both flowed tuples and the public port are flushed; the freed /30 index and public port are durably quarantined and not reused; tap/nft teardown probes are fail-closed and calibrated while the lease exists.                                                                                                                  |
+| `60-egress-dnat-isolation.sh` | `egress:true` masquerade to an outside netns service (plus a conntrack masquerade proof); `egress:false` blocked; public DNAT from the outside netns; team isolation measured inside the guests with a flush control; `nmap` from outside over ports 1-10000 plus the configured `tcpPortRange` sees only the published ports; Firecracker teardown enumeration is fail-closed and calibrated before delete.                                                                                                                                              |
 
 The guest used for the checks is `guest-start` in this directory: it keeps the
 flag on tmpfs (never on the ext4 rootfs) and exposes `/probe.txt` with the
@@ -92,7 +104,7 @@ An HTTP service on `192.0.2.2:9999` represents the internet. `nmap` runs in
 | Path           | Purpose                                                       |
 | -------------- | ------------------------------------------------------------- |
 | `vm.sh`        | create/start/ssh/status/stop/destroy/selftest the VM (idempotent, port-ownership checks, authenticated pidfiles, pidfd signalling, verified base image) |
-| `pidguard.py`  | authenticate a v2 pidfile and TERM/KILL it through a pidfd (shared with `../multihost/vm.sh`) |
+| `pidguard.py`  | authenticate a v3 pidfile (boot id, start ticks, exe, PID namespace, argv) and TERM/KILL it through a pidfd; exit codes preserve running / stale / identity-mismatch / observation-error (shared with `../multihost/vm.sh`) |
 | `provision.sh` | runs as root in the VM: packages, Bun, checkout, guest image  |
 | `run.sh`       | host driver: boot, copy, provision, run checks, stop, summary |
 | `guest-start`  | test-only guest service (flag on tmpfs + probe results)       |

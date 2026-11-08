@@ -42,8 +42,12 @@ and `lost` are terminal-until-delete. Agent states: `creating, starting, running
    `(teamId, challengeIntegrationId)` return it (idempotent / concurrent-safe via UNIQUE index on live rows);
    else pick a host (healthy, not draining, fits `capacity × overcommit − reserved`), insert the row
    with the reservation and a random instance id. → call agent `PUT /v1/instances/:id`.
-   Agent `no_capacity`/transport error ⇒ release the reservation and try the next host (bounded);
-   all failed ⇒ `no_capacity` error to the player. Flags only live in request memory.
+   Only a **definitive pre-create rejection** (`no_capacity`, `draining`, `invalid_request`, `unauthorized`)
+   releases the reservation and tries the next host (bounded); all such failures ⇒ `no_capacity` error to the
+   player. A **transport error, timeout, 5xx or any other ambiguous outcome** does **not** release the reservation
+   or fail over: the row stays `creating`, pinned to that host, holding the key and reservation until the
+   reconciler adopts the VM or fences it (see "Ambiguous creates and fencing" below). Flags only live in
+   request memory.
 2. Agent `create`: reserve against its own limits (second line of defence) → `NetworkManager.allocate` →
    `VmDriver.launch` → `NetworkManager.publish` → state `starting` → `VmDriver.waitReady` → `running`; failure ⇒
    `errored`, release everything, keep a tombstone record until the controller deletes/forgets it.

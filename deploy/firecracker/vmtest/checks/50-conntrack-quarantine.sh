@@ -100,6 +100,24 @@ for pair in "DNAT:$DNAT_LINE" "egress:$EGRESS_LINE"; do
   expect_eq "$n" 2 "$label flow entry carries both original and reply tuples"
 done
 
+# Positive calibration while the lease exists: the same teardown probes must
+# find the tap and the guest IP now. A probe error must fail, not pass.
+if link_exists "$TAP"; then
+  ok "positive calibration: tap $TAP is present before release"
+else
+  case "$LINK_STATE" in
+    absent) bad "positive calibration failed: tap $TAP is absent before release" ;;
+    *) bad "positive calibration failed: cannot observe tap $TAP (${LINK_ERROR:-probe error})" ;;
+  esac
+fi
+if nft_table_grep inet rctf_fc "$GUEST"; then
+  [ "$NFT_STATE" = match ] &&
+    ok "positive calibration: inet rctf_fc references the live guest before release" ||
+    bad "positive calibration failed: inet rctf_fc does not reference $GUEST before release (state=$NFT_STATE)"
+else
+  bad "positive calibration failed: cannot read inet rctf_fc (${NFT_ERROR:-probe error})"
+fi
+
 # --- release ---------------------------------------------------------------
 CODE=$(api_code DELETE "/v1/instances/$ID")
 echo "  delete: HTTP $CODE $(api_body | head -c 200)"
@@ -155,12 +173,22 @@ fi
 if kill -0 "$PID" 2>/dev/null; then bad "firecracker process survived delete"; else ok "firecracker process removed"; fi
 if [ -e "$JAILBASE/$ID" ]; then bad "jail dir still present"; else ok "jail dir removed"; fi
 if [ -e "/sys/fs/cgroup/firecracker/$ID" ]; then bad "cgroup still present"; else ok "cgroup removed"; fi
-if ip link show dev "$TAP" >/dev/null 2>&1; then bad "tap still present"; else ok "tap removed"; fi
-if nft list table inet rctf_fc 2>/dev/null | grep -qF "$GUEST"; then
-  bad "nftables still references the released guest"
-else
-  ok "nftables no longer references the released guest"
-fi
+link_exists "$TAP"
+case "$?" in
+  0) bad "tap still present" ;;
+  1) ok "tap removed" ;;
+  *) bad "could not observe tap $TAP after release (${LINK_ERROR:-probe error}); cannot claim it was removed" ;;
+esac
+nft_table_grep inet rctf_fc "$GUEST"
+case "$?" in
+  0)
+    case "$NFT_STATE" in
+      match) bad "nftables still references the released guest" ;;
+      absent | missing) ok "nftables no longer references the released guest" ;;
+    esac
+    ;;
+  *) bad "could not read inet rctf_fc after release (${NFT_ERROR:-probe error}); cannot claim the rules were removed" ;;
+esac
 
 # --- quarantine really prevents immediate reuse ---------------------------
 SPEC2=/tmp/vmtest-spec-$ID2.json

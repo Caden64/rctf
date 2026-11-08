@@ -1,4 +1,95 @@
-# vmtest results — 2026-11-08 (pidfd signalling + fail-closed observation rerun)
+# vmtest results — 2026-11-08 (three-outcome pidfiles, non-mutating observers, fail-closed teardown)
+
+Real execution as root inside a throwaway QEMU VM. **Nothing privileged was
+run on the developer machine.** The host only ran `qemu-system-x86_64` as the
+login user; every root operation happened inside the VM.
+
+- Host: Linux 7.2.14-arch1-1, AMD Ryzen 7 7840HS, nested KVM enabled,
+  `/dev/kvm` 0666. This run used `VM_DIR=~/.cache/rctf-vmtest`,
+  `VM_SSH_PORT=2422`, `VM_SEED_PORT=8201`; no other QEMU was running before or
+  after.
+- VM: Ubuntu 24.04.5 cloud image from the dated `noble/20261017/` directory
+  (cached image re-hashed against the pinned SHA256 before boot), systemd
+  `255.4-1ubuntu8.18`, nftables 1.0.9, conntrack-tools 1.4.8, nmap 7.94SVN.
+- Guest runtime: Firecracker/jailer v1.17.0, kernel 6.1.155, Bun 1.4.4.
+- Command: `deploy/firecracker/vmtest/run.sh` (the cleanly stopped overlay from
+  the previous run was reused). Exit code **0**.
+- Transcript: `~/.cache/rctf-vmtest/logs/run-20261108-151627.log`.
+- VM stopped at the end: `vm.sh status` → `stopped`, ports 2422/8201 free, and
+  no qemu/seed process from this run remains.
+
+## Summary (this run)
+
+All checks pass: **221 assertions, 0 failed**. The pidfile self-test adds
+**45 passing checks** before boot (was 23) and is not part of the 221 numbered
+check assertions (45 selftest + 221 check `PASS` lines = the 266 `PASS` lines
+in the transcript).
+
+| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                  |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `00-host-setup.sh` (a)              | 22 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies **only its own** sysctl file (an unrelated 99- drop-in stays unapplied) and all three intended keys, idempotent rerun.                                                      |
+| `10-agent-systemd.sh` (b)           | 35 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent; `AmbientCapabilities=CAP_SETUID` only; measured `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`; `CAP_SETGID` still effective; preflight `accepting:true`.                            |
+| `20-jailer-instance.sh` (c)         | 45 pass / 0 fail | **PASS** — real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown with live tap/nft calibrations and fail-closed post-delete probes, fencing; live Firecracker has zero caps and `NoNewPrivs=1`. |
+| `30-restart-survival.sh` (d)        | 57 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` unchanged, `vm-identity.json` matches live `/proc`; zero-capability/`NoNewPrivs` after each re-adoption; CAP_SYS_PTRACE safe-failure outcome asserted; cleanup tap/process probes calibrated and fail-closed. |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: 105 tests, 0 fail; the namespace suite also passes as `ubuntu`.                                                                                                                                                         |
+| `50-conntrack-quarantine.sh` (f)    | 26 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; tap/nft teardown probes calibrated while live and fail-closed after release; quarantine holds.                                                           |
+| `60-egress-dnat-isolation.sh` (g,h) | 24 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed; Firecracker enumeration calibrated before teardown and fail-closed after it.                                  |
+
+Total: **221 passed, 0 failed**; selftest **45 passed, 0 failed**.
+
+## What changed in this pass (2026-11-08, lifecycle/observation hardening)
+
+1. **Pidfile outcomes are no longer collapsed.** `pidguard.py` (now
+   `version=3`, which also records `/proc/<pid>/ns/pid`) returns `0`
+   authenticated/stopped, `1` definitely dead/stale (missing file, process
+   gone, post-reboot boot id), `4` identity mismatch (a live process exists but
+   is not the record) and `3` observation failure (pidfd, `/proc` or PID
+   namespace unreadable). `vm.sh` preserves all four: only `1` deletes a
+   pidfile; `4` keeps it (the live process may be the VM whose record was
+   replaced) and `3` keeps it and every resource it protects. `stop_recorded`
+   returns nonzero for `3`/`4`, `destroy` refuses to remove the
+   overlay/console/seed when shutdown is unconfirmed, and `run.sh` no longer
+   claims "stopped" on an unknown observation.
+2. **PID-namespace identity.** The authenticated record includes the PID
+   namespace (`pid:[…]`) and verification requires an exact match, so the same
+   numeric PID in another namespace is never signalled. The selftest covers a
+   deliberate namespace mismatch.
+3. **Observers are non-mutating; mutators are serialised.** `status`/`pid` use
+   `pidfile_observe`, which never deletes or rewrites. Every pidfile mutation
+   (`create`/`start`/`stop`/`destroy`) holds a lifecycle `flock`; the seed
+   server and QEMU are started with fd 9 closed. QEMU writes its bare numeric
+   pidfile to `qemu.pid.raw` and the authenticated record is atomically
+   renamed onto `qemu.pid`, so a concurrent observer cannot see a bare
+   intermediate. A selftest runs 60 concurrent observes while the record is
+   rewritten 60 times and requires the live record to survive.
+4. **Teardown probes fail closed.** The checks no longer treat a failed
+   `nft list table` or `ip link show` as absence. `lib.sh` provides
+   `nft_table_grep` (match / absent / missing-after-teardown / producer
+   failure), `link_exists` (present / absent / probe failure) and a fail-closed
+   `fc_procs` (pgrep exit 1 = no match, any other failure = probe error).
+   Checks 20/30/50/60 fail on a producer error, and each adds a positive
+   calibration while the tap/nft rules/process still exist.
+5. **`host-setup.sh` applies only its own sysctl file.** `sysctl --system` was
+   replaced by `sysctl -q -p /etc/sysctl.d/90-rctf-firecracker.conf`, followed
+   by a check of every key/value in that file. Check 00 creates a conflicting
+   `99-vmtest-unrelated.conf`, proves it is **not** applied, and verifies all
+   three intended settings before and after an idempotent rerun.
+
+## Honest notes
+
+- The first rerun of this pass reported every check PASS but exited 1: the
+  cleanup trap in `run.sh` reused the saved-exit-status variable for the
+  `vm.sh status` probe, so the trap's `exit "$rc"` returned the probe's code
+  (1 = stopped). That harness bug was fixed (`status_rc`/`vm_rc` are separate)
+  and the full run above is the clean rerun (exit 0).
+- No product bug was found or fixed in `apps/**/src`.
+- The residual honest limitation from the pidfd pass remains: the record is
+  sampled from `/proc` just after `qemu -daemonize`; a PID reused in that
+  microsecond window cannot authenticate later because the record also pins
+  this VM_DIR's `-pidfile` argument, the PID namespace, exe and argv.
+
+
+# Previous run — pidfd signalling + fail-closed observation rerun (2026-11-08 14:23; superseded)
 
 Real execution as root inside a throwaway QEMU VM. **Nothing privileged was run
 on the developer machine.** The host only ran `qemu-system-x86_64` as the login

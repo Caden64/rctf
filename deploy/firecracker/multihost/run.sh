@@ -33,6 +33,9 @@ LOG=$RUN/logs/run.log
 LOGS=$RUN/logs
 mkdir -p "$LOGS" "$VM_ROOT"
 export MH_VM_ROOT=$VM_ROOT
+# The private link directory is $RUN/link. $RUN is the trusted root linkguard
+# checks (owned by this uid, mode 0700, no group/other write).
+export MH_LINK_ROOT=$RUN
 
 say() { printf '%s\n' "$*" | tee -a "$LOG" >&2; }
 die() {
@@ -99,16 +102,19 @@ cleanup() {
     say "==> stopping VMs"
     "$HERE/vm.sh" --name host-a --ssh-port "$A_SSH" --link-local "$A_LINK" stop >>"$LOG" 2>&1 || true
     "$HERE/vm.sh" --name host-b --ssh-port "$B_SSH" --link-local "$B_LINK" stop >>"$LOG" 2>&1 || true
-    for n in host-a host-b; do
-      if "$HERE/vm.sh" --name "$n" status >>"$LOG" 2>&1; then
-        say "WARNING: $n is still running after stop"
-      fi
-    done
-    # Keep console logs for the record, then drop the overlays.
+    # Keep console logs for the record. Remove an overlay ONLY when the
+    # authenticated pidfile proves the VM stopped; a still-running or
+    # unobservable VM keeps its disk (and the run stays honest about it).
     for n in host-a host-b; do
       [ -f "$VM_ROOT/$n/console.log" ] && cp "$VM_ROOT/$n/console.log" "$LOGS/$n-console.log" || true
+      vm_rc=0
+      "$HERE/vm.sh" --name "$n" status >>"$LOG" 2>&1 || vm_rc=$?
+      case "$vm_rc" in
+        0) say "WARNING: $n is still running after stop; keeping $VM_ROOT/$n/overlay.qcow2" ;;
+        1) rm -f "$VM_ROOT/$n/overlay.qcow2" ;;
+        *) say "WARNING: $n's state could not be observed after stop; keeping $VM_ROOT/$n/overlay.qcow2" ;;
+      esac
     done
-    rm -f "$VM_ROOT"/*/overlay.qcow2
   fi
   say "run dir: $RUN"
   exit "$rc"
