@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { parse as parseYaml } from 'yaml'
 import * as z from 'zod/mini'
 
 /** Owner: track 5 (controller). Extend freely; keep the export names. */
@@ -48,5 +50,102 @@ export const controllerConfigSchema = z.object({
   /** After this, instances on an unhealthy host are written off (key freed, cleanup deferred to host return). */
   hostLostSeconds: z.optional(z.prefault(z.int(), 300)),
   reaperIntervalSeconds: z.optional(z.prefault(z.int(), 5)),
+  /** How often DB-vs-agent reconciliation runs. */
+  reconcileIntervalSeconds: z.optional(z.prefault(z.int(), 30)),
+  /** Agent-side records unknown to the DB are deleted after this grace (in-flight creates). */
+  orphanGraceSeconds: z.optional(z.prefault(z.int(), 30)),
+  /**
+   * Optional hard cap on an instance's total lifetime (seconds from creation).
+   * Extends are clamped to `createdAt + maxLifetimeSeconds`.
+   */
+  maxLifetimeSeconds: z.optional(z.int()),
 })
 export type ControllerConfig = z.output<typeof controllerConfigSchema>
+
+const formatIssues = (error: {
+  issues: readonly { path: readonly PropertyKey[]; message: string }[]
+}): string =>
+  error.issues
+    .map(issue =>
+      issue.path.length > 0
+        ? `${issue.path.join('.')}: ${issue.message}`
+        : issue.message
+    )
+    .join('; ')
+
+const hostTokenEnvKey = (hostId: string): string =>
+  `FIRECRACKER_HOST_TOKEN_${hostId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`
+
+/**
+ * Load controller config from a YAML/JSON file path (or an already-parsed
+ * object) and apply environment overrides:
+ *
+ * - `FIRECRACKER_CONTROLLER_AUTH_TOKEN`   -> authToken
+ * - `FIRECRACKER_CONTROLLER_ADMIN_TOKEN`  -> adminToken
+ * - `FIRECRACKER_TEAM_KEY_SECRET`         -> teamKeySecret
+ * - `FIRECRACKER_HOST_TOKEN_<HOST_ID>`    -> hosts[].token (uppercase, non
+ *   alphanumerics become `_`)
+ */
+export const loadControllerConfig = (
+  source: string | Record<string, unknown>,
+  env: Record<string, string | undefined> = process.env
+): ControllerConfig => {
+  let raw: unknown
+  if (typeof source === 'string') {
+    let text: string
+    try {
+      text = readFileSync(source, 'utf8')
+    } catch (error) {
+      throw new Error(
+        `cannot read controller config ${source}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+    try {
+      raw = parseYaml(text)
+    } catch (error) {
+      throw new Error(
+        `cannot parse controller config ${source}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+    }
+  } else {
+    raw = source
+  }
+
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('controller config must be a mapping/object')
+  }
+
+  const input = { ...(raw as Record<string, unknown>) }
+  if (env.FIRECRACKER_CONTROLLER_AUTH_TOKEN !== undefined) {
+    input.authToken = env.FIRECRACKER_CONTROLLER_AUTH_TOKEN
+  }
+  if (env.FIRECRACKER_CONTROLLER_ADMIN_TOKEN !== undefined) {
+    input.adminToken = env.FIRECRACKER_CONTROLLER_ADMIN_TOKEN
+  }
+  if (env.FIRECRACKER_TEAM_KEY_SECRET !== undefined) {
+    input.teamKeySecret = env.FIRECRACKER_TEAM_KEY_SECRET
+  }
+  if (Array.isArray(input.hosts)) {
+    input.hosts = input.hosts.map(entry => {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        return entry
+      }
+      const host = { ...(entry as Record<string, unknown>) }
+      if (typeof host.id === 'string') {
+        const override = env[hostTokenEnvKey(host.id)]
+        if (override !== undefined) host.token = override
+      }
+      return host
+    })
+  }
+
+  const parsed = controllerConfigSchema.safeParse(input)
+  if (!parsed.success) {
+    throw new Error(`invalid controller config: ${formatIssues(parsed.error)}`)
+  }
+  return parsed.data
+}
