@@ -98,3 +98,12 @@ than asserted.
 - No OpenSSH source build: the vulnerable image uses the pinned Alpine 10.3p1
   package, and the fixed image uses the pinned upstream 10.6p2 package on
   Alpine edge.
+
+## Re-run on the integrated branch (2026-11-08)
+
+After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
+retries, full schema validation before the service starts), the whole lab was
+re-run from a clean tree: image rebuilds with the hardened
+`guest/build-rootfs.sh`, fresh unique VM, **44 passed, 0 failed**, VM
+destroyed, exit 0. The lab images already install the pinned static jq, so
+the stricter init changes nothing about what the checks prove.
