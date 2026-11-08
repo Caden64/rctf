@@ -105,7 +105,13 @@ export class HttpAgentClient implements AgentClient {
     const material = config.tls ?? resolveHostTls(config)
     this.tls =
       material === undefined
-        ? undefined
+        ? this.baseUrl.startsWith('https://')
+          ? // No custom trust material, but verification is still forced:
+            // every https agent must reject an untrusted server even when
+            // the process environment sets NODE_TLS_REJECT_UNAUTHORIZED=0,
+            // or the bearer token could be sent to an impostor.
+            { rejectUnauthorized: true }
+          : undefined
         : // Verify the server certificate even if the process environment sets
           // NODE_TLS_REJECT_UNAUTHORIZED=0.
           { ...material, rejectUnauthorized: true }

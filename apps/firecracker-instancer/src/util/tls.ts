@@ -170,7 +170,12 @@ const assertCertificateValid = (
       `${label}: certificate ${source} has unreadable validity dates`
     )
   }
-  if (now < notBefore - expirySkewMs) {
+  // No skew on notBefore: a not-yet-valid certificate is rejected outright.
+  // A peer would refuse it during the handshake anyway, which would produce a
+  // listener that starts but cannot communicate. The skew margin applies to
+  // expiry only, where a certificate that just expired must not race a
+  // restart into accepting it.
+  if (now < notBefore) {
     throw new Error(
       `${label}: certificate ${source} is not valid yet (notBefore ${cert.validFrom})`
     )

@@ -38,6 +38,23 @@ export const createLogger = (
           '*.tls.cert',
           'tls.ca',
           '*.tls.ca',
+          // Controller configuration shapes: a whole HostConfig carries the
+          // loaded client key/cert/CA and the agent bearer token, and configs
+          // get logged as { config: ... } / { hosts: [...] } / nested
+          // wrappers. `*.token` only matches one level, so array shapes need
+          // their own paths.
+          'hosts[*].token',
+          'config.hosts[*].token',
+          '*.hosts[*].token',
+          'hosts[*].tls.key',
+          'hosts[*].tls.cert',
+          'hosts[*].tls.ca',
+          'config.hosts[*].tls.key',
+          'config.hosts[*].tls.cert',
+          'config.hosts[*].tls.ca',
+          '*.hosts[*].tls.key',
+          '*.hosts[*].tls.cert',
+          '*.hosts[*].tls.ca',
         ],
         censor: '<redacted>',
       },

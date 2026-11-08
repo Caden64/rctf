@@ -179,16 +179,17 @@ Both sides load TLS material through `src/util/tls.ts` at startup and fail close
 
 - files must be regular files owned by root or the current uid (read through one descriptor so stat and bytes describe
   the same inode);
-- private keys and leaf certificates must be mode 0600 (no group/other bits); a CA bundle may be world-readable but not
-  group/other-writable;
+- private keys and leaf certificates must have no group/other permission bits (0600 or stricter, e.g. 0400); a CA
+  bundle may be world-readable but not group/other-writable;
 - PEM must parse (`node:crypto` `X509Certificate` / `createPrivateKey`), the leaf must be currently valid (60 s expiry
   skew, not-yet-valid rejected), and the certificate public key must match the private key;
 - errors name the file and reason, never PEM/key bytes. Pino additionally redacts `tlsMaterial` and `tls.{key,cert,ca}`.
 
 Controller hosts accept `caCertificate` (inline PEM) XOR `caCertificateFile` (path), plus `clientCertFile` and
 `clientKeyFile` together for mTLS. TLS settings on an `http` URL are a startup error (they would be silently unused).
-`HttpAgentClient` passes `{ ca, cert, key, rejectUnauthorized: true }` to `fetch`; verification is explicit so a process
-environment with `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot disable it. Key material is never logged.
+`HttpAgentClient` passes `{ ca, cert, key, rejectUnauthorized: true }` to `fetch`; verification is explicit for EVERY
+https host — with or without custom trust material — so a process environment with `NODE_TLS_REJECT_UNAUTHORIZED=0`
+cannot disable it (regression-tested with the override set in a child process). Key material is never logged.
 
 Bun 1.4.4 option names were verified against the installed type definitions and a real handshake: `Bun.serve({ tls: {
 cert, key, ca, requestCert, rejectUnauthorized } })` and `fetch(url, { tls: { ca, cert, key, rejectUnauthorized } })`.

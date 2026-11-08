@@ -1,4 +1,5 @@
 import { chmodSync } from 'node:fs'
+import { X509Certificate } from 'node:crypto'
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
   DEFAULT_CERT_EXPIRY_SKEW_MS,
@@ -121,6 +122,26 @@ describe('loadTlsIdentity', () => {
       loadTlsIdentity(
         { certFile: paths.serverCert, keyFile: paths.serverKey },
         { label, now: Date.parse('2000-01-01T00:00:00Z') }
+      )
+    ).toThrow(/not valid yet/)
+  })
+
+  test('accepts a certificate exactly at notBefore and rejects one millisecond earlier', () => {
+    const paths = setup()
+    // There is no skew on notBefore (the margin applies to expiry only), so
+    // the boundary is exact.
+    const cert = new X509Certificate(fixture('server.crt'))
+    const notBefore = Date.parse(cert.validFrom)
+    expect(() =>
+      loadTlsIdentity(
+        { certFile: paths.serverCert, keyFile: paths.serverKey },
+        { label, now: notBefore }
+      )
+    ).not.toThrow()
+    expect(() =>
+      loadTlsIdentity(
+        { certFile: paths.serverCert, keyFile: paths.serverKey },
+        { label, now: notBefore - 1 }
       )
     ).toThrow(/not valid yet/)
   })

@@ -6,8 +6,9 @@ listen:
   port: 7001
 # Native TLS (optional). Without this block the agent serves plain HTTP, so keep
 # the listener on a private address and firewall it to the controller.
-# The agent runs as root: install the key and certificate root-owned and mode
-# 0600 (startup refuses group/world-accessible cert or key files).
+# The agent runs as root: install the key and certificate root-owned with no
+# group/other permission bits (0600 or stricter, e.g. 0400). A caFile bundle
+# may be world-readable (0644) but never group/other-writable.
 # tls:
 #   certFile: /etc/rctf-firecracker/tls/agent.crt
 #   keyFile: /etc/rctf-firecracker/tls/agent.key

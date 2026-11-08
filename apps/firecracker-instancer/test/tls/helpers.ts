@@ -55,11 +55,21 @@ export const installFixtures = (dir: string): FixturePaths => ({
   otherCaCert: writePem(dir, 'other-ca.crt', fixture('other-ca.crt'), 0o644),
 })
 
-export const opensslAvailable = (): boolean =>
-  Bun.spawnSync(['openssl', 'version'], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  }).exitCode === 0
+export const opensslAvailable = (binary = 'openssl'): boolean => {
+  try {
+    return (
+      Bun.spawnSync([binary, 'version'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }).exitCode === 0
+    )
+  } catch {
+    // Bun.spawnSync throws (ENOENT) when the executable is missing instead
+    // of returning a nonzero exit code; treat that as "not available" so the
+    // handshake suite reaches its loud warning-and-skip path.
+    return false
+  }
+}
 
 const run = (cwd: string, args: string[]): void => {
   const result = Bun.spawnSync(args, {

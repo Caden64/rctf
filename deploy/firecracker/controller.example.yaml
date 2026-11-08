@@ -15,8 +15,11 @@ hosts:
     url: http://10.0.0.11:7001 # use https:// when the agent has a tls block; plain HTTP must stay on a private network
     # TLS for an https agent. caCertificateFile and caCertificate (inline PEM)
     # are mutually exclusive; clientCertFile/clientKeyFile enable mTLS and must
-    # be set together. Files must be root/owner-owned and mode 0600 for the key
-    # and client certificate (startup fails otherwise).
+    # be set together. Verification is forced for every https URL even with no
+    # trust anchor configured (system trust is then used). Key and client
+    # certificate files must be root/owner-owned with no group/other bits
+    # (0600 or stricter); a CA bundle may be world-readable (0644) but never
+    # group/other-writable.
     # caCertificateFile: /etc/rctf-firecracker/tls/agent-ca.crt
     # caCertificate: |            # inline alternative to caCertificateFile
     #   -----BEGIN CERTIFICATE-----

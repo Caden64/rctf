@@ -170,4 +170,55 @@ describe.skipIf(!hasOpenssl)('real TLS and mTLS handshake', () => {
       .catch(error => error)
     expect(error).toBeInstanceOf(AgentUnreachableError)
   })
+
+  test('an https agent with no trust material still rejects an untrusted server when NODE_TLS_REJECT_UNAUTHORIZED=0', async () => {
+    // Regression for the review finding: a client with no CA configured must
+    // still force certificate verification, so the environment override
+    // cannot downgrade it and expose the bearer token. The fetches run in a
+    // child process so the override is set before any TLS state initializes.
+    // The agent's certificate is signed by the ephemeral test CA, which is
+    // not in any system trust store, so the server is untrusted for a
+    // no-material client.
+    const url = startAgent()
+    const run = async (scriptBody: string): Promise<string> => {
+      // Async spawn (not spawnSync): a synchronous spawn blocks this
+      // process's event loop, the agent server above could never accept the
+      // child's connection, and the two would deadlock.
+      const child = Bun.spawn(['bun', '-e', `try {
+  ${scriptBody}
+} catch (error) {
+  console.log('FETCH_FAIL', String(error))
+}`], {
+        env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        stdin: 'ignore',
+      })
+      const out = await new Response(child.stdout).text()
+      expect(await child.exited).toBe(0)
+      return out
+    }
+
+    // The danger this defends against: a plain fetch with no tls options
+    // honors NODE_TLS_REJECT_UNAUTHORIZED=0 and reaches the untrusted server.
+    const raw = await run(
+      `const response = await fetch('${url}/v1/info')
+   console.log('FETCH_OK', response.status)`
+    )
+    expect(raw).toContain('FETCH_OK')
+
+    // The defense: the explicit rejectUnauthorized option the client now
+    // passes for every https URL beats the same environment override.
+    const forced = await run(
+      `const response = await fetch('${url}/v1/info', { tls: { rejectUnauthorized: true } })
+   console.log('FETCH_OK', response.status)`
+    )
+    expect(forced).toContain('FETCH_FAIL')
+    expect(forced).not.toContain('FETCH_OK')
+
+    // And the same no-material client fails in-process too (default
+    // verification of an untrusted certificate).
+    const error = await clientFor(url).info().catch(error => error)
+    expect(error).toBeInstanceOf(AgentUnreachableError)
+  })
 })

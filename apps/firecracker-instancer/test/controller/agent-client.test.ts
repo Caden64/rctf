@@ -402,6 +402,15 @@ describe('HttpAgentClient TLS options', () => {
     expect(spy.seen()?.tls).toBeUndefined()
   })
 
+  test('forces verification for an https host with no TLS material', async () => {
+    // No CA configured: system trust is used, but verification must still be
+    // explicit so NODE_TLS_REJECT_UNAUTHORIZED=0 cannot disable it.
+    const spy = capture()
+    const client = new HttpAgentClient(baseConfig(), { fetch: spy.fetch })
+    await client.info()
+    expect(spy.seen()?.tls).toEqual({ rejectUnauthorized: true })
+  })
+
   test('fails closed when both CA forms are set on a direct config', () => {
     const dir = testDir()
     dirs.push(dir)
