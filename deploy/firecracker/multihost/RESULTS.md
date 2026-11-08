@@ -15,12 +15,117 @@ Dated log of what actually ran. All runs are on the reference development host:
   `hostProbeTimeoutSeconds=2`, `hostLostSeconds=300`,
   `maxClockSkewSeconds=10`, `reconcileIntervalSeconds=2`,
   `reaperIntervalSeconds=1`, `createFenceSeconds=10`.
-- Private L2: QEMU `-netdev socket,mcast=…` second NIC, `10.77.0.10` (host-a)
-  and `10.77.0.11` (host-b). Controller→agent HTTP uses distinct per-host
-  bearer tokens. This machine reaches the controller through one ssh forward
-  and observes the agents through the same ssh management channel.
+- Private link (current harness): QEMU `-netdev dgram` over two `AF_UNIX`
+  sockets in the run's mode-0700 `link/` directory, one bound by each VM
+  (`local.path`/`remote.path` mirrored); `10.77.0.10` (host-a) and
+  `10.77.0.11` (host-b). No multicast, no UDP/TCP port, no host bridge/tap,
+  so it cannot reach the LAN. Controller→agent HTTP over it uses distinct
+  per-host bearer tokens. This machine reaches the controller through one ssh
+  forward and observes the agents through the same ssh management channel.
+  Results below dated before this hardening pass describe the multicast link
+  that was in use then; they are kept as history.
 
-## Final run — 2026-11-08 13:26:05–13:33:10 (America/Denver)
+## Final run (link + pidfile hardening) — 2026-11-08 13:52:43–13:59:58 (America/Denver)
+
+Command:
+
+```sh
+./deploy/firecracker/multihost/run.sh
+```
+
+Dynamic identifiers for this run: run dir `/tmp/opencode/fcmh-cYdNuX`, ssh ports
+`40875` / `56637`, controller forward `42977`, private link
+`/tmp/opencode/fcmh-cYdNuX/link/{host-a,host-b}.sock` (QEMU unix-datagram, no
+multicast group or port). Exit code **0**. The 7m15s includes the two boots,
+provisioning, the 20-way race, the partition/host-loss restarts and both agent
+restarts.
+
+```
+==> pidfile authentication selftest (unprivileged decoy processes)
+pidfile selftest passed (19 checks)
+...
+PASS [link.24] the controller API binds loopback only (reached through the ssh forward)
+private-link checks: 24 passed, 0 failed
+private link works and is host-local only
+...
+RESULT: 137 passed, 0 failed, 137 assertions
+driver exit code: 0
+```
+
+Both QEMUs were stopped through their authenticated pidfiles by the EXIT trap;
+`pgrep -af '^qemu-system'` returned nothing afterwards, and the cleanup removed
+both link socket files (the `link/` directory remains mode 0700).
+
+### Per-check outcome
+
+| Group                                    | Result   | Assertions | Evidence highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------------- | -------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1 hosts register/heartbeat/accept + link | **PASS** | 10/10      | `/v1/hosts` healthy; `hosts.accepting=1` in controller SQLite; direct agent `/v1/info` `accepting:true`, `checks.recovered:true`; `lastSeenMs` advanced 3014/3015 ms; unauthenticated agent call `401`; KVM+jailer preflight true. New 1.8–1.10: recorded QEMU command lines contain exactly the two mirrored `dgram,local.type=unix` netdevs and no multicast/inet/host backend, `link/` is mode 0700 uid 1000 and both endpoints are unix sockets; both agents listen only on `10.77.0.10:7001` / `10.77.0.11:7001` on the MAC-pinned `ens4`; each VM's only route to the peer is `ens4` with the peer's private MAC; this machine has no `10.77.0.x` address or listener. |
+| 2 placement/pinning/jailer + memory skew | **PASS** | 22/22      | equal budgets: `a,b,a,b` (most-free-memory, host-id tie-break); with host-b's configured memory halved to 2048 MiB: `mem-1,mem-2` on host-a then `mem-3,mem-4` on host-b (`a,a,b,b`), proving the scheduler follows free memory rather than alternating. Extend/delete touched only the pinned agent; both guests ran under the real jailer (uid 10000, `/firecracker`, `/proc/<pid>/root == jail root`, 64769:531797 / 64769:532138); the deleted guest was definitively refused (probe `timeout/28`), not a probe error.                                                                                                                                                   |
+| 3 capacity + sampled 20-way race         | **PASS** | 8/8        | host-a filled to 2; 4th create on host-b; 5th ⇒ `no capacity: insufficient instance slots…`; 20 concurrent creates ⇒ 4 accepted, 16 `no_capacity`; `/v1/hosts` sampled every 50 ms during the race: `samples=4 maxReserved=2/2 over=0` (never above capacity at any sample), 4 Firecracker processes; capacity returned after deletes.                                                                                                                                                                                                                                                                                                                                       |
+| 4 drain/undrain                          | **PASS** | 8/8        | host-a draining, new create on host-b, existing guest kept serving, undrain restored placement.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 5 host loss                              | **PASS** | 15/15      | healthy removal `409`; QEMU `SIGKILL` ⇒ unhealthy after ~5.9 s; new create on host-a; the B instance reported `errored` with **exactly one row**, still pinned to host-b, no agent record for that id on host-a; removal `204` ⇒ `lost`, reservation 0, host draining; the key was freed and the team recreated on host-a; host-b's QEMU was restarted through the same authenticated pidfile/link arguments, re-adopted/wrote off, cleaned the tombstone, had no record/process/tap; exactly one live instance for the team; undrain restored service.                                                                                                                      |
+| 6 network partition + dead-man           | **PASS** | 16/16      | nftables drop ⇒ unhealthy after ~4.2 s; create during partition on host-a; host-b instance reported `errored` with **exactly one row** pinned to host-b and no host-a record; the short row stayed pinned to host-b (`deleting`); the agent state recorded the live pid and real `expiresAtMs`; the agent destroyed the guest itself at deadline+1525 ms (`expiresAtMs + 10 s` grace, 1 s sweep) with listing, state file, Firecracker process and pid all definitely absent; the long guest stayed alive; unblock ⇒ healthy in ~0.4 s, long guest still served, short row removed.                                                                                          |
+| 7 clock skew                             | **PASS** | 9/9        | +59.3 s and −60.6 s measured and flagged; host stayed healthy; creates refused with `no capacity: all hosts exceed the maximum clock skew` and no row/VM; corrected clock ⇒ −252 ms. host-a stayed **drained**, so the post-correction create had to land on host-b: 7.7 confirms `host=host-b`, 7.8 fetches the real guest flag from that instance, and only then 7.9 undrains host-a.                                                                                                                                                                                                                                                                                      |
+| 8 cross-host isolation                   | **PASS** | 12/12      | two instances of one team and two of another, two per host; every endpoint names its own host address/agent port; each guest served exactly its own flag; cross-host correct address/port worked (HTTP 200 both ways); the other host's port was **definitively refused** (`refused/7`); four distinct flags never crossed.                                                                                                                                                                                                                                                                                                                                                  |
+| 9 controller restart                     | **PASS** | 7/7        | SIGKILL restart while instances spanned both hosts; same ids, same pinned hosts, one VM each, both guests served; one live row per team; duplicate create returned the same id.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 10 token mismatch                        | **PASS** | 6/6        | wrong host-b token ⇒ unhealthy after ~4.0 s; `last_seen_ms` frozen (`advance=0`) while the wrong token was in use; direct agent still `accepting:true`; creates on host-a; 14 rejection lines in the controller log; restoring the token made host-b healthy.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 11 ambiguous create                      | **PASS** | 10/10      | in-guest fault proxy: a held create produced exactly one `creating` row pinned to host-b and a `starting` answer, the request was captured (no VM on either host), the reconciler fenced it after `createFenceSeconds` (row removed, key freed), the agent tombstone was durable, and replaying the captured PUT returned **409** with no VM; a response-swallowed create was adopted with the same id on host-b, served its flag, one row, no host-a duplicate.                                                                                                                                                                                                             |
+| 12 agent restart with a live VM          | **PASS** | 7/7        | `systemctl restart` re-adopted the **same Firecracker pid** (22242) and kept serving; `kill -9` of the agent was recovered by systemd and re-adopted the same pid; one controller row stayed pinned to host-a; a new create still spread to host-b.                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| L leftovers                              | **PASS** | 7/7        | 0 controller rows (the SQLite dump succeeded), 0 agent instances, 0 Firecracker processes, 0 taps, 0 state records, 0 per-lease nft rules on both hosts; cleanup had no swallowed errors; both agents answered `200`.                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+
+### Verbatim excerpts (final run)
+
+```
+==> pidfile authentication selftest (unprivileged decoy processes)
+pidfile selftest passed (19 checks)
+PASS [link.1] host-a private NIC is a host-local unix-datagram link (host-a.sock -> host-b.sock)
+PASS [link.3] host-a has exactly two netdevs (user-mode management + unix-dgram private) and no host-network or port-forward path to the private link
+PASS [link.19] link directory /tmp/opencode/fcmh-cYdNuX/link is mode 0700 and owned by uid 1000
+PASS [link.21] no interface on this machine carries 10.77.0.10 or 10.77.0.11 (the private L2 does not exist on the host)
+PASS [link.24] the controller API binds loopback only (reached through the ssh forward)
+private-link checks: 24 passed, 0 failed
+
+PASS [1.8] the private link is a host-local unix-datagram point-to-point link, not multicast (recorded QEMU command lines + socket objects) -- netdevs a=["user,id=n0,hostfwd=tcp:127.0.0.1:40875-:22","dgram,id=n1,local.type=unix,local.path=/tmp/opencode/fcmh-cYdNuX/link/host-a.sock,remote.type=unix,remote.path=/tmp/opencode/fcmh-cYdNuX/link/host-b.sock"] b=["user,id=n0,hostfwd=tcp:127.0.0.1:56637-:22","dgram,id=n1,local.type=unix,local.path=/tmp/opencode/fcmh-cYdNuX/link/host-b.sock,remote.type=unix,remote.path=/tmp/opencode/fcmh-cYdNuX/link/host-a.sock"] dirMode=700 owner=1000 unixSockets=true hostAddr=false
+PASS [1.9] each agent's private-NIC address is MAC-pinned and is the only address it listens on -- ifaceA=ens4 macA=true ifaceB=ens4 macB=true listenA=[...,"10.77.0.10:7001"] listenB=[...,"10.77.0.11:7001"]
+PASS [1.10] the agents private-link addresses are reachable only across that link (peer route + MAC, and absent from the developer machine) -- routeA=10.77.0.11 dev ens4 src 10.77.0.10 ... neighA=10.77.0.11 dev ens4 lladdr 52:54:00:77:0b:01 REACHABLE hostListener=false
+PASS [6.9] host-b destroys the expired guest on its own dead-man deadline (expiresAtMs + 10s grace; 1s agent sweep) while partitioned -- expiresAtMs=1794171362200 deadline=1794171372200 destroyed=1794171373725 delta=1525ms listing, state file, Firecracker process and pid are all absent
+PASS [7.7] with host-a still drained, placement works again only on host-b after the skew is fixed -- create={"kind":"instancerInstanceDetails","status":"starting",...} host=host-b
+PASS [7.8] the post-correction instance is pinned to host-b and its guest serves the team flag -- id=r02myowqwhmajdioce01m5x1 host=host-b
+PASS [7.9] host-a is undrained only after host-b proved it can take and serve a placement -- healthy
+PASS [11.9] the reconciler adopts the existing VM: same id, running, pinned to host-b, one row and no duplicate on host-a -- id=lkqvd39von589j7v4o40ynof host=host-b
+PASS [12.2] systemctl restart re-adopts the same VM (same Firecracker pid, same instance id) -- pidBefore=22242 pidAfter=22242 state=true
+```
+
+### What changed in this hardening pass
+
+1. **No multicast, no LAN exposure.** The private NIC is now
+   `-netdev dgram,local.type=unix,local.path=…,remote.type=unix,remote.path=…`
+   per VM, with the two mirrored paths inside a mode-0700 per-run directory.
+   There is no multicast group, UDP/TCP port, bridge or tap, so no other
+   machine (or local user) can observe or inject the bearer-token/flag HTTP
+   that crosses it. All multicast allocation and wording was removed.
+2. **Asserted, not assumed.** `run.sh` performs 24 explicit link checks before
+   the driver (recorded QEMU command lines, exactly two confined netdevs, mode
+   0700 sockets, MAC-pinned private NICs, agent listen addresses only on the
+   private IPs, peer routes/neighbour MACs, no host address/listener) and the
+   driver repeats the core invariants as assertions 1.8–1.10 (137 total).
+3. **Authenticated pidfiles for QEMU and the seed server.** Both pidfiles are
+   versioned records of the boot id, process start ticks, executable and
+   run-specific argv; identity is verified before `TERM` and again before
+   `KILL`, and a stale/mismatched file is removed with a warning without
+   signalling anything. `vm.sh selftest` runs before boot and passed 19/19
+   decoy checks (bare PID, wrong cmdline, stale boot id, PID reuse, another
+   run's link argument, positive control, stale seed pidfile).
+4. **Clock-skew assertion fixed.** host-a is no longer undrained before the
+   post-correction create: it stays drained until the instance is running on
+   host-b with the correct pinned host and a real `/flag.txt` response from
+   its guest (7.7–7.8), then host-a is undrained (7.9).
+5. **RESULTS corrected.** The old claim that vmtest check 20's inode
+   comparisons passed on empty strings is removed and replaced with the
+   current behaviour (see “Observations” below).
+
+## Previous run — 2026-11-08 13:26:05–13:33:10 (America/Denver)
 
 Command:
 
@@ -73,9 +178,9 @@ PASS [12.2] systemctl restart re-adopts the same VM (same Firecracker pid, same 
 PASS [12.4b] after kill -9 systemd restarts the agent and it re-adopts the same Firecracker pid -- pidBefore=21571 pidAfter=21571 state=true
 ```
 
-### What changed in this hardening pass
+### What changed in the previous hardening pass (132 assertions)
 
-The previous suite passed 108/108 but several assertions were weak. This pass
+The suite before it passed 108/108 but several assertions were weak. That pass
 strengthened them and added the missing scenarios:
 
 1. **Dead-man fail-closed**: the wait now requires the agent HTTP list
@@ -143,7 +248,7 @@ The first run of the hardened suite was 2026-11-08 13:18:16–13:25:29
   interval.
 
 Neither was a product bug; both were harness over-specification. The final run
-above is 132/132.
+of that pass was 132/132.
 
 ## Earlier run — 2026-11-08 12:48:13–12:52:57 (America/Denver)
 
@@ -237,11 +342,25 @@ confirms the result is reproducible, not a one-off ordering.
 
 ## Product bugs found
 
-**None in either pass.** The 108-assertion suite and the final 132-assertion
-run both passed. The only two failures in the intermediate hardened run were
-harness over-specifications (6.8 row state and 10.2 one pre-SIGTERM
-heartbeat), fixed in the driver; no product code was changed and no
-reproduction was needed, so `repros/` is empty.
+**None.** The 108-assertion, 132-assertion and 137-assertion runs all passed.
+The only two assertion failures in the intermediate 130/132 run were harness
+over-specifications (6.8 row state and 10.2 one pre-SIGTERM heartbeat), fixed
+in the driver; no product code was changed and no reproduction was needed, so
+`repros/` is empty.
+
+### Attempts before the final 137/137 run
+
+Two attempts in this pass stopped before exercising any scenario, for local
+reasons that are worth recording:
+
+- the first run reached the driver with the link checks already 24/24, then
+  failed with `Cannot find module '@rctf/firecracker-protocol'`: this fresh
+  worktree had no `node_modules` for the **host-side** driver (the VMs install
+  their own). Fixed by `bun install --frozen-lockfile` on the host; README now
+  lists this as a prerequisite.
+- one attempt was aborted because `run.sh` was edited by hand while bash was
+  still reading it, producing `syntax error near unexpected token ')'` at line 241. The EXIT trap still stopped both VMs. The final run used the finished
+  scripts unchanged.
 
 ## Harness defects found and fixed during development (not product bugs)
 
@@ -275,9 +394,10 @@ harness; all were fixed here, never by editing product code:
    It now reads them with `sudo` and derives `/srv/jailer/firecracker/<id>/root`.
 
 Intermediate run at 12:44 reached **106/108**; the two failures were exactly
-item 9 (uid 10000 was visible, but `exe`/`root` were empty). After the fix the
-108-assertion suite's final run above is 108/108. The hardened 132-assertion
-suite is the 2026-11-08 13:26 run at the top of this file.
+item 9 (uid 10000 was visible, but `exe`/`root` were empty). After the fix that
+suite's final run was 108/108. The 132-assertion pass is the 2026-11-08 13:26
+run above; the current 137-assertion pass is the 2026-11-08 13:52 run at the
+top of this file.
 
 ## Observations / limitations (honest)
 
@@ -286,13 +406,19 @@ suite is the 2026-11-08 13:26 run at the top of this file.
   asserts `/v1/hosts` health and `accepting:true` from the controller's
   `hosts.accepting` column (what the scheduler consumes) plus each agent's
   `/v1/info`. This is an observability gap, not incorrect behaviour.
-- `.vm.jailRoot` is not part of the persisted agent handle schema, so the
-  existing `vmtest/checks/20-jailer-instance.sh` line
-  `JAILROOT=$(... '.vm.jailRoot')` is empty; its two `stat -Lc '%d:%i'`
-  comparisons then compare empty strings and pass vacuously. This multi-host
-  harness derives the jail root path from the configured chroot base and
-  checks it with `sudo`, so the jail is really verified here. (The rest of
-  vmtest check 20’s jail assertions are unaffected.)
+- An earlier version of this file claimed that
+  `vmtest/checks/20-jailer-instance.sh` read an empty `.vm.jailRoot` and that
+  its `stat -Lc '%d:%i'` comparisons then "compare empty strings and pass
+  vacuously". That is **not** true of the current code. The state schema in
+  `apps/firecracker-instancer/src/agent/vm/driver.ts` persists `jailRoot`, so
+  check 20 gets a non-empty path; if it were missing, the check records
+  `bad "agent state has no vm.jailRoot for $ID"`. Both inode comparisons (exe
+  dev:ino vs `$JAILROOT/firecracker`, and `/proc/<pid>/root` dev:ino vs
+  `$JAILROOT`) are computed only when both sides are non-empty and otherwise
+  record `bad "could not stat ... identities"`; empty strings can never make
+  them pass. This multi-host harness nevertheless derives the jail root from
+  the configured chroot base and checks the same identities with `sudo`
+  itself, so `2.7-*` is an independent assertion.
 - The “public internet” is not tested: `egress:false`, no Traefik/TLS. Public
   DNAT is measured between the two VMs over their private L2.
 - Nested virtualization (KVM-on-KVM) is slower than bare metal and cannot
@@ -302,5 +428,6 @@ suite is the 2026-11-08 13:26 run at the top of this file.
   case and the one with duplicate-instance risk.
 - Clock skew is injected with `date -s` inside host-b (timesyncd/chrony
   disabled), not with a real broken NTP source.
-- Each run uses ephemeral ports, directories and a random multicast group;
-  the reference host may run other unprivileged workers without interference.
+- Each run uses ephemeral ports, unique directories and two unique unix-socket
+  paths for the private link; the reference host may run other unprivileged
+  workers without interference.
