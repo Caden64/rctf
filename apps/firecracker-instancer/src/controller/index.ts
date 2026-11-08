@@ -1,7 +1,5 @@
-import { readFileSync } from 'node:fs'
-import { parse as parseYaml } from 'yaml'
 import { createLogger } from '../log'
-import { controllerConfigSchema } from './config'
+import { loadControllerConfig } from './config'
 import { createControllerServer } from './server'
 import { createControllerService } from './service'
 
@@ -9,44 +7,6 @@ const logger = createLogger('firecracker-controller')
 
 const resolveConfigPath = (): string | undefined =>
   process.env.FIRECRACKER_CONTROLLER_CONFIG ?? process.argv[2]
-
-const loadConfig = (path: string) => {
-  let source: string
-  try {
-    source = readFileSync(path, 'utf8')
-  } catch {
-    throw new Error(`Could not read the controller config at ${path}`)
-  }
-
-  let raw: unknown
-  try {
-    raw = parseYaml(source)
-  } catch {
-    throw new Error(`Could not parse the controller config at ${path} as YAML`)
-  }
-
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error(`The controller config at ${path} must be a YAML mapping`)
-  }
-
-  // TODO(firecracker): switch to `loadControllerConfig` from `./config` once
-  // track 5 lands it. Until then parse here and apply the documented env
-  // overrides.
-  const merged = {
-    ...(raw as Record<string, unknown>),
-    ...(process.env.FIRECRACKER_CONTROLLER_AUTH_TOKEN === undefined
-      ? {}
-      : { authToken: process.env.FIRECRACKER_CONTROLLER_AUTH_TOKEN }),
-    ...(process.env.FIRECRACKER_CONTROLLER_ADMIN_TOKEN === undefined
-      ? {}
-      : { adminToken: process.env.FIRECRACKER_CONTROLLER_ADMIN_TOKEN }),
-    ...(process.env.FIRECRACKER_TEAM_KEY_SECRET === undefined
-      ? {}
-      : { teamKeySecret: process.env.FIRECRACKER_TEAM_KEY_SECRET }),
-  }
-
-  return controllerConfigSchema.parse(merged)
-}
 
 const main = async (): Promise<void> => {
   const configPath = resolveConfigPath()
@@ -56,7 +16,7 @@ const main = async (): Promise<void> => {
     )
   }
 
-  const config = loadConfig(configPath)
+  const config = loadControllerConfig(configPath)
   const listen = config.listen ?? { host: '127.0.0.1', port: 7000 }
   const service = createControllerService(config, { logger })
   const server = createControllerServer({
