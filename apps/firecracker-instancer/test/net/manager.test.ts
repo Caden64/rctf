@@ -1,9 +1,17 @@
 import { describe, expect, test } from 'bun:test'
-import { readdir, readFile, writeFile } from 'node:fs/promises'
+import {
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Clock, NetLease } from '../../src/interfaces'
 import { NetworkCapacityError } from '../../src/interfaces'
 import { createNetworkManager } from '../../src/agent/net'
+import { tapAlias } from '../../src/agent/net/tap'
 import {
   publicHostname,
   traefikFileName,
@@ -127,6 +135,18 @@ describe('allocate', () => {
     second.publicPorts[0] = 1
     second.publicHostnames[1] = 'evil.example.com'
     expect(await manager.allocate(req)).toEqual(snapshot)
+  })
+
+  test('every created tap carries the durable alias and tap link type', async () => {
+    const { host, manager } = await setup()
+    const lease = await manager.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    })
+    const link = host.links.get(lease.tapName)
+    expect(link?.kind).toBe('tap')
+    expect(link?.alias).toBe(tapAlias('rctf-fc'))
   })
 
   test('released /30s and ports go through the reuse quarantine, then are reused oldest-first', async () => {
@@ -316,8 +336,8 @@ describe('fault injection during allocate', () => {
       expose: [tcpExpose(80)],
     })
     const callsPerAllocate = baselineHost.calls.length
-    // conntrack probe, tuntap add, addr add, link up, nft
-    expect(callsPerAllocate).toBe(5)
+    // conntrack probe, tuntap add, alias, addr add, link up, nft
+    expect(callsPerAllocate).toBe(6)
 
     for (let failingCall = 1; failingCall <= callsPerAllocate; failingCall++) {
       const { manager, host, config } = await setup()
@@ -417,7 +437,7 @@ describe('publish / unpublish / release', () => {
     ).toBe(1)
   })
 
-  test('unpublish keeps every security rule on the live tap, drops ingress and flushes conntrack', async () => {
+  test('unpublish fences first, drops ingress, flushes conntrack, then re-asserts security rules', async () => {
     const { config, host, manager } = await setup()
     const expose = [
       tcpExpose(8080),
@@ -430,7 +450,32 @@ describe('publish / unpublish / release', () => {
     })
     await manager.publish(lease, expose)
     const publicPort = lease.publicPorts[0] as number
+    const writesBefore = host.nftWrites
+    const callsBefore = host.calls.length
     await manager.unpublish(lease.instanceId)
+    const unpublishCalls = host.calls.slice(callsBefore)
+    const nftWrites = unpublishCalls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => call.argv.join(' ') === 'nft -f -')
+    expect(nftWrites.length).toBe(2)
+    const fenceWrite = nftWrites[0]?.call.stdin ?? ''
+    // The first render must be a pure fence: no DNAT/accept for this lease.
+    expect(fenceWrite).not.toContain('dnat')
+    expect(fenceWrite).not.toContain(
+      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
+    expect(fenceWrite).toContain(`iifname "${lease.tapName}" drop`)
+    expect(fenceWrite).toContain(`ip saddr ${lease.guestIp} drop`)
+    // Traefik removal + conntrack flush happen while the fence is installed.
+    const fenceIndex = nftWrites[0]?.index ?? -1
+    const finalIndex = nftWrites[1]?.index ?? -1
+    const flushIndex = unpublishCalls.findIndex(call =>
+      call.argv.join(' ').startsWith('conntrack -D')
+    )
+    expect(fenceIndex).toBeGreaterThanOrEqual(0)
+    expect(flushIndex).toBeGreaterThan(fenceIndex)
+    expect(finalIndex).toBeGreaterThan(flushIndex)
+    expect(await listDir(config.traefikDynamicDir)).toEqual([])
 
     expect(host.links.has(lease.tapName)).toBe(true)
     expect(host.nftText).not.toContain('dnat')
@@ -447,14 +492,15 @@ describe('publish / unpublish / release', () => {
     expect(host.nftText).toContain(
       `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
     )
-    expect(await listDir(config.traefikDynamicDir)).toEqual([])
+    expect(host.nftWrites).toBeGreaterThan(writesBefore)
 
     const commands = commandsOf(host)
     expect(commands).toContain(`conntrack -D --orig-src ${lease.guestIp}`)
     expect(commands).toContain(`conntrack -D --orig-dst ${lease.guestIp}`)
     expect(commands).toContain(`conntrack -D --reply-src ${lease.guestIp}`)
     expect(commands).toContain(`conntrack -D --reply-dst ${lease.guestIp}`)
-    expect(commands).toContain(
+    // Never a port-only delete (other tenants' flows share that port).
+    expect(commands).not.toContain(
       `conntrack -D --orig-port-dst ${publicPort} -p tcp`
     )
 
@@ -474,7 +520,7 @@ describe('publish / unpublish / release', () => {
     expect(await listDir(config.traefikDynamicDir)).toEqual([])
   })
 
-  test('release removes everything, flushes conntrack, is idempotent and tolerates a missing tap', async () => {
+  test('release fences, tears down, persists quarantine, is idempotent and tolerates a missing tap', async () => {
     const { clock, advance } = mutableClock()
     const { config, host, manager } = await setup({}, { clock })
     const expose = [
@@ -492,10 +538,27 @@ describe('publish / unpublish / release', () => {
     await manager.release(lease.instanceId)
 
     expect(host.links.size).toBe(0)
-    expect(host.nftText).not.toContain(lease.guestIp)
+    // The applied ruleset keeps the retiring lease fenced (explicit drops),
+    // but no public ingress and no accept for it survive.
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).toContain(`ip saddr ${lease.guestIp} drop`)
+    expect(host.nftText).not.toContain(
+      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
+    expect(host.nftText).not.toContain('dnat')
     expect(await listDir(config.traefikDynamicDir)).toEqual([])
-    expect(commandsOf(host)).toContain(
-      `conntrack -D --orig-port-dst ${lease.publicPorts[0]} -p tcp`
+    const commands = commandsOf(host)
+    for (const direction of [
+      '--orig-src',
+      '--orig-dst',
+      '--reply-src',
+      '--reply-dst',
+    ]) {
+      expect(commands).toContain(`conntrack -D ${direction} ${lease.guestIp}`)
+    }
+    // Regression: a port-only delete hits other tenants' connections.
+    expect(commands.some(command => command.includes('--orig-port-dst'))).toBe(
+      false
     )
 
     const calls = host.calls.length
@@ -511,6 +574,42 @@ describe('publish / unpublish / release', () => {
     })
     expect(replacement.guestIp).toBe(lease.guestIp)
     expect(replacement.publicPorts[0]).toBe(lease.publicPorts[0])
+  })
+
+  test('release deletes only this lease conntrack entries, never every flow to the public port', async () => {
+    const { host, manager } = await setup()
+    const lease = await manager.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [tcpExpose(8080)],
+    })
+    const port = lease.publicPorts[0] as number
+    // Our published DNAT flow: reply-src is the guest address.
+    host.seedFlow({
+      origSrc: '203.0.113.5',
+      origDst: '198.51.100.10',
+      origPortDst: port,
+      replySrc: lease.guestIp,
+      replyDst: '203.0.113.5',
+    })
+    // Another tenant's egress to the same port, and a host-local connection.
+    host.seedFlow({
+      origSrc: '203.0.113.9',
+      origDst: '198.51.100.10',
+      origPortDst: port,
+      replySrc: '198.51.100.8',
+      replyDst: '203.0.113.9',
+    })
+    host.seedFlow({
+      origSrc: '127.0.0.1',
+      origDst: '127.0.0.1',
+      origPortDst: port,
+      replySrc: '127.0.0.1',
+      replyDst: '127.0.0.1',
+    })
+    await manager.release(lease.instanceId)
+    expect(host.flows).toHaveLength(2)
+    expect(host.flows.map(flow => flow.replySrc)).not.toContain(lease.guestIp)
   })
 
   test('a failed tap deletion keeps the lease reserved so release can be retried', async () => {
@@ -535,6 +634,162 @@ describe('publish / unpublish / release', () => {
     await manager.release(lease.instanceId) // idempotent
   })
 
+  test('release fences before route/tap/conntrack teardown', async () => {
+    const { config, host, manager } = await setup()
+    const expose = [
+      tcpExpose(8080),
+      { kind: 'http' as const, hostPrefix: 'web', port: 3000 },
+    ]
+    const req = { instanceId: instanceId(1), egress: false, expose }
+    const lease = await manager.allocate(req)
+    await manager.publish(lease, expose)
+
+    const start = host.calls.length
+    // Fail at the first flush so we can inspect the exact steady state then.
+    host.failMatch = argv => argv[0] === 'conntrack' && argv[1] === '-D'
+    await expect(manager.release(lease.instanceId)).rejects.toThrow(
+      'could not flush conntrack'
+    )
+    const calls = host.calls.slice(start)
+    const find = (predicate: (argv: string[]) => boolean): number =>
+      calls.findIndex(call => predicate(call.argv))
+    const fenceIndex = find(
+      argv => argv[0] === 'nft' && argv[1] === '-f' && argv[2] === '-'
+    )
+    const deleteIndex = find(
+      argv => argv[0] === 'ip' && argv[1] === 'link' && argv[2] === 'del'
+    )
+    const flushIndex = find(argv => argv[0] === 'conntrack' && argv[1] === '-D')
+    expect(fenceIndex).toBeGreaterThanOrEqual(0)
+    expect(fenceIndex).toBeLessThan(deleteIndex)
+    expect(deleteIndex).toBeLessThan(flushIndex)
+
+    const fence = calls[fenceIndex]?.stdin ?? ''
+    expect(fence).not.toContain('dnat')
+    expect(fence).not.toContain(
+      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
+    expect(fence).toContain(`iifname "${lease.tapName}" drop`)
+    expect(fence).toContain(`ip saddr ${lease.guestIp} drop`)
+
+    // By the time conntrack runs, routes are gone and the tap is deleted.
+    expect(await listDir(config.traefikDynamicDir)).toEqual([])
+    expect(host.links.has(lease.tapName)).toBe(false)
+    // ...but the lease is still reserved and fenced.
+    expect((await manager.allocate(req)).guestIp).toBe(lease.guestIp)
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+  })
+
+  test('a fence or tap-delete failure leaves the lease reserved and fenced; retry completes', async () => {
+    for (const step of ['fence', 'tap'] as const) {
+      const { config, host, manager } = await setup()
+      const req = {
+        instanceId: instanceId(1),
+        egress: false,
+        expose: [tcpExpose(8080)],
+      }
+      const lease = await manager.allocate(req)
+      await manager.publish(lease, [tcpExpose(8080)])
+      if (step === 'fence') {
+        host.failMatch = argv => argv[0] === 'nft' && argv[1] === '-f'
+      } else {
+        host.failDeleteTap = lease.tapName
+      }
+      await expect(manager.release(lease.instanceId)).rejects.toThrow()
+      // Still reserved (idempotent allocate returns the same lease).
+      expect((await manager.allocate(req)).guestIp).toBe(lease.guestIp)
+      // A fence failure aborts before teardown; a tap-delete failure happens
+      // after the fence. Either way the tap is still present.
+      expect(host.links.has(lease.tapName)).toBe(true)
+      if (step === 'tap') {
+        // Routes are removed between the fence and the tap deletion.
+        expect(await listDir(config.traefikDynamicDir)).toEqual([])
+        // The fence was installed before the failing tap deletion.
+        expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+        expect(host.nftText).not.toContain('dnat')
+        expect(
+          commandsOf(host).some(command => command.startsWith('conntrack -D'))
+        ).toBe(false)
+      }
+      host.failMatch = undefined
+      host.failDeleteTap = undefined
+      await manager.release(lease.instanceId)
+      expect(host.links.has(lease.tapName)).toBe(false)
+      expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    }
+  })
+
+  test('a route-removal failure leaves the lease reserved and fenced; retry completes', async () => {
+    const { config, host, manager } = await setup()
+    const expose = [{ kind: 'http' as const, hostPrefix: 'web', port: 3000 }]
+    const req = { instanceId: instanceId(1), egress: false, expose }
+    const lease = await manager.allocate(req)
+    await manager.publish(lease, expose)
+
+    const parked = `${config.traefikDynamicDir}.parked`
+    await rename(config.traefikDynamicDir, parked)
+    await writeFile(config.traefikDynamicDir, 'not a directory')
+    await expect(manager.release(lease.instanceId)).rejects.toThrow()
+    // Fence applied, but tap/routes/conntrack not torn down yet.
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).not.toContain('dnat')
+    expect(host.links.has(lease.tapName)).toBe(true)
+    expect((await manager.allocate(req)).guestIp).toBe(lease.guestIp)
+
+    await rm(config.traefikDynamicDir)
+    await rename(parked, config.traefikDynamicDir)
+    await manager.release(lease.instanceId)
+    expect(host.links.has(lease.tapName)).toBe(false)
+    expect(await listDir(config.traefikDynamicDir)).toEqual([])
+  })
+
+  test('restore while a lease is half-released keeps it fenced and does not resurrect it', async () => {
+    const { host, manager } = await setup()
+    const req = {
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [tcpExpose(8080)],
+    }
+    const lease = await manager.allocate(req)
+    await manager.publish(lease, [tcpExpose(8080)])
+    // Fence -> routes gone -> tap deleted -> flush fails.
+    host.conntrackFlushError = 'Operation not permitted'
+    await expect(manager.release(lease.instanceId)).rejects.toThrow(
+      'could not flush conntrack'
+    )
+    host.conntrackFlushError = undefined
+    expect(host.links.has(lease.tapName)).toBe(false)
+
+    await manager.restore([lease])
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).toContain(`ip saddr ${lease.guestIp} drop`)
+    expect(host.nftText).not.toContain('dnat')
+    expect(host.nftText).not.toContain(
+      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
+    // Restore must not re-create the tap of a lease that is being released.
+    expect(host.links.has(lease.tapName)).toBe(false)
+    expect((await manager.allocate(req)).guestIp).toBe(lease.guestIp)
+
+    await manager.release(lease.instanceId)
+    expect(host.links.has(lease.tapName)).toBe(false)
+  })
+
+  test('release never deletes a foreign interface that took over the lease name', async () => {
+    const { host, manager } = await setup()
+    const req = {
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    }
+    const lease = await manager.allocate(req)
+    host.links.delete(lease.tapName)
+    host.seedTap(lease.tapName, [], true, { kind: 'dummy' })
+    await manager.release(lease.instanceId)
+    expect(host.links.has(lease.tapName)).toBe(true)
+    expect(commandsOf(host)).not.toContain(`ip link del dev ${lease.tapName}`)
+  })
+
   test('a conntrack flush failure keeps the lease reserved', async () => {
     const { host, manager } = await setup()
     const req = {
@@ -551,7 +806,10 @@ describe('publish / unpublish / release', () => {
 
     host.conntrackFlushError = undefined
     await manager.release(lease.instanceId)
-    expect(host.nftText).not.toContain(lease.guestIp)
+    expect(host.nftText).toContain(`iifname "${lease.tapName}" drop`)
+    expect(host.nftText).not.toContain(
+      `iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
+    )
   })
 
   test('"no conntrack entries" is a successful flush', async () => {
@@ -639,8 +897,8 @@ describe('restore', () => {
     const leases = [tcpLease, httpLease]
     const orphanId = instanceId(77)
     const hostB = new FakeHost()
-    // A down, unaddressed tap with our naming is an interrupted create: ours.
-    hostB.seedTap('fctap99', [], false)
+    // A down, unaddressed tap carrying OUR alias is an interrupted create.
+    hostB.seedTapAsAgent('fctap99', [], false)
     await writeFile(
       join(config.traefikDynamicDir, traefikFileName(orphanId)),
       'http: {}\n'
@@ -688,7 +946,7 @@ describe('restore', () => {
     })
 
     const host = new FakeHost()
-    host.seedTap(lease.tapName, [], false) // exists, no address, down
+    host.seedTapAsAgent(lease.tapName, [], false) // exists, no address, down
     const manager = createNetworkManager(config, { runner: host })
     await manager.restore([lease])
 
@@ -775,9 +1033,95 @@ describe('restore', () => {
     expect(commandsOf(host)).not.toContain('ip link del dev fctap9')
   })
 
+  test('leaves a dummy fctap9 alone even when it spoofs our alias (wrong link type)', async () => {
+    const { host, manager } = await setup()
+    host.seedTap('fctap9', [], false, {
+      kind: 'dummy',
+      alias: tapAlias('rctf-fc'),
+    })
+    const result = (await manager.restore([])) as {
+      removedOrphans: string[]
+      keptOrphans: string[]
+      skippedLeases: string[]
+    }
+    expect(result.keptOrphans).toEqual(['tap:fctap9'])
+    expect(host.links.has('fctap9')).toBe(true)
+    expect(commandsOf(host)).not.toContain('ip link del dev fctap9')
+  })
+
+  test('fails a restored live lease whose interface lacks our marker, without touching it', async () => {
+    const config = await makeTempConfig()
+    const managerA = createNetworkManager(config, { runner: new FakeHost() })
+    const lease = await managerA.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    })
+    const host = new FakeHost()
+    host.seedTap(lease.tapName, ['192.168.5.1/24'], true, { kind: 'dummy' })
+    const manager = createNetworkManager(config, { runner: host })
+    await expect(manager.restore([lease])).rejects.toThrow(/does not belong/)
+    expect(host.links.get(lease.tapName)?.kind).toBe('dummy')
+    expect(host.links.get(lease.tapName)?.alias).toBeUndefined()
+    expect(commandsOf(host)).not.toContain(
+      `ip addr add ${lease.hostIp}/30 dev ${lease.tapName}`
+    )
+    expect(commandsOf(host)).not.toContain(`ip link del dev ${lease.tapName}`)
+  })
+
+  test('restore with a flipped egress flag fences and flushes before re-rendering', async () => {
+    const config = await makeTempConfig()
+    const host = new FakeHost()
+    const clock = (): number => 1_000_000
+    const managerA = createNetworkManager(config, { runner: host, clock })
+    const lease = await managerA.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [],
+    })
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" ct state new drop`
+    )
+
+    const start = host.calls.length
+    const managerB = createNetworkManager(config, { runner: host, clock })
+    await managerB.restore([{ ...lease, egress: true }])
+    const calls = host.calls.slice(start)
+    const writes = calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => call.argv.join(' ') === 'nft -f -')
+    expect(writes.length).toBeGreaterThanOrEqual(2)
+    const fence = writes[0]?.call.stdin ?? ''
+    expect(fence).toContain(`iifname "${lease.tapName}" drop`)
+    expect(fence).not.toContain('ct state established,related accept')
+    expect(fence).not.toContain(`ip saddr ${lease.guestIp} ct state new drop`)
+    const flushIndex = calls.findIndex(
+      call => call.argv[0] === 'conntrack' && call.argv[1] === '-D'
+    )
+    expect(flushIndex).toBeGreaterThan(writes[0]?.index ?? -1)
+    expect(flushIndex).toBeLessThan(writes[1]?.index ?? Number.MAX_SAFE_INTEGER)
+
+    // The final ruleset is rendered with the restored lease's egress flag.
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} accept`
+    )
+    expect(host.nftText).toContain(
+      `iifname "${lease.tapName}" oifname "eth0" ip saddr ${lease.guestIp} masquerade`
+    )
+    expect(
+      (
+        await managerB.allocate({
+          instanceId: lease.instanceId,
+          egress: true,
+          expose: [],
+        })
+      ).egress
+    ).toBe(true)
+  })
+
   test('removes an abandoned in-pool tap and quarantines its index', async () => {
     const { host, manager } = await setup()
-    host.seedTap('fctap0', [], false)
+    host.seedTapAsAgent('fctap0', [], false)
     const result = await manager.restore([])
     expect(result.removedOrphans).toContain('tap:fctap0')
 
@@ -848,5 +1192,123 @@ describe('preflight', () => {
     })
     const missingChecks = await missing.manager.preflight()
     expect(missingChecks.traefikDirWritable).toBe(false)
+  })
+})
+
+describe('quarantine persistence', () => {
+  test('released /30s and ports stay quarantined across a restart and restore([])', async () => {
+    const { clock, advance } = mutableClock()
+    const config = await makeTempConfig()
+    const hostA = new FakeHost()
+    const managerA = createNetworkManager(config, {
+      runner: hostA,
+      clock,
+    })
+    const first = await managerA.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    await managerA.release(first.instanceId)
+
+    // New process over the same quarantine file, then restore([]) (which must
+    // not reset deadlines to "now" or drop them).
+    const hostB = new FakeHost()
+    const managerB = createNetworkManager(config, {
+      runner: hostB,
+      clock,
+    })
+    await managerB.restore([])
+    const second = await managerB.allocate({
+      instanceId: instanceId(2),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    expect(second.guestIp).not.toBe(first.guestIp)
+    expect(second.publicPorts[0]).not.toBe(first.publicPorts[0])
+
+    advance(121_000)
+    const third = await managerB.allocate({
+      instanceId: instanceId(3),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    expect(third.guestIp).toBe(first.guestIp)
+    expect(third.publicPorts[0]).toBe(first.publicPorts[0])
+  })
+
+  test('same-process restore preserves in-memory quarantine deadlines', async () => {
+    const { clock, advance } = mutableClock()
+    const { host, manager } = await setup({}, { clock })
+    const first = await manager.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    await manager.release(first.instanceId)
+    await manager.restore([])
+
+    const second = await manager.allocate({
+      instanceId: instanceId(2),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    expect(second.guestIp).not.toBe(first.guestIp)
+    advance(121_000)
+    const third = await manager.allocate({
+      instanceId: instanceId(3),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    expect(third.guestIp).toBe(first.guestIp)
+    expect(host.links.has(first.tapName)).toBe(true)
+  })
+
+  test('a corrupt quarantine file fails closed for one quarantine period', async () => {
+    const { clock, advance } = mutableClock()
+    const config = await makeTempConfig({ subnetPool: '10.9.0.0/24' })
+    await writeFile(config.quarantineFile, '{not json', { mode: 0o600 })
+    const host = new FakeHost()
+    const manager = createNetworkManager(config, { runner: host, clock })
+    await manager.restore([])
+    await expect(
+      manager.allocate({
+        instanceId: instanceId(1),
+        egress: false,
+        expose: [tcpExpose(80)],
+      })
+    ).rejects.toBeInstanceOf(NetworkCapacityError)
+
+    advance(121_000)
+    const lease = await manager.allocate({
+      instanceId: instanceId(2),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    expect(lease.guestIp).toBe('10.9.0.2')
+    expect(lease.publicPorts[0]).toBe(20000)
+  })
+
+  test('writes only resource ids + expiry to a 0600 file', async () => {
+    const { config, manager } = await setup()
+    const lease = await manager.allocate({
+      instanceId: instanceId(1),
+      egress: false,
+      expose: [tcpExpose(80)],
+    })
+    await manager.release(lease.instanceId)
+    const info = await stat(config.quarantineFile)
+    expect(info.mode & 0o777).toBe(0o600)
+    const text = await readFile(config.quarantineFile, 'utf8')
+    const document = JSON.parse(text) as Record<string, unknown>
+    expect(Object.keys(document).sort()).toEqual([
+      'indexes',
+      'ports',
+      'version',
+    ])
+    expect(text).not.toContain(lease.guestIp)
+    expect(text).not.toContain(lease.instanceId)
+    expect(text).not.toContain(lease.guestMac)
+    expect(text).not.toContain(lease.tapName)
   })
 })

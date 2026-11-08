@@ -7,6 +7,12 @@ const DEFAULT_TIMEOUT_MS = 15_000
 export const TAP_PREFIX = 'fctap'
 export const TAP_LINK_REGEX = /^fctap/
 
+/** Interface alias prefix; the full alias is `rctf-fc:<ownerMarker>`. */
+export const TAP_ALIAS_PREFIX = 'rctf-fc'
+
+export const tapAlias = (ownerMarker: string): string =>
+  `${TAP_ALIAS_PREFIX}:${ownerMarker}`
+
 /** `Cannot find device "x"` / ENODEV after a link disappeared underneath us. */
 const ABSENT_LINK =
   /cannot find device|does not exist|no such device|no such file|ENODEV/i
@@ -29,6 +35,16 @@ export const newTapOwnership = (): TapOwnership => ({
   linkUp: false,
 })
 
+/** `remove` may skip the alias check only for a link this call just created. */
+export interface TapRemoveOptions {
+  /**
+   * Trust the in-process `TapOwnership` evidence (`ip tuntap add` succeeded in
+   * this allocation). Used only by allocation rollback, never for adoption or
+   * release of an interface found on the host.
+   */
+  createdByUs?: boolean
+}
+
 /**
  * The name is already taken by an interface this allocation did not create.
  * Nothing was changed on the host; the manager must skip/quarantine the index
@@ -48,6 +64,10 @@ export interface TapInspection {
   up: boolean
   /** IPv4 CIDRs configured on the link (`10.200.0.1/30`). */
   addresses: string[]
+  /** True only for `tun type tap` (parsed from `ip -d -o link show`). */
+  tapDevice: boolean
+  /** Interface alias (`ip link set dev X alias ...`), if any. */
+  alias: string | undefined
 }
 
 const isConflict = (output: string): boolean =>
@@ -62,8 +82,22 @@ export class TapController {
   constructor(
     private readonly runner: CommandRunner,
     private readonly tapOwner: { user?: string; group?: string } = {},
-    private readonly logger?: Logger
+    private readonly logger?: Logger,
+    private readonly ownerMarker = 'rctf-fc'
   ) {}
+
+  /** The alias every tap created by THIS agent carries. */
+  get expectedAlias(): string {
+    return tapAlias(this.ownerMarker)
+  }
+
+  /**
+   * Durable ownership evidence: the link must be a tun/tap device AND carry
+   * this host's agent alias. The name alone is never proof.
+   */
+  isOwned(info: TapInspection): boolean {
+    return info.exists && info.tapDevice && info.alias === this.expectedAlias
+  }
 
   private async mustRun(argv: string[]): Promise<void> {
     const result = await this.runner.run(argv, {
@@ -89,16 +123,34 @@ export class TapController {
   /** Inspect a link without mutating it. Absent links are not an error. */
   async inspect(tapName: string): Promise<TapInspection> {
     assertTapName(tapName)
-    const link = await this.run(['ip', '-o', 'link', 'show', 'dev', tapName])
+    const link = await this.run([
+      'ip',
+      '-d',
+      '-o',
+      'link',
+      'show',
+      'dev',
+      tapName,
+    ])
     if (link.code !== 0) {
       if (ABSENT_LINK.test(link.text)) {
-        return { exists: false, up: false, addresses: [] }
+        return {
+          exists: false,
+          up: false,
+          addresses: [],
+          tapDevice: false,
+          alias: undefined,
+        }
       }
       throw new Error(
-        `ip -o link show dev ${tapName} failed (${link.code}): ${link.text || 'no output'}`
+        `ip -d -o link show dev ${tapName} failed (${link.code}): ${link.text || 'no output'}`
       )
     }
     const up = /state UP|[,<]UP[,>]/.test(link.text)
+    // `ip -d` prints `tun type tap` for taps and `dummy` for dummies.
+    const tapDevice = /\btun\s+type\s+tap\b/.test(link.text)
+    const aliasMatch = /\balias\s+([^\s\\]+)/.exec(link.text)
+    const alias = aliasMatch?.[1]
     const addr = await this.run([
       'ip',
       '-o',
@@ -116,7 +168,7 @@ export class TapController {
     const addresses = [...addr.text.matchAll(/inet\s+([0-9./]+)/g)]
       .map(match => match[1])
       .filter((cidr): cidr is string => cidr !== undefined)
-    return { exists: true, up, addresses }
+    return { exists: true, up, addresses, tapDevice, alias }
   }
 
   /**
@@ -152,6 +204,17 @@ export class TapController {
     if (owned !== undefined) {
       owned.tapCreated = true
     }
+    // Durable ownership evidence, immediately after creation. If this fails,
+    // rollback still knows the tap was created by this call (owned.tapCreated).
+    await this.mustRun([
+      'ip',
+      'link',
+      'set',
+      'dev',
+      tap,
+      'alias',
+      this.expectedAlias,
+    ])
     await this.mustRun([
       'ip',
       'addr',
@@ -183,6 +246,20 @@ export class TapController {
       await this.create(lease, owned)
       return
     }
+    if (!this.isOwned(link)) {
+      // Same name, no durable evidence that it is ours: never modify it. The
+      // caller reports/skips the lease just like an allocation name conflict.
+      this.logger?.warn(
+        {
+          tap,
+          tapDevice: link.tapDevice,
+          alias: link.alias,
+          expectedAlias: this.expectedAlias,
+        },
+        'refusing to adopt an fctap interface without agent ownership evidence'
+      )
+      throw new TapNameConflictError(tap)
+    }
     const cidr = `${lease.hostIp}/${lease.prefixLength}`
     if (!link.addresses.includes(cidr)) {
       await this.mustRun(['ip', 'addr', 'add', cidr, 'dev', tap])
@@ -199,10 +276,32 @@ export class TapController {
   /**
    * Delete a tap. Missing links are not an error; every other failure is
    * propagated so `release()` keeps the lease reserved and can be retried.
+   *
+   * Unless `createdByUs` is set (allocation rollback where `ip tuntap add`
+   * succeeded in this call), the link must pass the durable ownership check
+   * first. A foreign interface with our name is left alone and reported.
    */
-  async remove(tapName: string): Promise<void> {
+  async remove(tapName: string, options: TapRemoveOptions = {}): Promise<void> {
     if (!TAP_NAME_REGEX.test(tapName)) {
       throw new Error(`refusing to delete non-agent interface: ${tapName}`)
+    }
+    if (options.createdByUs !== true) {
+      const existing = await this.inspect(tapName)
+      if (!existing.exists) {
+        return
+      }
+      if (!this.isOwned(existing)) {
+        this.logger?.warn(
+          {
+            tap: tapName,
+            tapDevice: existing.tapDevice,
+            alias: existing.alias,
+            expectedAlias: this.expectedAlias,
+          },
+          'refusing to delete an fctap interface without agent ownership evidence'
+        )
+        return
+      }
     }
     const result = await this.runner.run(
       ['ip', 'link', 'del', 'dev', tapName],

@@ -26,6 +26,9 @@ const subnetPoolSchema = z
 
 const portSchema = z.int().check(z.gte(1), z.lte(65535))
 
+/** Stable per-host marker embedded in every tap interface alias. */
+const OWNER_MARKER_REGEX = /^[A-Za-z0-9._-]{1,32}$/
+
 /**
  * Owner: track 3 (network). Extend freely; keep the export names.
  *
@@ -77,6 +80,32 @@ export const networkConfigSchema = z.object({
   externalInterface: z
     .prefault(z.string(), 'eth0')
     .check(z.regex(IFACE_NAME_REGEX, 'Invalid externalInterface')),
+  /**
+   * Durable ownership marker for taps this agent creates. Every tap gets the
+   * interface alias `rctf-fc:<ownerMarker>` immediately after `ip tuntap add`;
+   * restore/ensure/delete only ever touch interfaces whose link type is tun/tap
+   * AND whose alias matches. Keep it stable across restarts (a changed marker
+   * makes previously created taps look foreign).
+   */
+  ownerMarker: z
+    .prefault(z.string(), 'rctf-fc')
+    .check(
+      z.regex(
+        OWNER_MARKER_REGEX,
+        'Invalid ownerMarker (use [A-Za-z0-9._-]{1,32})'
+      )
+    ),
+  /**
+   * Durable reuse quarantine (resource id + expiry epoch ms only). Written
+   * atomically (tmp+fsync+rename, mode 0600) on release/orphan cleanup and
+   * loaded again at startup so a restart cannot forget a released /30 or port.
+   * A corrupt/unreadable file fails closed for one quarantine period. It holds
+   * no secrets.
+   */
+  quarantineFile: z.prefault(
+    z.string().check(z.minLength(1)),
+    '/var/lib/rctf-firecracker/net-quarantine.json'
+  ),
   /** Traefik entrypoint for plain HTTP routers. */
   httpEntrypoint: z
     .prefault(z.string(), 'web')

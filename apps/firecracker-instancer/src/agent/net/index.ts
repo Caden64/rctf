@@ -23,6 +23,7 @@ import {
   PortAllocator,
   parseSubnetPool,
   tapNameForIndex,
+  type QuarantineEntry,
   type SubnetPool,
 } from './ipam'
 import {
@@ -33,7 +34,13 @@ import {
   isTcpKind,
   validateExpose,
 } from './lease'
-import { applyRuleset, renderRuleset } from './nftables'
+import {
+  applyRuleset,
+  detectInstalledEgress,
+  readInstalledRuleset,
+  renderRuleset,
+} from './nftables'
+import { QuarantineStore, type QuarantineData } from './quarantine'
 import {
   TapController,
   TapNameConflictError,
@@ -61,6 +68,14 @@ interface LeaseState {
   /** Whether this lease currently installs public ingress (DNAT/Traefik). */
   routed: boolean
 }
+
+/*
+ * `NetLease.egress` is immutable for the life of a lease: it is chosen at
+ * allocation and never changed by publish/unpublish/restore. If a restored
+ * lease's flag disagrees with the installed rules, restore fences and flushes
+ * before re-rendering (see `restore`) rather than silently crossing the
+ * policy change while old established flows still exist.
+ */
 
 /** Tiny promise mutex: host operations and allocator mutations are serialised. */
 class Mutex {
@@ -122,8 +137,14 @@ class NetworkManagerImpl implements NetworkManager {
   private readonly traefik: TraefikFileManager
   private readonly quarantineMs: number
   private readonly clock: Clock
-  /** Lease ids whose rules must already be gone (release in progress). */
+  /** Lease ids whose ruleset is fenced (release in progress). */
   private readonly releasing = new Set<string>()
+  /** Transient fence for restore transitions (e.g. an egress-policy change). */
+  private readonly transitionFenced = new Set<string>()
+  /** Egress transitions whose conntrack flush still has to succeed. */
+  private readonly egressFlushPending = new Set<string>()
+  private readonly quarantineStore: QuarantineStore
+  private readonly quarantineReady: Promise<void>
   private conntrackUsable = false
 
   constructor(
@@ -191,9 +212,75 @@ class NetworkManagerImpl implements NetworkManager {
     this.taps = new TapController(
       runner,
       { user: config.tapUser, group: config.tapGroup },
-      logger
+      logger,
+      config.ownerMarker
     )
     this.traefik = new TraefikFileManager(config, logger)
+    this.quarantineStore = new QuarantineStore(
+      config.quarantineFile,
+      this.clock,
+      logger
+    )
+    this.quarantineReady = this.loadQuarantine()
+  }
+
+  /**
+   * Load persisted quarantine deadlines into the fresh allocators. A missing
+   * file is normal. A corrupt/unreadable file is a hard fail-closed: every
+   * currently unowned index/port is quarantined for one full period, so a
+   * restart can never hand a just-released resource straight back out.
+   */
+  private async loadQuarantine(): Promise<void> {
+    try {
+      const result = await this.quarantineStore.load()
+      if (result.corrupt) {
+        this.ipam.quarantineAll()
+        this.ports?.quarantineAll()
+        return
+      }
+      this.ipam.applyQuarantine(result.data.indexes)
+      this.ports?.applyQuarantine(result.data.ports)
+    } catch (error) {
+      this.ipam.quarantineAll()
+      this.ports?.quarantineAll()
+      this.logger?.error(
+        { err: error, path: this.config.quarantineFile },
+        'could not load network quarantine; failing closed for one quarantine period'
+      )
+    }
+  }
+
+  /**
+   * Persist the current quarantine plus (optionally) resources about to be
+   * freed, pruning expired entries. Callers decide whether a write failure is
+   * fatal (release logs it and keeps the in-memory quarantine).
+   */
+  private async persistQuarantine(
+    extra: Partial<QuarantineData> = {}
+  ): Promise<void> {
+    const merge = (
+      first: readonly QuarantineEntry[],
+      second: readonly QuarantineEntry[]
+    ): QuarantineEntry[] => {
+      const merged = new Map<number, number>()
+      for (const entry of [...first, ...second]) {
+        const existing = merged.get(entry.id)
+        merged.set(
+          entry.id,
+          existing === undefined
+            ? entry.expiresAtMs
+            : Math.max(existing, entry.expiresAtMs)
+        )
+      }
+      return [...merged.entries()].map(([id, expiresAtMs]) => ({
+        id,
+        expiresAtMs,
+      }))
+    }
+    await this.quarantineStore.save({
+      indexes: merge(this.ipam.quarantineEntries(), extra.indexes ?? []),
+      ports: merge(this.ports?.quarantineEntries() ?? [], extra.ports ?? []),
+    })
   }
 
   private allocatorOptions(): { quarantineMs: number; now: Clock } {
@@ -211,16 +298,17 @@ class NetworkManagerImpl implements NetworkManager {
    * `unpublish` never weakens a live tap.
    */
   private async renderAndApply(): Promise<void> {
-    const active = [...this.states.values()].filter(
-      state => !this.releasing.has(state.lease.instanceId)
-    )
+    const active = [...this.states.values()]
+    const fenced = new Set([...this.releasing, ...this.transitionFenced])
     const published = new Set(
-      active.filter(state => state.routed).map(state => state.lease.instanceId)
+      active
+        .filter(state => state.routed && !fenced.has(state.lease.instanceId))
+        .map(state => state.lease.instanceId)
     )
     const ruleset = renderRuleset(
       active.map(state => state.lease),
       this.config,
-      { published }
+      { published, fenced }
     )
     await applyRuleset(this.runner, ruleset)
   }
@@ -279,10 +367,7 @@ class NetworkManagerImpl implements NetworkManager {
     this.conntrackUsable = false
   }
 
-  private async flushConntrackFor(
-    guestIp: string,
-    publicPorts: Iterable<number>
-  ): Promise<void> {
+  private async flushConntrackFor(guestIp: string): Promise<void> {
     if (!this.config.requireConntrack) {
       const available = await conntrackAvailable(this.runner)
       if (!available) {
@@ -293,14 +378,11 @@ class NetworkManagerImpl implements NetworkManager {
         return
       }
     }
-    await flushConntrack(this.runner, { guestIp, publicPorts })
+    await flushConntrack(this.runner, { guestIp })
   }
 
   private async flushLeaseConntrack(lease: NetLease): Promise<void> {
-    await this.flushConntrackFor(
-      lease.guestIp,
-      Object.values(lease.publicPorts)
-    )
+    await this.flushConntrackFor(lease.guestIp)
   }
 
   private async cleanupAllocation(args: {
@@ -320,7 +402,7 @@ class NetworkManagerImpl implements NetworkManager {
     if (owned.tapCreated) {
       const tapName = state?.lease.tapName ?? tapNameForIndex(index)
       try {
-        await this.taps.remove(tapName)
+        await this.taps.remove(tapName, { createdByUs: true })
       } catch (error) {
         tapRemovalFailed = true
         this.logger?.warn(
@@ -349,6 +431,7 @@ class NetworkManagerImpl implements NetworkManager {
     expose: NetExposeRequest[]
   }): Promise<NetLease> {
     return this.mutex.run(async () => {
+      await this.quarantineReady
       assertInstanceId(req.instanceId)
       if (typeof req.egress !== 'boolean') {
         throw new Error('egress must be a boolean')
@@ -485,6 +568,7 @@ class NetworkManagerImpl implements NetworkManager {
 
   async publish(lease: NetLease, expose: NetExposeRequest[]): Promise<void> {
     return this.mutex.run(async () => {
+      await this.quarantineReady
       const exposeReq = validateExpose(expose)
       let state = this.states.get(lease.instanceId)
       if (state === undefined) {
@@ -508,6 +592,7 @@ class NetworkManagerImpl implements NetworkManager {
 
   async unpublish(instanceId: string): Promise<void> {
     return this.mutex.run(async () => {
+      await this.quarantineReady
       assertInstanceId(instanceId)
       const state = this.states.get(instanceId)
       if (state === undefined) {
@@ -516,50 +601,72 @@ class NetworkManagerImpl implements NetworkManager {
         await this.traefik.remove(instanceId)
         return
       }
-      const wasRouted = state.routed
+      const lease = state.lease
       state.routed = false
-      try {
-        await this.renderAndApply()
-      } catch (error) {
-        state.routed = wasRouted
-        throw error
-      }
+      // Same fencing step as release: remove every accept/DNAT first, so no
+      // flow created after the conntrack flush can survive a later publish.
+      // Any failure keeps the lease fenced and retryable (no accepts restored).
+      this.releasing.add(instanceId)
+      await this.renderAndApply()
       await this.traefik.remove(instanceId)
-      // The live tap keeps every security rule; only public ingress is gone.
-      // Flush the published flows so a later publish/tenant cannot inherit
-      // them (guests with no egress cannot re-open flows meanwhile).
-      await this.flushLeaseConntrack(state.lease)
+      await this.flushLeaseConntrack(lease)
+      this.releasing.delete(instanceId)
+      // The tap stays alive and keeps every security rule, but no public
+      // ingress. A failure here leaves the applied ruleset fenced (safe).
+      await this.renderAndApply()
     })
   }
 
   async release(instanceId: string): Promise<void> {
     return this.mutex.run(async () => {
+      await this.quarantineReady
       assertInstanceId(instanceId)
       const state = this.states.get(instanceId)
       if (state === undefined) {
         return
       }
       const lease = state.lease
+      const expiresAt = this.clock() + this.quarantineMs
+      // Keep the lease reserved AND fenced from here on. Every step below is
+      // retried by calling release() again; nothing is freed until all pass.
+      // On any failure `releasing` is deliberately kept: the lease stays
+      // reserved and fenced (when the fence step itself failed, the old rules
+      // are still the pre-release ones; a retry installs the fence first).
       this.releasing.add(instanceId)
       state.routed = false
+      // (a) Fence first: only blocking rules remain (no DNAT/accepts).
+      await this.renderAndApply()
+      // (b) Remove public routes.
+      await this.traefik.remove(instanceId)
+      // (c) Delete the tap so the guest cannot inject packets any more.
+      await this.taps.remove(lease.tapName)
+      // (d) Flush conntrack in all four directions.
+      await this.flushLeaseConntrack(lease)
+      // (e) Persist the reuse quarantine BEFORE freeing in-memory state so a
+      //     restart cannot forget it. Persistence failure is loud but not a
+      //     reason to keep a torn-down lease reserved forever (the in-memory
+      //     quarantine still applies); the production path is writable.
       try {
-        // Flush first: a failure keeps the lease reserved and retryable.
-        await this.flushLeaseConntrack(lease)
-        await this.traefik.remove(instanceId)
-        // `remove` propagates real failures; only confirmed absence is
-        // tolerated, so a failed deletion keeps the lease reserved.
-        await this.taps.remove(lease.tapName)
-        await this.renderAndApply()
+        await this.persistQuarantine({
+          indexes: [{ id: state.index, expiresAtMs: expiresAt }],
+          ports: Object.values(lease.publicPorts).map(port => ({
+            id: port,
+            expiresAtMs: expiresAt,
+          })),
+        })
       } catch (error) {
-        this.releasing.delete(instanceId)
-        throw error
+        this.logger?.error(
+          { err: error, path: this.config.quarantineFile, instanceId },
+          'could not persist network quarantine; reuse safety is not durable across restarts'
+        )
       }
       this.releasing.delete(instanceId)
+      this.egressFlushPending.delete(instanceId)
       this.states.delete(instanceId)
       this.usedMacs.delete(lease.guestMac)
       // Freed resources enter the reuse quarantine (conntrack just flushed).
-      this.ipam.release(state.index)
-      this.ports?.release(Object.values(lease.publicPorts))
+      this.ipam.release(state.index, expiresAt)
+      this.ports?.release(Object.values(lease.publicPorts), expiresAt)
     })
   }
 
@@ -642,6 +749,7 @@ class NetworkManagerImpl implements NetworkManager {
     skippedLeases: string[]
   }> {
     return this.mutex.run(async () => {
+      await this.quarantineReady
       const skippedLeases: string[] = []
       const keptOrphans: string[] = []
       const errors: unknown[] = []
@@ -725,11 +833,34 @@ class NetworkManagerImpl implements NetworkManager {
         }
       }
 
-      // Phase 2: authoritative replacement of the in-memory allocators.
+      // Phase 2: authoritative replacement of the in-memory allocators. The
+      // reuse quarantine is NOT reset: persisted deadlines from the previous
+      // process (and any added since) are carried into the new allocators.
+      const installed = await readInstalledRuleset(this.runner)
+      const previousEgress = new Map<string, boolean>()
+      for (const state of this.states.values()) {
+        previousEgress.set(state.lease.instanceId, state.lease.egress)
+      }
+      const previousIndexes = this.ipam.quarantineEntries()
+      const previousPorts = this.ports?.quarantineEntries() ?? []
+
+      const restoredIds = new Set(staged.map(entry => entry.lease.instanceId))
+      for (const id of Array.from(this.releasing)) {
+        if (!restoredIds.has(id)) {
+          this.releasing.delete(id)
+        }
+      }
+      for (const id of Array.from(this.egressFlushPending)) {
+        if (!restoredIds.has(id)) {
+          this.egressFlushPending.delete(id)
+        }
+      }
+      this.transitionFenced.clear()
+
       this.states.clear()
       this.usedMacs.clear()
-      this.releasing.clear()
       this.ipam = new Ipv4Pool(this.pool, this.allocatorOptions())
+      this.ipam.applyQuarantine(previousIndexes)
       let nextPorts: PortAllocator | undefined
       try {
         nextPorts = new PortAllocator(
@@ -741,6 +872,7 @@ class NetworkManagerImpl implements NetworkManager {
         nextPorts = undefined
       }
       this.ports = nextPorts
+      this.ports?.applyQuarantine(previousPorts)
       if (
         (!this.portRangeValid || this.ports === undefined) &&
         staged.some(entry => Object.keys(entry.lease.publicPorts).length > 0)
@@ -758,11 +890,58 @@ class NetworkManagerImpl implements NetworkManager {
         this.states.set(lease.instanceId, {
           lease,
           index,
-          routed: true,
+          // A half-released lease stays reserved and fenced; it must not get
+          // its public ingress (or a re-created tap) back on restore.
+          routed: !this.releasing.has(lease.instanceId),
         })
       }
 
+      // Egress is immutable per lease. If the installed rules show a different
+      // policy than the restored lease (e.g. a corrupted/edited record, or a
+      // transition that was interrupted), fence + flush before re-rendering so
+      // established flows cannot cross the policy change.
+      const egressTransitions: NetLease[] = []
+      for (const { lease } of staged) {
+        if (this.releasing.has(lease.instanceId)) {
+          continue
+        }
+        const detected =
+          detectInstalledEgress(installed, lease, this.config) ??
+          previousEgress.get(lease.instanceId)
+        if (
+          this.egressFlushPending.has(lease.instanceId) ||
+          (detected !== undefined && detected !== lease.egress)
+        ) {
+          egressTransitions.push(lease)
+          this.egressFlushPending.add(lease.instanceId)
+        }
+      }
+      if (egressTransitions.length > 0) {
+        for (const lease of egressTransitions) {
+          this.transitionFenced.add(lease.instanceId)
+        }
+        await this.renderAndApply()
+        for (const lease of egressTransitions) {
+          await this.flushLeaseConntrack(lease)
+          this.egressFlushPending.delete(lease.instanceId)
+          this.transitionFenced.delete(lease.instanceId)
+        }
+      }
+
       for (const state of this.states.values()) {
+        if (this.releasing.has(state.lease.instanceId)) {
+          // Mid-release: never re-create/modify the tap or re-add its routes.
+          try {
+            await this.traefik.remove(state.lease.instanceId)
+          } catch (error) {
+            this.logger?.warn(
+              { err: error, instanceId: state.lease.instanceId },
+              'could not remove routes of a half-released lease'
+            )
+            errors.push(error)
+          }
+          continue
+        }
         try {
           await this.taps.ensure(state.lease)
         } catch (error) {
@@ -779,6 +958,9 @@ class NetworkManagerImpl implements NetworkManager {
       // Every route (kind, entrypoint, guest port) is rebuilt from the lease;
       // existing Traefik files are always rewritten, never trusted blindly.
       for (const state of this.states.values()) {
+        if (this.releasing.has(state.lease.instanceId)) {
+          continue
+        }
         await this.traefik.write(
           state.lease.instanceId,
           this.traefikRoutes(state)
@@ -793,6 +975,17 @@ class NetworkManagerImpl implements NetworkManager {
         keptOrphans,
         errors,
       })
+
+      if (removed.some(entry => entry.startsWith('tap:'))) {
+        try {
+          await this.persistQuarantine()
+        } catch (error) {
+          this.logger?.warn(
+            { err: error, path: this.config.quarantineFile },
+            'could not persist orphan tap quarantine'
+          )
+        }
+      }
 
       if (skippedLeases.length > 0) {
         this.logger?.warn(
@@ -812,16 +1005,13 @@ class NetworkManagerImpl implements NetworkManager {
   }
 
   /**
-   * Orphan tap cleanup with ownership evidence.
+   * Orphan tap cleanup with durable ownership evidence.
    *
-   * A stray `fctapN` is only OURS when either
-   *   - it is down and has no IPv4 address (an interrupted create), or
-   *   - every IPv4 address on it is exactly the host side of the /30 that
-   *     belongs to its own index inside `subnetPool`.
-   * Anything else (a foreign address, or up without an address) is reported as
-   * kept and left untouched: the name prefix alone is not proof of ownership.
-   * (`ip -d link show` does not expose the tun owner uid reliably, so the
-   * address/state pair is the evidence used here.)
+   * A stray `fctapN` is only OURS when `ip -d -o link show` reports a tun/tap
+   * link AND its interface alias is this host's `rctf-fc:<ownerMarker>`. The
+   * name/address/state heuristics used previously adopted (and deleted) any
+   * down+unaddressed `fctapN`; a foreign dummy interface named `fctap9` is now
+   * always reported and left untouched.
    */
   private async removeStrayTaps(result: {
     removed: string[]
@@ -848,17 +1038,22 @@ class NetworkManagerImpl implements NetworkManager {
         continue
       }
       const index = tapIndexFromName(link)
-      if (index === undefined || !this.isOwnedStrayTap(index, info)) {
+      if (index === undefined || !this.taps.isOwned(info)) {
         this.logger?.warn(
-          { tap: link, addresses: info.addresses, up: info.up },
-          'leaving a non-agent fctap interface alone (ownership evidence mismatch)'
+          {
+            tap: link,
+            tapDevice: info.tapDevice,
+            alias: info.alias,
+            expectedAlias: this.taps.expectedAlias,
+          },
+          'leaving a non-agent fctap interface alone (no ownership evidence)'
         )
         result.keptOrphans.push(`tap:${link}`)
         continue
       }
       try {
         const { guestIp } = this.ipam.addresses(index)
-        await this.flushConntrackFor(guestIp, [])
+        await this.flushConntrackFor(guestIp)
         await this.taps.remove(link)
         result.removed.push(`tap:${link}`)
         // An unknown-lease resource begins its reuse quarantine now.
@@ -867,20 +1062,6 @@ class NetworkManagerImpl implements NetworkManager {
         result.errors.push(error)
       }
     }
-  }
-
-  private isOwnedStrayTap(index: number, info: TapInspection): boolean {
-    let expected: string
-    try {
-      const { hostIp } = this.ipam.addresses(index)
-      expected = `${hostIp}/30`
-    } catch {
-      return false
-    }
-    if (info.addresses.length === 0) {
-      return !info.up
-    }
-    return info.addresses.every(address => address === expected)
   }
 
   private poolIndexFor(lease: NetLease): number {
