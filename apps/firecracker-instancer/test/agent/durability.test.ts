@@ -290,7 +290,11 @@ describe('durable state directory errors', () => {
       readdir: () => Object.assign(new Error('gone'), { code: 'ENOENT' }),
     })
     await missing.init()
-    await expect(missing.load()).resolves.toEqual([])
+    await expect(missing.load()).resolves.toEqual({
+      records: [],
+      fences: [],
+      readErrors: 0,
+    })
 
     const broken = new StateStore(dir, logger(), {
       readdir: () => ioError('readdir failed'),

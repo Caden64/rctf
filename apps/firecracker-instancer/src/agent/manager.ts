@@ -20,11 +20,13 @@ import { NetworkCapacityError } from '../interfaces'
 import { createLogger, type Logger } from '../log'
 import type { AgentConfig } from './config'
 import {
+  StateReadError,
   StateStore,
   TombstoneStore,
   buildStoredInstance,
   computeSpecHash,
   leaseToJson,
+  type StateLoadResult,
   type StoredInstance,
 } from './state'
 
@@ -92,6 +94,13 @@ interface Entry {
   refs: number
   record?: StoredInstance
   boot?: BootTask
+  /**
+   * Resource-acquiring calls (allocate/launch/publish) whose outcome is not
+   * known yet because they outlived the operation deadline. Teardown must not
+   * release anything until these settle: a late call could create a lease/VM
+   * after the release and leave an unowned guest behind.
+   */
+  pendingOps: Set<Promise<unknown>>
 }
 
 const TERMINAL_STATES: ReadonlySet<AgentInstanceState> = new Set([
@@ -184,6 +193,8 @@ export const createInstanceManager = (deps: {
   operationTimeoutMs?: number
   /** Parallel per-instance sweeps. Default 8. */
   sweepConcurrency?: number
+  /** Sweeps between full orphan re-discovery. Default 30 (≈30s at 1s). */
+  orphanScanSweeps?: number
   /** Injectable stores (tests use faults); defaults to the real ones. */
   store?: StateStore
   tombstones?: TombstoneStore
@@ -196,7 +207,8 @@ export const createInstanceManager = (deps: {
     deps.store ??
     new StateStore(config.stateDir ?? '/var/lib/rctf-firecracker/state', logger)
   const tombstones =
-    deps.tombstones ?? new TombstoneStore(store.directory, logger)
+    deps.tombstones ??
+    new TombstoneStore(store.directory, logger, undefined, now)
   const expiryGraceMs = (config.expiryGraceSeconds ?? 120) * 1000
   const erroredTtlMs =
     deps.erroredTtlMs ?? (config.erroredTtlSeconds ?? 600) * 1000
@@ -206,8 +218,14 @@ export const createInstanceManager = (deps: {
   const orphanGraceMs = deps.orphanGraceMs ?? 0
   const operationTimeoutMs = deps.operationTimeoutMs ?? 30_000
   const sweepConcurrency = deps.sweepConcurrency ?? 8
+  const orphanScanSweeps = Math.max(1, deps.orphanScanSweeps ?? 30)
   const shutdownTimeoutMs = (config.shutdownTimeoutSeconds ?? 15) * 1000
   const version = deps.version ?? '0.0.0'
+  /**
+   * Teardown waits at most this long for an unsettled provisioning call to
+   * settle before keeping the record `stopping` and retrying on the sweep.
+   */
+  const pendingOperationGraceMs = Math.max(operationTimeoutMs * 4, 1)
 
   const entries = new Map<string, Entry>()
   const entriesLock = new Mutex()
@@ -219,8 +237,14 @@ export const createInstanceManager = (deps: {
   let shuttingDown = false
   /** False until restore + orphan cleanup have both succeeded. */
   let recovered = false
+  /** False until the state/tombstone files were read successfully. */
+  let stateLoaded = false
   let recoveryInFlight: Promise<void> | undefined
   let activeOps = 0
+  /** Orphan VM ids whose destruction has not been confirmed yet. */
+  const orphanBacklog = new Set<string>()
+  let orphanScanInFlight = false
+  let sweepsSinceOrphanScan = 0
 
   const beginOp = (): void => {
     activeOps += 1
@@ -271,6 +295,45 @@ export const createInstanceManager = (deps: {
     }
   }
 
+  /**
+   * Like `runOperation`, but keeps the underlying promise on the entry until it
+   * actually settles. A timed-out call keeps running (it may still create a VM
+   * or a lease), so teardown must wait for it before releasing anything.
+   */
+  const trackProvisioning = <T>(
+    entry: Entry,
+    fn: () => Promise<T>
+  ): Promise<T> => {
+    const operation = (async () => fn())()
+    entry.pendingOps.add(operation)
+    const settle = (): void => {
+      entry.pendingOps.delete(operation)
+    }
+    void operation.then(settle, settle)
+    return operation
+  }
+
+  /** Wait (bounded) until every tracked provisioning call has settled. */
+  const waitForPendingOperations = async (entry: Entry): Promise<boolean> => {
+    if (entry.pendingOps.size === 0) return true
+    let handle: ReturnType<typeof setTimeout> | undefined
+    const timedOut = new Promise<boolean>(resolve => {
+      handle = setTimeout(
+        () => resolve(false),
+        Math.max(1, pendingOperationGraceMs)
+      )
+      if (typeof handle.unref === 'function') handle.unref()
+    })
+    try {
+      return await Promise.race([
+        Promise.allSettled(entry.pendingOps).then(() => true),
+        timedOut,
+      ])
+    } finally {
+      if (handle) clearTimeout(handle)
+    }
+  }
+
   const persistBestEffort = async (
     entry: Entry,
     operation: string
@@ -300,14 +363,17 @@ export const createInstanceManager = (deps: {
   })
 
   /**
-   * Capacity is held by every record that still owns a lease or a VM, or is in
-   * a non-terminal state. An errored record whose cleanup is still pending
-   * keeps its reservation until release is confirmed.
+   * Capacity is held by every record that still owns a lease or a VM (or may
+   * own one: its allocation/launch outcome is not known yet), or is in a
+   * non-terminal state. An errored record whose cleanup is still pending keeps
+   * its reservation until release is confirmed.
    */
   const holdsResources = (record: StoredInstance): boolean =>
     record.lease !== undefined ||
     record.vm !== undefined ||
     record.vmPendingDestroy === true ||
+    record.netMayHold === true ||
+    record.vmMayHold === true ||
     isLiveState(record.state)
 
   const usage = (): AgentInfo['usage'] => {
@@ -330,7 +396,7 @@ export const createInstanceManager = (deps: {
     entriesLock.run(async () => {
       let entry = entries.get(id)
       if (!entry) {
-        entry = { id, mutex: new Mutex(), refs: 0 }
+        entry = { id, mutex: new Mutex(), refs: 0, pendingOps: new Set() }
         entries.set(id, entry)
       }
       entry.refs += 1
@@ -354,26 +420,51 @@ export const createInstanceManager = (deps: {
    * Reverse-order resource release. Ownership of each resource is cleared only
    * after that resource's release is confirmed; a failed step keeps the handle
    * so the sweep retries (all calls are idempotent).
+   *
+   * A still-running provisioning call is awaited first: releasing before it
+   * settles could leave a lease/VM created after the release. When it does not
+   * settle within the grace cap nothing is released and the caller keeps the
+   * record so the sweep retries.
    */
   const releaseResources = async (entry: Entry): Promise<boolean> => {
     const record = entry.record
     if (!record) return true
-    const id = record.id
-    let vmReleased = !(record.vm || record.vmPendingDestroy)
-    let leaseReleased = !record.lease
 
-    if (record.lease) {
+    if (!(await waitForPendingOperations(entry))) {
+      logOperationError(
+        record.id,
+        'provisioning settle',
+        new OperationTimeoutError('provisioning')
+      )
+      return false
+    }
+
+    const current = entry.record ?? record
+    const id = current.id
+    // `netMayHold`/`vmMayHold` mean "a resource may exist even without a
+    // persisted handle"; release/destroy are idempotent by id, so they are
+    // always attempted unconditionally, not only when a handle was saved.
+    const mayHoldNet =
+      current.lease !== undefined || current.netMayHold === true
+    const mayHoldVm =
+      current.vm !== undefined ||
+      current.vmPendingDestroy === true ||
+      current.vmMayHold === true
+    let vmReleased = !mayHoldVm
+    let leaseReleased = !mayHoldNet
+
+    if (current.lease) {
       try {
         await runOperation(id, 'net.unpublish', () => net.unpublish(id))
       } catch (err) {
         logOperationError(id, 'net.unpublish', err)
       }
     }
-    if (record.vm || record.vmPendingDestroy) {
-      if (record.vm) {
+    if (mayHoldVm) {
+      if (current.vm) {
         try {
           await runOperation(id, 'vm.stop', () =>
-            vm.stop(record.vm as VmHandle, { graceMs: 2000 })
+            vm.stop(current.vm as VmHandle, { graceMs: 2000 })
           )
         } catch (err) {
           logOperationError(id, 'vm.stop', err)
@@ -387,7 +478,7 @@ export const createInstanceManager = (deps: {
         vmReleased = false
       }
     }
-    if (record.lease) {
+    if (mayHoldNet) {
       try {
         await runOperation(id, 'net.release', () => net.release(id))
         leaseReleased = true
@@ -396,12 +487,16 @@ export const createInstanceManager = (deps: {
       }
     }
 
-    const next: StoredInstance = { ...record }
+    const next: StoredInstance = { ...current }
     if (vmReleased) {
       next.vm = undefined
       next.vmPendingDestroy = undefined
+      next.vmMayHold = undefined
     }
-    if (leaseReleased) next.lease = undefined
+    if (leaseReleased) {
+      next.lease = undefined
+      next.netMayHold = undefined
+    }
     entry.record = next
     return vmReleased && leaseReleased
   }
@@ -577,7 +672,17 @@ export const createInstanceManager = (deps: {
     entry: Entry,
     spec: AgentInstanceSpec
   ): Promise<AgentInstance> => {
-    await tombstones.ensureLoaded()
+    try {
+      await tombstones.ensureLoaded()
+    } catch (err) {
+      // Without the fences we cannot prove an id was not deleted: fail closed
+      // (the sweep retries loading and the controller retries the create).
+      logOperationError(spec.id, 'tombstones.load', err)
+      throw new ProtocolError(
+        'host_unavailable',
+        'agent tombstones are unavailable'
+      )
+    }
     if (tombstones.has(spec.id)) {
       throw new ProtocolError('conflict', 'instance id was deleted')
     }
@@ -594,6 +699,21 @@ export const createInstanceManager = (deps: {
     }
 
     await admissionLock.run(async () => {
+      // Recovery and creates are serialised: until restore + orphan cleanup
+      // have completed, a create could be undone by a later `net.restore()`
+      // (which rebuilds from the snapshot taken before the new lease existed).
+      if (!recovered) {
+        throw new ProtocolError(
+          'host_unavailable',
+          'agent recovery is incomplete'
+        )
+      }
+      if (orphanBacklog.size > 0) {
+        throw new ProtocolError(
+          'host_unavailable',
+          'orphaned VMs still need cleanup'
+        )
+      }
       const current = usage()
       if (
         current.instances + 1 > config.capacity.maxInstances ||
@@ -629,12 +749,22 @@ export const createInstanceManager = (deps: {
 
     let stage: FailureKind = 'allocate'
     try {
+      // Write-ahead the ambiguity: from here on the id may own network
+      // resources even if `net.allocate` never returns, so teardown always
+      // calls `net.release(id)`.
+      await saveRecord({
+        ...record,
+        netMayHold: true,
+        updatedAtMs: now(),
+      })
       const lease = await runOperation(spec.id, 'net.allocate', () =>
-        net.allocate({
-          instanceId: spec.id,
-          egress: spec.egress,
-          expose: exposeRequests(record.spec),
-        })
+        trackProvisioning(entry, () =>
+          net.allocate({
+            instanceId: spec.id,
+            egress: spec.egress,
+            expose: exposeRequests(record.spec),
+          })
+        )
       )
       await saveRecord({
         ...record,
@@ -647,34 +777,47 @@ export const createInstanceManager = (deps: {
         spec.expose
           .map((_, index) => lease.publicHostnames[index])
           .find(hostname => hostname !== undefined) ?? spec.id
+      // Same ambiguity for the VM process: `vm.destroy(id)` must be attempted
+      // even if the handle never reaches the record.
+      await saveRecord({
+        ...record,
+        vmMayHold: true,
+        updatedAtMs: now(),
+      })
       const handle = await runOperation(spec.id, 'vm.launch', () =>
-        vm.launch({
-          instanceId: spec.id,
-          image: spec.image,
-          vcpus: spec.vcpus,
-          memMiB: spec.memMiB,
-          diskMiB: spec.diskMiB,
-          ...(spec.kernelArgs === undefined
-            ? {}
-            : { kernelArgs: spec.kernelArgs }),
-          lease,
-          metadata: {
-            rctf: {
-              version: GUEST_METADATA_VERSION,
-              instanceId: spec.id,
-              hostname: firstPublicHostname,
-              env: spec.env,
-              // SECRET: memory only, handed straight to MMDS by the driver.
-              flags: spec.flags,
+        trackProvisioning(entry, () =>
+          vm.launch({
+            instanceId: spec.id,
+            image: spec.image,
+            vcpus: spec.vcpus,
+            memMiB: spec.memMiB,
+            diskMiB: spec.diskMiB,
+            ...(spec.kernelArgs === undefined
+              ? {}
+              : { kernelArgs: spec.kernelArgs }),
+            lease,
+            metadata: {
+              rctf: {
+                version: GUEST_METADATA_VERSION,
+                instanceId: spec.id,
+                hostname: firstPublicHostname,
+                env: spec.env,
+                // SECRET: memory only, handed straight to MMDS by the driver.
+                flags: spec.flags,
+              },
             },
-          },
-        })
+          })
+        )
       )
       await saveRecord({ ...record, vm: handle, updatedAtMs: now() })
 
       stage = 'publish'
+      // A timed-out publish can still install routes after teardown released
+      // the lease; track it so release happens only once it settled.
       await runOperation(spec.id, 'net.publish', () =>
-        net.publish(lease, exposeRequests(record.spec))
+        trackProvisioning(entry, () =>
+          net.publish(lease, exposeRequests(record.spec))
+        )
       )
 
       await saveRecord({
@@ -750,11 +893,18 @@ export const createInstanceManager = (deps: {
           if (!record) {
             throw new ProtocolError('not_found', 'instance not found')
           }
-          if (record.state === 'stopping' || record.state === 'errored') {
+          // Accepted while the instance is live, including the grace window
+          // after the nominal deadline: the controller may have committed an
+          // extension before the old deadline whose PATCH arrived just after
+          // it. This mutex is the same one the dead-man teardown runs under,
+          // so exactly one of the two claims the instance: once teardown set
+          // `stopping` (or finished), the deadline can no longer move.
+          if (
+            record.state === 'stopping' ||
+            record.state === 'stopped' ||
+            record.state === 'errored'
+          ) {
             throw new ProtocolError('expired', 'instance is no longer live')
-          }
-          if (now() >= record.expiresAtMs) {
-            throw new ProtocolError('expired', 'instance has expired')
           }
           const next = Math.max(record.expiresAtMs, expiresAtMs)
           if (next === record.expiresAtMs) return toAgentInstance(record)
@@ -797,7 +947,15 @@ export const createInstanceManager = (deps: {
       const entry = await obtainEntry(id)
       try {
         return await entry.mutex.run(async () => {
-          await tombstones.ensureLoaded()
+          try {
+            await tombstones.ensureLoaded()
+          } catch (err) {
+            logOperationError(id, 'tombstones.load', err)
+            throw new ProtocolError(
+              'host_unavailable',
+              'agent tombstones are unavailable'
+            )
+          }
           const record = entry.record
           if (!record) {
             // Fence the id even though it is unknown/already finished. This is
@@ -937,15 +1095,159 @@ export const createInstanceManager = (deps: {
     )
   }
 
+  /** Persist conservative fences for ids whose record file was malformed. */
+  const persistConservativeFences = async (ids: string[]): Promise<boolean> => {
+    for (const id of ids) {
+      try {
+        await tombstones.save(id, now())
+        logger.warn(
+          { instanceId: id },
+          'fenced id whose state file was malformed'
+        )
+      } catch (err) {
+        logOperationError(id, 'tombstone.persist', err)
+        return false
+      }
+    }
+    return true
+  }
+
+  /**
+   * Load state from disk. A per-file READ failure fails recovery closed and is
+   * retried by the sweep; a MALFORMED file is quarantined and its id
+   * conservatively fenced so it can never be silently reused.
+   */
+  const loadState = async (): Promise<boolean> => {
+    try {
+      await store.init()
+      await tombstones.load()
+      await tombstones.prune(now(), tombstoneTtlMs).catch(err => {
+        logOperationError('*', 'tombstone.prune', err)
+      })
+    } catch (err) {
+      if (err instanceof StateReadError) {
+        logOperationError('*', 'state.read', err)
+        return false
+      }
+      throw err
+    }
+
+    let loaded: StateLoadResult
+    try {
+      loaded = await store.load()
+    } catch (err) {
+      if (err instanceof StateReadError) {
+        logOperationError('*', 'state.read', err)
+        return false
+      }
+      throw err
+    }
+
+    if (!(await persistConservativeFences(loaded.fences))) return false
+    if (loaded.readErrors > 0) {
+      logger.error(
+        { failures: loaded.readErrors },
+        'could not read every instance state file; failing recovery closed'
+      )
+      return false
+    }
+
+    for (const entry of entries.values()) entry.boot?.controller.abort()
+    entries.clear()
+    for (const record of loaded.records) {
+      entries.set(record.id, {
+        id: record.id,
+        mutex: new Mutex(),
+        refs: 0,
+        record,
+        pendingOps: new Set(),
+      })
+    }
+
+    // Serialise recovery mutations per id before any request can arrive.
+    for (const record of loaded.records) {
+      const entry = entries.get(record.id)
+      if (!entry) continue
+      try {
+        await entry.mutex.run(() => recoverEntry(entry))
+      } catch (err) {
+        logOperationError(record.id, 'recover', err)
+      }
+    }
+    stateLoaded = true
+    return true
+  }
+
+  /** Retry every orphan id until its destruction is confirmed. */
+  const retryOrphanBacklog = async (): Promise<void> => {
+    for (const id of orphanBacklog) {
+      try {
+        await runOperation(id, 'vm.destroy', () => vm.destroy(id))
+        orphanBacklog.delete(id)
+        logger.info({ instanceId: id }, 'destroyed orphaned VM')
+      } catch (err) {
+        logOperationError(id, 'destroy orphan', err)
+      }
+    }
+  }
+
+  /**
+   * Full discovery: every VM the driver knows about but no record owns is an
+   * orphan. Destruction failures stay in the backlog (retried every sweep and
+   * re-discovered periodically) instead of being forgotten.
+   */
+  const scanForOrphans = async (): Promise<boolean> => {
+    let found: string[]
+    try {
+      found = await runOperation('*', 'vm.listInstanceIds', () =>
+        vm.listInstanceIds()
+      )
+    } catch (err) {
+      logOperationError('*', 'vm.listInstanceIds', err)
+      return false
+    }
+    const owned = ownedInstanceIds()
+    for (const id of found) {
+      if (owned.has(id)) {
+        orphanBacklog.delete(id)
+        continue
+      }
+      if (!INSTANCE_ID_REGEX.test(id)) {
+        logger.warn({ instanceId: id }, 'refusing to destroy invalid orphan id')
+        continue
+      }
+      orphanBacklog.add(id)
+    }
+    for (const id of orphanBacklog) {
+      if (owned.has(id)) orphanBacklog.delete(id)
+    }
+    await retryOrphanBacklog()
+    return true
+  }
+
+  const runOrphanMaintenance = async (discover: boolean): Promise<void> => {
+    if (orphanScanInFlight) return
+    orphanScanInFlight = true
+    try {
+      if (discover) await scanForOrphans()
+      else await retryOrphanBacklog()
+    } finally {
+      orphanScanInFlight = false
+    }
+  }
+
   /**
    * Restore the network from stable ownership and remove orphan VMs. Until
    * this succeeds the agent is not accepting and readiness tasks are deferred;
-   * the sweep retries it.
+   * the sweep retries it. Failed orphan destructions do not block recovery but
+   * keep `accepting` false until they are confirmed.
    */
   const finishRecovery = (): Promise<void> => {
     if (recovered || shuttingDown) return Promise.resolve()
     if (recoveryInFlight) return recoveryInFlight
     recoveryInFlight = (async () => {
+      if (!stateLoaded && !(await loadState())) return
+
       const leases = liveLeases()
       try {
         const restored = await runOperation('*', 'net.restore', () =>
@@ -962,36 +1264,15 @@ export const createInstanceManager = (deps: {
         return
       }
 
-      try {
-        let found: string[] = []
-        found = await runOperation('*', 'vm.listInstanceIds', () =>
-          vm.listInstanceIds()
-        )
-        if (orphanGraceMs > 0) await Bun.sleep(orphanGraceMs)
-        const owned = ownedInstanceIds()
-        for (const id of found) {
-          if (owned.has(id)) continue
-          if (!INSTANCE_ID_REGEX.test(id)) {
-            logger.warn(
-              { instanceId: id },
-              'refusing to destroy invalid orphan id'
-            )
-            continue
-          }
-          try {
-            await runOperation(id, 'vm.destroy', () => vm.destroy(id))
-            logger.info({ instanceId: id }, 'destroyed orphaned VM')
-          } catch (err) {
-            logOperationError(id, 'destroy orphan', err)
-          }
-        }
-      } catch (err) {
-        logOperationError('*', 'vm.listInstanceIds', err)
-        return
-      }
+      if (orphanGraceMs > 0) await Bun.sleep(orphanGraceMs)
+      if (!(await scanForOrphans())) return
 
       if (shuttingDown) return
-      recovered = true
+      // Serialise the transition with creates: a create admitted before this
+      // point could be undone by a later restore from a stale lease snapshot.
+      await admissionLock.run(async () => {
+        if (!shuttingDown) recovered = true
+      })
       // Readiness may only start after the network has been restored.
       for (const entry of entries.values()) {
         const record = entry.record
@@ -1011,39 +1292,16 @@ export const createInstanceManager = (deps: {
     timer = undefined
     shuttingDown = false
     recovered = false
+    stateLoaded = false
     recoveryInFlight = undefined
+    orphanBacklog.clear()
+    sweepsSinceOrphanScan = 0
 
     for (const entry of entries.values()) entry.boot?.controller.abort()
     entries.clear()
 
     // Fail startup closed: an unreadable state or tombstone directory is never
     // treated as empty (that would forget live resources and fences).
-    await store.init()
-    await tombstones.load()
-    await tombstones.prune(now(), tombstoneTtlMs).catch(err => {
-      logOperationError('*', 'tombstone.prune', err)
-    })
-    const records = await store.load()
-    for (const record of records) {
-      entries.set(record.id, {
-        id: record.id,
-        mutex: new Mutex(),
-        refs: 0,
-        record,
-      })
-    }
-
-    // Serialise recovery mutations per id before any request can arrive.
-    for (const record of records) {
-      const entry = entries.get(record.id)
-      if (!entry) continue
-      try {
-        await entry.mutex.run(() => recoverEntry(entry))
-      } catch (err) {
-        logOperationError(record.id, 'recover', err)
-      }
-    }
-
     await finishRecovery()
 
     if (!shuttingDown) {
@@ -1057,13 +1315,25 @@ export const createInstanceManager = (deps: {
   const sweepErroredLocked = async (entry: Entry): Promise<void> => {
     let record = entry.record
     if (!record) return
-    if (record.lease || record.vm || record.vmPendingDestroy) {
+    const holdsAnything =
+      record.lease !== undefined ||
+      record.vm !== undefined ||
+      record.vmPendingDestroy === true ||
+      record.netMayHold === true ||
+      record.vmMayHold === true
+    if (holdsAnything) {
       const ok = await releaseResources(entry)
       if (ok) await persistBestEffort(entry, 'persist errored cleanup')
     }
     record = entry.record
     if (!record) return
-    if (!record.lease && !record.vm && !record.vmPendingDestroy) {
+    const fullyReleased =
+      record.lease === undefined &&
+      record.vm === undefined &&
+      record.vmPendingDestroy !== true &&
+      record.netMayHold !== true &&
+      record.vmMayHold !== true
+    if (fullyReleased) {
       if (now() - record.updatedAtMs >= erroredTtlMs) {
         try {
           await store.remove(record.id)
@@ -1150,15 +1420,29 @@ export const createInstanceManager = (deps: {
         }
       })
       .catch(err => logOperationError('*', 'tombstone.prune', err))
-    await Promise.all([
+    const tasks: Promise<unknown>[] = [
       prune,
       ...Array.from(entries.values()).map(entry => sweepEntry(entry)),
-    ])
+    ]
+    if (recovered) {
+      sweepsSinceOrphanScan += 1
+      const discover = sweepsSinceOrphanScan >= orphanScanSweeps
+      if (discover) sweepsSinceOrphanScan = 0
+      // Retry a non-empty backlog every sweep; re-discover periodically so an
+      // orphan that appears later is not missed.
+      if (discover || orphanBacklog.size > 0) {
+        tasks.push(runOrphanMaintenance(discover))
+      }
+    }
+    await Promise.all(tasks)
   }
 
   const info = async (): Promise<AgentInfo> => {
     let images: string[] = []
-    const checks: Record<string, boolean> = { recovered }
+    const checks: Record<string, boolean> = {
+      recovered,
+      orphanBacklog: orphanBacklog.size === 0,
+    }
     try {
       const preflight = await runOperation('*', 'vm.preflight', () =>
         vm.preflight()

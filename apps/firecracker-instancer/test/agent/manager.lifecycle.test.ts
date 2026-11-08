@@ -232,16 +232,83 @@ describe('instance manager: delete', () => {
 })
 
 describe('instance manager: extend and expiry', () => {
-  it('rejects extend after the deadline', async () => {
-    const harness = await setup({ sweepIntervalMs: 1_000_000 })
-    const spec = makeSpec({ expiresAtMs: harness.clock.now() + 1000 })
+  it('accepts an extension after the old deadline but within the grace window', async () => {
+    const harness = await setup({ sweepIntervalMs: 2 })
+    const start = harness.clock.now()
+    const spec = makeSpec({ expiresAtMs: start + 1000 })
     await harness.mgr.create(spec)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id))?.state === 'running' ? true : undefined
+    )
 
-    harness.clock.advance(1000)
+    // The controller committed the extension before the deadline; its PATCH
+    // reached the agent slightly after it. The VM is still alive (grace).
+    harness.clock.advance(1000 + 5000)
+    const extended = await harness.mgr.extend(spec.id, start + 60_000)
+    expect(extended.expiresAtMs).toBe(start + 60_000)
+    expect((await harness.mgr.get(spec.id))?.state).toBe('running')
+
+    // The dead-man deadline moved with it: not torn down at the old deadline.
+    const graceMs = 10_000
+    harness.clock.set(start + 60_000 + graceMs - 1)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(await harness.mgr.get(spec.id)).toBeDefined()
+
+    harness.clock.advance(1)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id)) === undefined ? true : undefined
+    )
+  })
+
+  it('rejects an extension once teardown has claimed the instance', async () => {
+    const harness = await setup({ sweepIntervalMs: 2 })
+    const start = harness.clock.now()
+    const spec = makeSpec({ expiresAtMs: start + 1000 })
+    await harness.mgr.create(spec)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id))?.state === 'running' ? true : undefined
+    )
+
+    harness.net.failRelease = true
+    harness.clock.advance(1000 + 10_000 + 1)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id))?.state === 'stopping' ? true : undefined
+    )
+
     const code = await rejectionCode(
       harness.mgr.extend(spec.id, harness.clock.now() + 60_000)
     )
     expect(code).toBe('expired')
+  })
+
+  it('has exactly one winner when an extension races the dead-man sweep', async () => {
+    const harness = await setup({ sweepIntervalMs: 1 })
+    const start = harness.clock.now()
+    const spec = makeSpec({ expiresAtMs: start + 1000 })
+    await harness.mgr.create(spec)
+    await waitFor(async () =>
+      (await harness.mgr.get(spec.id))?.state === 'running' ? true : undefined
+    )
+
+    const newDeadline = start + 30_000
+    // Put the clock exactly at the end of the grace window: either the sweep
+    // claims the instance first, or the extension moves the deadline first.
+    harness.clock.advance(1000 + 10_000)
+    const [extended] = await Promise.allSettled([
+      harness.mgr.extend(spec.id, newDeadline),
+      new Promise(resolve => setTimeout(resolve, 5)),
+    ])
+
+    const current = await harness.mgr.get(spec.id)
+    if (extended.status === 'fulfilled') {
+      expect(current).toBeDefined()
+      expect(current?.expiresAtMs).toBe(newDeadline)
+    } else {
+      expect(['expired', 'not_found']).toContain(
+        (extended.reason as ProtocolError).code
+      )
+      expect(current).toBeUndefined()
+    }
   })
 
   it('never shortens the expiry', async () => {

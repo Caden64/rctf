@@ -299,6 +299,8 @@ export class FakeVmDriver implements VmDriver {
   failWaitReady = false
   failStop = false
   failDestroy = false
+  /** Per-id destroy failures (leaves other ids unaffected). */
+  readonly failDestroyIds = new Set<string>()
   failAdopt = false
   failIsAlive = false
   failList = false
@@ -377,6 +379,9 @@ export class FakeVmDriver implements VmDriver {
     if (gate) await gate
     if (this.destroyError) throw this.destroyError
     if (this.failDestroy) throw new Error('destroy failed')
+    if (this.failDestroyIds.has(instanceId)) {
+      throw new Error('destroy failed for instance')
+    }
     this.destroyedIds.push(instanceId)
     this.alive.delete(instanceId)
     this.handles.delete(instanceId)
