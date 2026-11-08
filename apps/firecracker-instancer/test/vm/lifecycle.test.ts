@@ -250,8 +250,9 @@ describe('handle liveness', () => {
         } as VmHandle)
       ).toBe(false)
       expect(await driver.adopt(id)).toBeUndefined()
-      // destroy must not kill a process it cannot authenticate.
-      await driver.destroy(id)
+      // destroy must not kill a process it cannot authenticate, and it must
+      // not pretend the process is gone either: storage stays in place.
+      await expect(driver.destroy(id)).rejects.toThrow(/unresolved process/)
       expect(await readStartTicks(proc.pid)).toBeDefined()
     } finally {
       try {
