@@ -239,3 +239,27 @@ export interface ControllerService {
   start(): Promise<void>
   stop(): Promise<void>
 }
+
+// ===========================================================================
+// Shared utilities
+// ===========================================================================
+
+export interface CommandResult {
+  code: number
+  stdout: string
+  stderr: string
+}
+
+/**
+ * The ONLY way privileged host commands (ip, nft, cp, mkfs, jailer, ...) are run.
+ * argv array, no shell. Tests inject a recording/failing fake.
+ */
+export interface CommandRunner {
+  run(
+    argv: readonly string[],
+    opts?: { timeoutMs?: number; stdin?: string }
+  ): Promise<CommandResult>
+}
+
+/** Injectable time source (ms since epoch) so expiry/race tests are deterministic. */
+export type Clock = () => number
