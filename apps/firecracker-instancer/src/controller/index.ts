@@ -43,9 +43,11 @@ const main = async (): Promise<void> => {
     logger.info({ signal }, 'shutting down the firecracker controller')
 
     try {
-      // Stop accepting, let in-flight create/delete bookkeeping finish, then
-      // force-close whatever is left.
-      await http.stop()
+      // Stop accepting new requests immediately, give in-flight create/delete
+      // bookkeeping a bounded time to finish, then force-close whatever is
+      // left. `http.stop()` is NOT awaited first: it only resolves once every
+      // active request is done, which would bypass the drain deadline.
+      void http.stop()
       await server.drain(30_000)
       await http.stop(true)
     } catch (err) {
