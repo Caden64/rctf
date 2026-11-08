@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  access,
+  constants,
   lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
   symlink,
@@ -85,12 +88,204 @@ const fakeNc = async (
 const fakeJqDir = async (root: string): Promise<string> => {
   const binDir = path.join(root, 'bin')
   await mkdir(binDir, { recursive: true, mode: 0o700 })
+  await installFakeJq(binDir)
+  return binDir
+}
+
+const installFakeJq = async (binDir: string): Promise<void> => {
   await writeFile(
     path.join(binDir, 'jq'),
     `#!/bin/sh\nexec ${shQuote(process.execPath)} ${shQuote(path.join(import.meta.dir, 'fake-jq.ts'))} "$@"\n`,
     { mode: 0o755 }
   )
+}
+
+/** Symlink the requested host tools into a restricted PATH directory. */
+const guestBin = async (root: string, tools: string[]): Promise<string> => {
+  const binDir = path.join(root, 'bin')
+  await mkdir(binDir, { recursive: true, mode: 0o700 })
+  for (const tool of tools) {
+    let linked = false
+    for (const dir of ['/usr/bin', '/bin', '/usr/sbin', '/sbin']) {
+      const candidate = path.join(dir, tool)
+      try {
+        await access(candidate, constants.X_OK)
+        await symlink(candidate, path.join(binDir, tool))
+        linked = true
+        break
+      } catch {
+        // try the next directory
+      }
+    }
+    if (!linked) throw new Error(`test host has no ${tool}`)
+  }
   return binDir
+}
+
+/** A fake nc that answers PUT with `token` and anything else with `document`. */
+const writeFakeNc = async (
+  root: string,
+  binDir: string,
+  responses: { token: string; document: string }
+): Promise<string> => {
+  const capture = path.join(root, 'nc-request.bin')
+  const tokenFile = path.join(root, 'nc-token-response')
+  const documentFile = path.join(root, 'nc-document-response')
+  await writeFile(tokenFile, responses.token)
+  await writeFile(documentFile, responses.document)
+  await writeFile(
+    path.join(binDir, 'nc'),
+    `#!/bin/sh
+req=$(cat)
+printf '%s\\n' "$req" >> ${shQuote(capture)}
+case "$req" in
+  "PUT "*) cat ${shQuote(tokenFile)} ;;
+  *) cat ${shQuote(documentFile)} ;;
+esac
+`,
+    { mode: 0o755 }
+  )
+  return capture
+}
+
+/** A fake curl: records argv, writes -o body, prints the configured code. */
+const fakeCurl = async (
+  root: string,
+  options: { code: string; body: string; exitCode?: number }
+): Promise<{ binDir: string; capture: string }> => {
+  const binDir = path.join(root, 'bin')
+  await mkdir(binDir, { recursive: true, mode: 0o700 })
+  const capture = path.join(root, 'curl-args')
+  const bodyFile = path.join(root, 'curl-body')
+  await writeFile(bodyFile, options.body)
+  await writeFile(
+    path.join(binDir, 'curl'),
+    `#!/bin/sh
+printf '%s\\n' "$@" > ${shQuote(capture)}
+out=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) out=$2; shift 2 ;;
+    -m|-X|-w|-H) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$out" ]; then cat ${shQuote(bodyFile)} > "$out"; fi
+printf '%s' ${shQuote(options.code)}
+exit ${options.exitCode ?? 0}
+`,
+    { mode: 0o755 }
+  )
+  return { binDir, capture }
+}
+
+const validMetadata = (overrides: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    rctf: {
+      version: 1,
+      instanceId: 'instance-1',
+      hostname: 'instance-1.fc1.example.test',
+      env: { CHALLENGE: 'web-demo' },
+      flags: [{ provider: 'main', flag: 'flag{boot-contract}' }],
+      ...overrides,
+    },
+  })
+
+const httpResponse = (body: string, status = '200 OK'): string =>
+  `HTTP/1.1 ${status}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+
+interface GuestMainOptions {
+  /** `null` makes every document GET fail with 500. */
+  document?: string | null
+  token?: string
+  withJq?: boolean
+  envFileIsDirectory?: boolean
+  extraEnv?: Record<string, string>
+}
+
+interface GuestMainResult extends ShellResult {
+  marker: string
+  runRoot: string
+  capture: string
+}
+
+/**
+ * Run the real init end to end (as a normal process, not PID 1) with faked
+ * mounts, ip, hostname, nc and jq. `.mmds-body` and flags therefore land in a
+ * temp directory while the script's control flow is unchanged.
+ */
+const runGuestMain = async (
+  root: string,
+  options: GuestMainOptions = {}
+): Promise<GuestMainResult> => {
+  const binDir = await guestBin(root, [
+    'mkdir',
+    'chmod',
+    'awk',
+    'tr',
+    'cat',
+    'sleep',
+    'date',
+    'rm',
+  ])
+  // main calls these; fakes keep the test away from real mounts and routes.
+  for (const tool of ['mount', 'ip', 'hostname']) {
+    await writeFile(path.join(binDir, tool), '#!/bin/sh\nexit 0\n', {
+      mode: 0o755,
+    })
+  }
+  if (options.withJq !== false) await installFakeJq(binDir)
+
+  const capture = await writeFakeNc(root, binDir, {
+    token:
+      options.token ?? httpResponse('token-0123456789abcdef0123456789abcdef'),
+    document:
+      options.document === null
+        ? httpResponse('no metadata', '500 Server Error')
+        : (options.document ?? validMetadata()),
+  })
+
+  const runMount = path.join(root, 'run')
+  await mkdir(runMount, { recursive: true })
+  const runRoot = path.join(runMount, 'rctf')
+  const mounts = path.join(root, 'mounts')
+  await writeFile(mounts, `none ${runMount} tmpfs rw,nosuid,nodev 0 0\n`)
+  if (options.envFileIsDirectory) {
+    await mkdir(path.join(runRoot, 'env.sh'), { recursive: true })
+  }
+
+  const marker = path.join(root, 'service-ran')
+  const service = path.join(root, 'service.sh')
+  await writeFile(
+    service,
+    `#!/bin/sh
+printf 'SERVICE-RAN\\n'
+printf 'FLAGS_DIR=%s\\n' "$RCTF_FLAGS_DIR"
+for f in "$RCTF_FLAGS_DIR"/*; do
+  [ -e "$f" ] || continue
+  printf 'FLAG-FILE=%s\\n' "\${f##*/}"
+done
+printf 'ran\\n' > ${shQuote(marker)}
+`,
+    { mode: 0o755 }
+  )
+
+  const result = await runSh(`/bin/sh ${shQuote(INIT)}`, {
+    PATH: binDir,
+    RCTF_INIT_SOURCE_ONLY: '0',
+    RCTF_RUN_MOUNT: runMount,
+    RCTF_RUN_ROOT: runRoot,
+    RCTF_PROC_MOUNTS: mounts,
+    RCTF_MMDS_HOST: '127.0.0.1',
+    RCTF_MMDS_PORT: '8080',
+    RCTF_MMDS_BODY_FILE: path.join(runRoot, '.mmds-body'),
+    RCTF_BOOT_BUDGET: '0',
+    RCTF_FETCH_TIMEOUT: '1',
+    RCTF_RETRY_INTERVAL: '0',
+    RCTF_SERVICE: service,
+    ...options.extraEnv,
+  })
+  return { ...result, marker, runRoot, capture }
 }
 
 describe('guest init: PATH', () => {
@@ -225,6 +420,350 @@ describe('guest init: nc HTTP fallback', () => {
       }
     )
     expect(result.stdout).toBe('rc=1 out=\n')
+  })
+
+  test('treats a completely empty response as a failure', async () => {
+    const root = await tempRoot('rctf-guest-status-')
+    const { binDir } = await fakeNc(root, '')
+    const result = await runSh(
+      sourceInit('printf "" | http_body; printf "rc=%s\\n" "$?"'),
+      { PATH: `${binDir}:/usr/bin:/bin` }
+    )
+    expect(result.stdout).toBe('rc=1\n')
+  })
+})
+
+describe('guest init: bounded metadata retries', () => {
+  test('retries the document GET through the whole boot budget and returns nothing', async () => {
+    const root = await tempRoot('rctf-guest-retry-')
+    const binDir = await guestBin(root, ['awk', 'tr', 'cat', 'sleep', 'date'])
+    const capture = await writeFakeNc(root, binDir, {
+      token: httpResponse('token'),
+      document: httpResponse('not-metadata', '500 Server Error'),
+    })
+    const result = await runSh(
+      sourceInit(
+        'out=$(fetch_metadata_document); rc=$?; printf "rc=%s len=%s\\n" "$rc" "${#out}"'
+      ),
+      {
+        PATH: binDir,
+        RCTF_MMDS_HOST: '127.0.0.1',
+        RCTF_MMDS_PORT: '8080',
+        // 3 / (1 + 0) = 3 rounds, no sleeping, so the test is fast and the
+        // number of requests is deterministic.
+        RCTF_BOOT_BUDGET: '3',
+        RCTF_FETCH_TIMEOUT: '1',
+        RCTF_RETRY_INTERVAL: '0',
+      }
+    )
+    expect(result.stdout).toBe('rc=1 len=0\n')
+    const requests = await readFile(capture, 'utf8')
+    const puts = requests.split('\n').filter(line => line.startsWith('PUT '))
+    const gets = requests.split('\n').filter(line => line.startsWith('GET '))
+    // The token is fetched once and reused; every round retries the document.
+    expect(puts).toHaveLength(1)
+    expect(gets).toHaveLength(3)
+  })
+
+  test('retries the token PUT when it never succeeds', async () => {
+    const root = await tempRoot('rctf-guest-retry-')
+    const binDir = await guestBin(root, ['awk', 'tr', 'cat', 'sleep', 'date'])
+    const capture = await writeFakeNc(root, binDir, {
+      token: httpResponse('denied', '403 Forbidden'),
+      document: httpResponse(validMetadata()),
+    })
+    const result = await runSh(
+      sourceInit(
+        'out=$(fetch_metadata_document); rc=$?; printf "rc=%s len=%s\\n" "$rc" "${#out}"'
+      ),
+      {
+        PATH: binDir,
+        RCTF_MMDS_HOST: '127.0.0.1',
+        RCTF_MMDS_PORT: '8080',
+        RCTF_BOOT_BUDGET: '3',
+        RCTF_FETCH_TIMEOUT: '1',
+        RCTF_RETRY_INTERVAL: '0',
+      }
+    )
+    expect(result.stdout).toBe('rc=1 len=0\n')
+    const requests = await readFile(capture, 'utf8')
+    const puts = requests.split('\n').filter(line => line.startsWith('PUT '))
+    const gets = requests.split('\n').filter(line => line.startsWith('GET '))
+    expect(puts).toHaveLength(3)
+    // No token means the document is never requested.
+    expect(gets).toHaveLength(0)
+  })
+})
+
+describe('guest init: curl transport', () => {
+  test('uses the configured MMDS port for both the token and document URLs', async () => {
+    const root = await tempRoot('rctf-guest-curl-')
+    const { binDir, capture } = await fakeCurl(root, {
+      code: '200',
+      body: 'token-1',
+    })
+    const token = await runSh(sourceInit('fetch_token'), {
+      PATH: `${binDir}:/usr/bin:/bin`,
+      RCTF_MMDS_HOST: '127.0.0.1',
+      RCTF_MMDS_PORT: '8123',
+      RCTF_MMDS_BODY_FILE: path.join(root, 'body'),
+    })
+    expect(token.code).toBe(0)
+    expect(token.stdout).toBe('token-1')
+    const tokenArgs = await readFile(capture, 'utf8')
+    expect(tokenArgs).toContain('http://127.0.0.1:8123/latest/api/token')
+
+    const metadataRoot = await tempRoot('rctf-guest-curl-')
+    const metadataCurl = await fakeCurl(metadataRoot, {
+      code: '200',
+      body: validMetadata(),
+    })
+    const metadata = await runSh(sourceInit('fetch_metadata token-1'), {
+      PATH: `${metadataCurl.binDir}:/usr/bin:/bin`,
+      RCTF_MMDS_HOST: '127.0.0.1',
+      RCTF_MMDS_PORT: '8124',
+      RCTF_MMDS_BODY_FILE: path.join(metadataRoot, 'body'),
+    })
+    expect(metadata.code).toBe(0)
+    expect(metadata.stdout).toBe(validMetadata())
+    const metadataArgs = await readFile(metadataCurl.capture, 'utf8')
+    expect(metadataArgs).toContain('http://127.0.0.1:8124/')
+  })
+
+  test('requires exactly HTTP 200, not just any non-error status', async () => {
+    for (const code of ['204', '301', '500']) {
+      const root = await tempRoot('rctf-guest-curl-')
+      const { binDir } = await fakeCurl(root, {
+        code,
+        body: 'not-a-document',
+      })
+      const bodyFile = path.join(root, 'body')
+      const result = await runSh(
+        sourceInit(
+          'out=$(fetch_metadata token); rc=$?; printf "rc=%s out=%s\\n" "$rc" "$out"'
+        ),
+        {
+          PATH: `${binDir}:/usr/bin:/bin`,
+          RCTF_MMDS_HOST: '127.0.0.1',
+          RCTF_MMDS_PORT: '8080',
+          RCTF_MMDS_BODY_FILE: bodyFile,
+        }
+      )
+      expect(result.stdout).toBe('rc=1 out=\n')
+      // A rejected response body never lingers on tmpfs.
+      await expect(lstat(bodyFile)).rejects.toThrow()
+    }
+  })
+
+  test('fails closed when curl itself fails', async () => {
+    const root = await tempRoot('rctf-guest-curl-')
+    const { binDir } = await fakeCurl(root, {
+      code: '000',
+      body: '',
+      exitCode: 7,
+    })
+    const result = await runSh(
+      sourceInit(
+        'out=$(fetch_token); rc=$?; printf "rc=%s out=%s\\n" "$rc" "$out"'
+      ),
+      {
+        PATH: `${binDir}:/usr/bin:/bin`,
+        RCTF_MMDS_HOST: '127.0.0.1',
+        RCTF_MMDS_PORT: '8080',
+        RCTF_MMDS_BODY_FILE: path.join(root, 'body'),
+      }
+    )
+    expect(result.stdout).toBe('rc=1 out=\n')
+  })
+})
+
+describe('guest init: metadata schema', () => {
+  const violations: [string, string][] = [
+    ['version is not 1', validMetadata({ version: 2 })],
+    [
+      'version is missing',
+      JSON.stringify({
+        rctf: { instanceId: 'i', hostname: 'h', env: {}, flags: [] },
+      }),
+    ],
+    [
+      'instanceId is missing',
+      JSON.stringify({
+        rctf: { version: 1, hostname: 'h', env: {}, flags: [] },
+      }),
+    ],
+    ['instanceId is empty', validMetadata({ instanceId: '' })],
+    ['instanceId is not a string', validMetadata({ instanceId: 7 })],
+    [
+      'hostname is missing',
+      JSON.stringify({
+        rctf: { version: 1, instanceId: 'i', env: {}, flags: [] },
+      }),
+    ],
+    ['hostname is empty', validMetadata({ hostname: '' })],
+    ['env is an array', validMetadata({ env: [] })],
+    [
+      'env is missing',
+      JSON.stringify({
+        rctf: { version: 1, instanceId: 'i', hostname: 'h', flags: [] },
+      }),
+    ],
+    ['flags is an object', validMetadata({ flags: { main: 'x' } })],
+    [
+      'flags is missing',
+      JSON.stringify({
+        rctf: { version: 1, instanceId: 'i', hostname: 'h', env: {} },
+      }),
+    ],
+    ['a flag has no provider', validMetadata({ flags: [{ flag: 'x' }] })],
+    ['a flag has no value', validMetadata({ flags: [{ provider: 'main' }] })],
+    [
+      'a flag value is not a string',
+      validMetadata({ flags: [{ provider: 'main', flag: 1 }] }),
+    ],
+    ['the document is malformed JSON', '{"rctf":'],
+  ]
+
+  test('rejects every incomplete or malformed document', async () => {
+    const root = await tempRoot('rctf-guest-schema-')
+    const binDir = await fakeJqDir(root)
+    for (const [name, document] of violations) {
+      const result = await runSh(
+        sourceInit('validate_metadata "$DOC"; printf "rc=%s\\n" "$?"'),
+        {
+          PATH: `${binDir}:/usr/bin:/bin`,
+          DOC: document,
+        }
+      )
+      expect({ name, rc: result.stdout.trim() }).toEqual({
+        name,
+        rc: 'rc=1',
+      })
+      // Never echo the document (it may carry flags) or jq diagnostics.
+      expect(result.stdout).not.toContain('flag{boot-contract}')
+      expect(result.stderr).toBe('')
+    }
+  })
+
+  test('accepts the full document and an empty flags array', async () => {
+    const root = await tempRoot('rctf-guest-schema-')
+    const binDir = await fakeJqDir(root)
+    for (const document of [validMetadata(), validMetadata({ flags: [] })]) {
+      const result = await runSh(
+        sourceInit('validate_metadata "$DOC"; printf "rc=%s\\n" "$?"'),
+        {
+          PATH: `${binDir}:/usr/bin:/bin`,
+          DOC: document,
+        }
+      )
+      expect(result.stdout.trim()).toBe('rc=0')
+      expect(result.stderr).toBe('')
+    }
+  })
+})
+
+describe('guest init: boot contract is fail-closed', () => {
+  test('starts the service for a flagless challenge (empty flags array)', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse(validMetadata({ flags: [] })),
+    })
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain('SERVICE-RAN')
+    await expect(readFile(result.marker, 'utf8')).resolves.toBe('ran\n')
+    const flags = path.join(result.runRoot, 'flags')
+    expect((await stat(flags)).isDirectory()).toBe(true)
+    expect(await readdir(flags)).toEqual([])
+  })
+
+  test('does not start the service when the document GET fails through every retry', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, { document: null })
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).not.toContain('SERVICE-RAN')
+    expect(result.stderr).toContain('could not fetch MMDS metadata')
+    await expect(lstat(result.marker)).rejects.toThrow()
+  })
+
+  test('does not start the service when the document is malformed JSON', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse('{"rctf":'),
+    })
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).not.toContain('SERVICE-RAN')
+    expect(result.stderr).toContain('does not match the v1 schema')
+    await expect(lstat(result.marker)).rejects.toThrow()
+  })
+
+  test('does not start the service on a schema violation, and never logs the document', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse(
+        validMetadata({
+          version: 2,
+          flags: [{ provider: 'main', flag: 'flag{secret-in-document}' }],
+        })
+      ),
+    })
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).not.toContain('SERVICE-RAN')
+    expect(result.stderr).toContain('does not match the v1 schema')
+    expect(result.stdout).not.toContain('flag{secret-in-document}')
+    expect(result.stderr).not.toContain('flag{secret-in-document}')
+    await expect(lstat(result.marker)).rejects.toThrow()
+  })
+
+  test('does not start the service when jq is missing', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse(validMetadata()),
+      withJq: false,
+    })
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).not.toContain('SERVICE-RAN')
+    expect(result.stderr).toContain('jq is required')
+    await expect(lstat(result.marker)).rejects.toThrow()
+  })
+
+  test('does not start the service when the environment cannot be prepared', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse(
+        validMetadata({
+          flags: [{ provider: 'main', flag: 'flag{env-failure}' }],
+        })
+      ),
+      envFileIsDirectory: true,
+    })
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).not.toContain('SERVICE-RAN')
+    expect(result.stderr).toContain('MMDS boot contract failed')
+    await expect(lstat(result.marker)).rejects.toThrow()
+    // The flag was written before the failure, but diagnostics stay clean.
+    expect(result.stdout).not.toContain('flag{env-failure}')
+    expect(result.stderr).not.toContain('flag{env-failure}')
+  })
+
+  test('writes flags and environment before starting the service', async () => {
+    const root = await tempRoot('rctf-guest-main-')
+    const result = await runGuestMain(root, {
+      document: httpResponse(
+        validMetadata({
+          env: { CHALLENGE: 'web-demo' },
+          flags: [{ provider: 'main', flag: 'flag{delivered}' }],
+        })
+      ),
+    })
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain('SERVICE-RAN')
+    expect(result.stdout).toContain('FLAG-FILE=main')
+    expect(
+      await readFile(path.join(result.runRoot, 'flags', 'main'), 'utf8')
+    ).toBe('flag{delivered}')
+    expect(await readFile(path.join(result.runRoot, 'env.sh'), 'utf8')).toBe(
+      "export CHALLENGE='web-demo'\n"
+    )
   })
 })
 
@@ -470,6 +1009,54 @@ describe('guest init: SERVICE is a legitimate challenge variable', () => {
   })
 })
 
+/** Minimal ELF header bytes with a chosen class and e_machine. */
+const elfBinary = (
+  machine: number,
+  options: { bits?: 32 | 64 } = {}
+): Buffer => {
+  const bytes = Buffer.alloc(64)
+  bytes.write('\x7fELF', 0, 'latin1')
+  bytes[4] = (options.bits ?? 64) === 64 ? 2 : 1 // EI_CLASS
+  bytes[5] = 1 // EI_DATA: little-endian
+  bytes[6] = 1 // EI_VERSION
+  bytes.writeUInt16LE(machine, 18) // e_machine
+  return bytes
+}
+
+interface BuilderRun extends ShellResult {
+  out: string
+}
+
+/** Run only the builder's jq check path with a fake mkfs.ext4. */
+const runBuilderNegative = async (
+  root: string,
+  jqBytes: Buffer,
+  extraArgs = ''
+): Promise<BuilderRun> => {
+  const caseRoot = await mkdtemp(path.join(root, 'case-'))
+  const source = path.join(caseRoot, 'source')
+  await mkdir(path.join(source, 'etc'), { recursive: true })
+  await writeFile(path.join(source, 'etc', 'hostname'), 'guest\n')
+  const fakeBin = path.join(caseRoot, 'bin')
+  await mkdir(fakeBin, { recursive: true, mode: 0o700 })
+  await writeFile(
+    path.join(fakeBin, 'mkfs.ext4'),
+    `#!/bin/sh
+if [ "$1" = "-h" ]; then echo " -d"; exit 0; fi
+exit 0
+`,
+    { mode: 0o755 }
+  )
+  const jqFile = path.join(caseRoot, 'jq-binary')
+  await writeFile(jqFile, jqBytes)
+  const out = path.join(caseRoot, 'rootfs.ext4')
+  const result = await runSh(
+    `${shQuote(BUILD)} --dir ${shQuote(source)} --out ${shQuote(out)} --jq ${shQuote(jqFile)} ${extraArgs}`,
+    { PATH: `${fakeBin}:/usr/bin:/bin` }
+  )
+  return { ...result, out }
+}
+
 describe('guest build-rootfs', () => {
   test('never writes through a source symlink into the host', async () => {
     const root = await tempRoot('rctf-guest-build-')
@@ -510,7 +1097,8 @@ exit 0
       { mode: 0o755 }
     )
     const jqFile = path.join(root, 'jq-binary')
-    await writeFile(jqFile, 'fake jq bytes\n')
+    const jqBytes = elfBinary(62)
+    await writeFile(jqFile, jqBytes)
     const out = path.join(root, 'rootfs.ext4')
 
     const result = await runSh(
@@ -531,13 +1119,51 @@ exit 0
     expect(await readFile(path.join(capture, 'init'), 'utf8')).toBe(
       await readFile(INIT, 'utf8')
     )
-    expect(await readFile(path.join(capture, 'jq'), 'utf8')).toBe(
-      'fake jq bytes\n'
+    expect((await readFile(path.join(capture, 'jq'))).equals(jqBytes)).toBe(
+      true
     )
     await expect(
       readFile(path.join(capture, 'usr', 'bin', 'jq'))
     ).rejects.toThrow()
     const args = await readFile(mkfsArgs, 'utf8')
     expect(args).toContain('-d\n')
+  })
+
+  test('rejects a jq that is not an ELF binary', async () => {
+    const root = await tempRoot('rctf-guest-build-')
+    for (const jqBytes of [
+      Buffer.from('#!/bin/sh\nexec jq "$@"\n'),
+      Buffer.alloc(8),
+    ]) {
+      const result = await runBuilderNegative(root, jqBytes)
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain('not an ELF binary')
+      await expect(lstat(result.out)).rejects.toThrow()
+    }
+  })
+
+  test('rejects a 32-bit jq', async () => {
+    const root = await tempRoot('rctf-guest-build-')
+    const result = await runBuilderNegative(root, elfBinary(62, { bits: 32 }))
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain('32-bit ELF')
+  })
+
+  test('rejects a jq built for the wrong guest architecture', async () => {
+    const root = await tempRoot('rctf-guest-build-')
+    const result = await runBuilderNegative(root, elfBinary(183))
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain('wrong guest architecture')
+  })
+
+  test('accepts a matching architecture when --arch says so', async () => {
+    const root = await tempRoot('rctf-guest-build-')
+    const result = await runBuilderNegative(
+      root,
+      elfBinary(183),
+      '--arch aarch64'
+    )
+    expect(result.code).toBe(0)
+    expect(result.stderr).toBe('')
   })
 })

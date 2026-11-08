@@ -65,6 +65,34 @@ const shQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
 if (filter === '.') {
   if (exitStatus && (doc === null || doc === false)) process.exit(1)
   process.stdout.write(JSON.stringify(doc))
+} else if (filter.includes('.rctf.version == 1')) {
+  // Mirrors init's METADATA_SCHEMA filter: version 1, non-empty string
+  // instanceId/hostname, env object, flags array of {provider, flag} strings.
+  const rawRctf = asRecord(doc).rctf
+  const record =
+    typeof rawRctf === 'object' && rawRctf !== null && !Array.isArray(rawRctf)
+      ? (rawRctf as Record<string, unknown>)
+      : undefined
+  const valid =
+    record !== undefined &&
+    record.version === 1 &&
+    typeof record.instanceId === 'string' &&
+    record.instanceId.length > 0 &&
+    typeof record.hostname === 'string' &&
+    record.hostname.length > 0 &&
+    typeof record.env === 'object' &&
+    record.env !== null &&
+    !Array.isArray(record.env) &&
+    Array.isArray(record.flags) &&
+    record.flags.every(
+      entry =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as Record<string, unknown>).provider === 'string' &&
+        typeof (entry as Record<string, unknown>).flag === 'string'
+    )
+  if (exitStatus && !valid) process.exit(1)
+  process.stdout.write(valid ? 'true\n' : 'false\n')
 } else if (filter.includes('keys[]')) {
   for (const key of Object.keys(asRecord(rctf.env))) {
     if (filter.includes('startswith("RCTF_")') && !key.startsWith('RCTF_')) {

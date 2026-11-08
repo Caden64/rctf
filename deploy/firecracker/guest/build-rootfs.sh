@@ -10,11 +10,19 @@
 #   --size <size>   image size passed to truncate (default: 512M)
 #   --init <file>   init to install as /rctf/init (default: ./init next to this script)
 #   --jq <file>     copy this jq binary to /rctf/jq in the image
+#   --arch <arch>   guest architecture for the --jq ELF check (default: x86_64)
 #   --no-init       do not install an init
 #
+# The --jq binary is checked before it is installed: ELF magic, 64-bit,
+# little-endian and an ELF machine type matching --arch (x86_64|aarch64).
+# This catches a wrong-architecture or non-ELF jq without executing it. What it
+# cannot check unprivileged (no chroot, no execution): that the guest rootfs
+# has the dynamic loader and shared libraries a dynamically-linked jq needs.
+# Install a static jq when the source image is not known to provide them.
+#
 # Requirements (all unprivileged): a container engine for --image (docker or
-# podman), tar, truncate, realpath and e2fsprogs >= 1.47 (mkfs.ext4 -d). No loop
-# mount, no chroot, no root.
+# podman), tar, truncate, realpath, od and e2fsprogs >= 1.47 (mkfs.ext4 -d). No
+# loop mount, no chroot, no root.
 #
 # SECURITY: only run this builder as root on sources you fully trust. It
 # extracts/copies a source tree and only ever writes the fixed set of staging
@@ -29,6 +37,7 @@ out=rootfs.ext4
 size=512M
 init_file=$script_dir/init
 jq_file=
+arch=x86_64
 install_init=1
 
 usage() {
@@ -72,6 +81,11 @@ while [ $# -gt 0 ]; do
       jq_file=$2
       shift 2
       ;;
+    --arch)
+      [ $# -ge 2 ] || die "--arch needs a value"
+      arch=$2
+      shift 2
+      ;;
     --no-init)
       install_init=0
       shift
@@ -93,10 +107,17 @@ if [ -z "$source_image" ] && [ -z "$source_dir" ]; then
   die "one of --image or --dir is required (try --help)"
 fi
 
+case "$arch" in
+  x86_64) expected_machine=62 ;;
+  aarch64) expected_machine=183 ;;
+  *) die "unsupported --arch: $arch (expected x86_64 or aarch64)" ;;
+esac
+
 command -v mkfs.ext4 >/dev/null 2>&1 ||
   die "mkfs.ext4 not found (install e2fsprogs)"
 command -v truncate >/dev/null 2>&1 || die "truncate not found (coreutils)"
 command -v realpath >/dev/null 2>&1 || die "realpath not found (coreutils)"
+command -v od >/dev/null 2>&1 || die "od not found (coreutils or busybox)"
 mkfs.ext4 -h 2>&1 | grep -q -- '-d' ||
   die "this mkfs.ext4 lacks -d; e2fsprogs >= 1.47 is required"
 
@@ -184,6 +205,49 @@ install_into_staging() {
   esac
 }
 
+# check_guest_elf <file> <label>
+#
+# Fail closed on anything that cannot be a runnable guest binary of the
+# requested architecture: not an ELF, not 64-bit, not little-endian, or an
+# e_machine that does not match --arch. Unprivileged builds cannot execute the
+# guest binary or inspect the guest's /lib, so missing dynamic libraries or a
+# missing interpreter are documented as unverified.
+check_guest_elf() {
+  file=$1
+  label=$2
+  [ -f "$file" ] || die "$label not found: $file"
+  [ -r "$file" ] || die "$label is not readable: $file"
+  report=$(od -An -tu1 -N20 "$file" 2>/dev/null | awk '
+    { for (i = 1; i <= NF; i++) b[n++] = $i }
+    END {
+      if (n < 20) { print "short"; exit }
+      if (b[0] != 127 || b[1] != 69 || b[2] != 76 || b[3] != 70) {
+        print "not-elf"; exit
+      }
+      if (b[4] != 2) { print "not-elf64"; exit }
+      if (b[5] != 1) { print "not-little-endian"; exit }
+      print "machine:" (b[18] + b[19] * 256)
+    }')
+  case "$report" in
+    "machine:$expected_machine") ;;
+    machine:*)
+      die "$label is built for ELF machine ${report#machine:}, but --arch $arch expects $expected_machine (wrong guest architecture)"
+      ;;
+    short | not-elf)
+      die "$label is not an ELF binary (a shell script or wrapper cannot be installed as /rctf/jq)"
+      ;;
+    not-elf64)
+      die "$label is a 32-bit ELF; the guest image expects a 64-bit binary"
+      ;;
+    not-little-endian)
+      die "$label is not little-endian; the guest image expects a little-endian binary"
+      ;;
+    *)
+      die "could not verify $label as an ELF binary for --arch $arch"
+      ;;
+  esac
+}
+
 if [ "$install_init" = 1 ] || [ -n "$jq_file" ]; then
   prepare_rctf_dir
 fi
@@ -193,6 +257,7 @@ if [ "$install_init" = 1 ]; then
 fi
 
 if [ -n "$jq_file" ]; then
+  check_guest_elf "$jq_file" "jq binary (--jq)"
   install_into_staging "$jq_file" "$root/rctf/jq" 0755
 fi
 

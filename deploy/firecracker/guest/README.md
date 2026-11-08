@@ -76,6 +76,11 @@ reachable through the host network stack.
 }
 ```
 
+- `version` must be exactly `1`, `instanceId` and `hostname` must be
+  non-empty strings, `env` must be an object and `flags` must be an array of
+  `{ "provider": string, "flag": string }` objects. An **empty** `flags` array
+  is valid: flagless challenges boot normally. `init` validates the whole
+  document before it uses any of it.
 - `env` is non-secret and is exported to the service. Keys beginning with
   `RCTF_` are reserved for init: they are skipped (and logged) so challenge
   config can never spoof `RCTF_FLAGS_DIR`/`RCTF_INSTANCE_ID`/`RCTF_HOSTNAME`.
@@ -83,18 +88,50 @@ reachable through the host network stack.
   such as `FLAGS_DIR` cannot overwrite init's own state either.
 - `flags` are secrets. `init` writes each one to
   `/run/rctf/flags/<sanitised provider>` with mode 0400 on a tmpfs, and never
-  to the ext4 rootfs. Provider names are sanitised (`[^A-Za-z0-9._-]` → `_`);
-  on collision the index is appended (`name.<index>`) so two providers can
-  never overwrite each other, and a name that sanitises to empty is rejected
-  (the service is not started). Each value is written with `jq -j` by index, so
-  backslashes, tabs, newlines, quotes and unicode survive byte-for-byte. The
-  service reads the file/directory from `$RCTF_FLAGS_DIR`.
-- Before writing any flag, `init` checks `/proc/mounts` that `/run` really is a
-  tmpfs. If it is not, no flags are written and the service is **not** started
-  (`init` exits non-zero) instead of leaking flags onto the rootfs.
+  to the ext4 rootfs. Provider names are sanitised (`[^A-Za-z0-9._-]` → `_`).
+  Each value is written with `jq -j` by index, so backslashes, tabs, newlines,
+  quotes and unicode survive byte-for-byte. The service reads the
+  file/directory from `$RCTF_FLAGS_DIR`.
+- Flag collision fallback is order-dependent: the first provider that claims a
+  sanitised name gets `<name>`, and every later provider with the same
+  sanitised name gets `<name>.<index>` (its index in the `flags` array); if
+  that is also taken, `<name>.<index>.<n>` for the smallest free `n`. The
+  suffix depends on the order of the `flags` array, so challenges must use
+  distinct providers rather than rely on it. A provider that sanitises to
+  empty is rejected (the service is not started).
 - The document is delivered over the Firecracker API (`PUT /mmds`) only. The
   driver never logs it, never writes it to disk, and never puts it on the
-  kernel command line or a drive.
+  kernel command line or a drive. `init` never logs document contents or jq
+  diagnostics derived from it.
+
+### Fail-closed boot
+
+Before writing any flag, `init` checks `/proc/mounts` that `/run` really is a
+tmpfs. If it is not, no flags are written and the service is **not** started.
+
+The metadata phase is mandatory and fail-closed. `init`:
+
+1. requires `jq` (the bundled `/rctf/jq` or one on `PATH`) — a missing `jq` is
+   fatal, not a skipped feature,
+2. retries the token `PUT` and the document `GET` within one boot budget
+   (`RCTF_BOOT_BUDGET`, default 45 s; each request is bounded by
+   `RCTF_FETCH_TIMEOUT`, default 3 s, with `RCTF_RETRY_INTERVAL`, default 1 s),
+3. checks every fetch's exit status and only accepts an HTTP `200` with a
+   non-empty body,
+4. requires valid JSON matching the complete schema above,
+5. writes every flag and prepares the service environment; either step
+   failing is fatal.
+
+Any failure exits PID 1 non-zero. With `panic=1 reboot=k` that produces the
+documented panic/reboot loop, and the instance then fails readiness through
+the boot timeout or VM-death detection. That is the intended failure mode: a
+guest that cannot get its metadata never reports a flagless challenge as
+running.
+
+The budget default is below the driver's default `bootTimeoutSeconds` (60), so
+a metadata failure surfaces as a readiness timeout rather than racing the host
+deadline. Keep `RCTF_BOOT_BUDGET` below the configured boot timeout if you
+change either.
 
 ### Service
 
@@ -113,9 +150,11 @@ Then it `exec`s the first of:
 5. `/bin/sh`.
 
 `init` requires `jq` in the image (see the builder's `--jq` option). Without
-it, the service still starts but flags cannot be parsed. `nc` is used for MMDS
-unless `curl` is present; the `nc` path builds a strict HTTP/1.1 request with
-real CRLF header terminators and only accepts a `200` status line.
+it the service is not started at all: the metadata document cannot be
+validated. `nc` is used for MMDS unless `curl` is present; both transports
+build a strict request (real CRLF header terminators) and only accept an HTTP
+`200` with a non-empty body, and both use the configured MMDS host and port
+(`RCTF_MMDS_HOST`, `RCTF_MMDS_PORT`).
 
 ## Kernel requirements
 
@@ -156,8 +195,18 @@ never to run it:
 
 The script installs `init` as `/rctf/init` and creates `/proc`, `/sys`,
 `/dev`, `/run`, `/tmp` and `/etc`. It needs e2fsprogs >= 1.47 for `mkfs.ext4
--d`, plus `truncate`, `realpath` and `tar`. No `sudo`, `losetup`, `mount` or
-chroot is used.
+-d`, plus `truncate`, `realpath`, `od` and `tar`. No `sudo`, `losetup`,
+`mount` or chroot is used.
+
+A `--jq` binary is verified before installation: it must be an ELF file, 64-bit,
+little-endian, with an `e_machine` matching `--arch` (`x86_64` default, or
+`aarch64`). This catches a shell wrapper, a truncated download, a 32-bit build
+or a binary for the wrong guest architecture without executing it. What the
+builder cannot check unprivileged is the guest's ability to _load_ the binary:
+a dynamically linked jq needs the guest's dynamic loader and shared libraries
+(the source image may not provide them) and the builder never chroots or runs
+guest binaries. Prefer a static jq when building from a minimal image; if you
+use a foreign-arch build, pass `--arch aarch64` and boot an aarch64 kernel.
 
 Installs go **only** to `/rctf/init` and `/rctf/jq` (never through
 source-controlled paths like `/sbin/init`). Any `/rctf` entry in the copied
@@ -183,22 +232,25 @@ Image layout:
   rootfs.ext4
 ```
 
-Inside the rootfs, `/app/start` is an executable served as PID 1 by `init`:
+Inside the rootfs, `/app/start` is an executable served as PID 1 by `init`.
+The document root and the flag copy live on the tmpfs at `/run`, never on the
+writable rootfs:
 
 ```sh
 #!/bin/sh
-# Very small static HTTP service: expose the flag on :8080.
+# Very small static HTTP service: expose the flag on :8080 from a tmpfs copy.
 set -eu
-mkdir -p /www
-cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
-chmod 0644 /www/flag.txt
-exec httpd -f -p 8080 -h /www
+www=/run/rctf/www
+mkdir -p "$www"
+cp "$RCTF_FLAGS_DIR/main" "$www/flag.txt"
+chmod 0644 "$www/flag.txt"
+exec httpd -f -p 8080 -h "$www"
 ```
 
 The challenge config then uses `image: web-demo`, `readiness: { kind: "tcp",
 port: 8080 }` (or an HTTP probe of `/flag.txt`) and one `expose` entry for
-guest port 8080. `init`'s MMDS loop starts the service only after flags are
-written, so the port opens with the flag already available.
+guest port 8080. `init`'s metadata phase is mandatory and finishes before the
+service is exec'd, so the port opens with the flag already available.
 
 ## Security notes
 
@@ -217,9 +269,13 @@ written, so the port opens with the flag already available.
 - `mode: "direct"` skips all of that (no chroot/uid/cgroup/pid ns) and is for
   development only; the driver logs a prominent warning and you should never
   use it in production.
-- Flags exist only in the request buffer, Firecracker's MMDS, and the guest's
-  tmpfs. They are never on a kernel command line, a drive, a host file, or an
-  agent log.
+- **The driver's guarantee:** metadata is delivered through MMDS only; the
+  driver never logs it, never writes it to a host file, and the reference
+  `init` writes flags only to the verified tmpfs. The backend cannot prevent
+  guest code from copying a flag to its own writable rootfs: the instance
+  rootfs is a host-side copy under `runDir`, so challenge services must keep
+  any flag copies on tmpfs (as the sample does) and never write them to `/`
+  or another disk-backed path.
 
 ## Verification status
 
@@ -240,10 +296,15 @@ Covered by the automated tests in
 - idempotent stop/destroy, canonical (realpath) binary/jail layout,
 - readiness (TCP/HTTP, timeout, abort, VM death, probe-succeeded-then-died),
   and API socket readiness as a successful connect rather than file existence,
-- guest init: strict CRLF HTTP fallback and 200-only bodies, tmpfs check
-  before flags, byte-exact flag files and collision naming,
-- `build-rootfs.sh`: no writes through source-controlled symlinks and only
-  `/rctf/init` + `/rctf/jq`.
+- guest init: strict CRLF HTTP fallback and 200-only bodies (empty response is
+  a failure), tmpfs check before flags, byte-exact flag files and collision
+  naming, bounded token/document retries, malformed JSON, missing jq, schema
+  violations, env-generation failure never starting the service, empty `flags`
+  array still starting it, and curl using the configured MMDS port with an
+  exact-200 requirement,
+- `build-rootfs.sh`: no writes through source-controlled symlinks, only
+  `/rctf/init` + `/rctf/jq`, and the `--jq` ELF magic/class/endianness/machine
+  check against `--arch`.
 
 **Verified against the real thing** (unprivileged, `../smoke/`, Firecracker v1.17.0, kernel 6.1.155,
 busybox 1.35.0, static jq): a real KVM boot of this `init` and of an image produced by
