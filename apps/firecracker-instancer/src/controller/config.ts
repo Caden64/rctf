@@ -68,10 +68,32 @@ export const controllerConfigSchema = z.object({
    */
   maxClockSkewSeconds: z.optional(z.prefault(z.int(), 10)),
   /**
+   * Clock samples whose round-trip time exceeds this are discarded (an
+   * asymmetric/slow response cannot produce a trustworthy skew estimate).
+   * A host with no good sample takes no new placements.
+   */
+  clockMaxRttSeconds: z.optional(z.prefault(z.number(), 2)),
+  /**
+   * A clock sample older than this is stale: the host takes no new placements
+   * (existing instances keep running with the stored estimate).
+   */
+  clockSampleMaxAgeSeconds: z.optional(z.prefault(z.number(), 60)),
+  /**
    * Optional hard cap on an instance's total lifetime (seconds from creation).
    * Extends are clamped to `createdAt + maxLifetimeSeconds`.
+   *
+   * GRANDFATHERED: lowering the cap across a restart applies to new creates and
+   * to future extends, but never shortens an instance already created under a
+   * larger cap. Extends leave such a deadline unchanged; new creates get the
+   * new, lower cap.
    */
   maxLifetimeSeconds: z.optional(z.int()),
+  /**
+   * Upper bound on controller shutdown: loops stop scheduling immediately and
+   * in-flight ticks are awaited concurrently until this deadline, after which
+   * SQLite is closed (late tick writes are harmless).
+   */
+  shutdownTimeoutSeconds: z.optional(z.prefault(z.number(), 10)),
 })
 export type ControllerConfig = z.output<typeof controllerConfigSchema>
 

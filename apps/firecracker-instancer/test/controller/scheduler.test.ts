@@ -20,6 +20,9 @@ const host = (id: string, overrides: Partial<HostRecord> = {}): HostRecord => ({
   createdAtMs: 0,
   reportedCapacity: null,
   clockSkewMs: 0,
+  clockRttMs: 0,
+  clockSampledAtMs: 1000,
+  clockState: 'valid',
   ...overrides,
 })
 
@@ -116,6 +119,43 @@ describe('scheduler', () => {
     expect(message).toContain('no capacity')
     expect(message).toContain('instance slots')
     expect(message).not.toContain('http://')
+  })
+
+  test('requires a valid, fresh clock sample for placement', () => {
+    const unknown = candidate(
+      'unknown',
+      {},
+      { record: { clockState: 'unknown', clockSampledAtMs: null } }
+    )
+    expect(isPlaceable(unknown)).toBe(false)
+    expect(describeNoCapacity([unknown], request, overcommit)).toContain(
+      'clock sample'
+    )
+
+    const stale = candidate(
+      'stale',
+      {},
+      { record: { clockState: 'stale', clockSampledAtMs: 1000 } }
+    )
+    expect(isPlaceable(stale)).toBe(false)
+
+    const old = candidate(
+      'old',
+      {},
+      { record: { clockState: 'valid', clockSampledAtMs: 1000 } }
+    )
+    const fresh: PlacementCandidate = {
+      ...old,
+      nowMs: 7000,
+      clockSampleMaxAgeMs: 5000,
+    }
+    expect(isPlaceable(fresh)).toBe(false)
+    const withinAge: PlacementCandidate = {
+      ...old,
+      nowMs: 6000,
+      clockSampleMaxAgeMs: 5000,
+    }
+    expect(isPlaceable(withinAge)).toBe(true)
   })
 
   test('excludes hosts beyond the maximum clock skew with a clear message', () => {

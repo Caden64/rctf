@@ -128,7 +128,7 @@ describe('reaper vs extend', () => {
     }
   })
 
-  test('the reaper treats a missing instance as confirmed teardown', async () => {
+  test('the reaper treats a missing instance as confirmed teardown (tombstone written)', async () => {
     const { service, agent, clock, timers } = setup()
     await service.start()
     try {
@@ -136,18 +136,68 @@ describe('reaper vs extend', () => {
         makeCreateRequest('team-1', { timeoutMilliseconds: 1000 })
       )
       const id = [...agent.instances.keys()][0]!
-      // The VM vanished but the agent reports not_found on DELETE.
+      // The VM vanished and the agent answers 404 for DELETE, after writing
+      // its durable fence.
       agent.forceDrop(id)
       agent.deleteMissingMode = 'not_found'
 
       clock.t += 1000
       await timers.trigger(1)
       expect(agent.deleteCalls).toContain(id)
+      // A 404 is confirmation exactly because the agent wrote the tombstone.
+      expect(agent.isTombstoned(id)).toBe(true)
       const details = await service.get({
         teamId: 'team-1',
         challengeIntegrationId: 'chal-1',
       })
       expect(details.status).toBe('stopped')
+    } finally {
+      await service.stop()
+    }
+  })
+
+  test('a DELETE answering 410/expired never frees the reaped row', async () => {
+    const { service, agent, clock, timers } = setup()
+    await service.start()
+    try {
+      await service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 1000 })
+      )
+      const id = [...agent.instances.keys()][0]!
+      // 410/expired: the agent writes its tombstone but does NOT confirm the
+      // teardown (only HTTP 2xx/404 do).
+      agent.deleteErrorMode = 'expired'
+
+      clock.t += 1000
+      await timers.trigger(1)
+      expect(agent.deleteCalls).toContain(id)
+      expect(agent.isTombstoned(id)).toBe(false)
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopping')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(1)
+      // The VM is still there too: nothing was torn down on this answer.
+      expect(agent.instances.has(id)).toBe(true)
+
+      // Once the agent confirms (the reconciler retries deleting rows), the
+      // row and reservation are released.
+      agent.deleteErrorMode = 'none'
+      await timers.trigger(2)
+      expect(
+        (
+          await service.get({
+            teamId: 'team-1',
+            challengeIntegrationId: 'chal-1',
+          })
+        ).status
+      ).toBe('stopped')
+      expect((await service.listHosts())[0]!.reserved.instances).toBe(0)
+      expect(agent.isTombstoned(id)).toBe(true)
     } finally {
       await service.stop()
     }

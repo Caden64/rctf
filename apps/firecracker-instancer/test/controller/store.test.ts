@@ -1,7 +1,11 @@
 import { Database } from 'bun:sqlite'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { ProtocolError } from '@rctf/firecracker-protocol'
-import { Store, type InstanceRecord } from '../../src/controller/store'
+import {
+  Store,
+  StoreClosedError,
+  type InstanceRecord,
+} from '../../src/controller/store'
 import { cleanupDir, databasePath, testDir } from './helpers'
 
 const dirs: string[] = []
@@ -31,6 +35,7 @@ const instance = (overrides: Partial<InstanceRecord> = {}): InstanceRecord => ({
   expiresAtMs: 10_000,
   createdAtMs: 1000,
   updatedAtMs: 1000,
+  revision: 0,
   message: null,
   agentExpirySynced: true,
   expose: [{ kind: 'http', hostPrefix: 'chal', port: 8080, title: 'Web' }],
@@ -135,7 +140,7 @@ describe('store', () => {
     const db = new Database(path, { readonly: true })
     const migrations = db.query('SELECT version FROM schema_migrations').all()
     db.close()
-    expect(migrations).toEqual([{ version: 1 }, { version: 2 }])
+    expect(migrations).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }])
     void dir
   })
 
@@ -153,5 +158,48 @@ describe('store', () => {
     // error-code contract visible here.
     expect(new ProtocolError('conflict', 'x').code).toBe('conflict')
     store.close()
+  })
+
+  test('a same-millisecond update cannot be overwritten by a stale snapshot', () => {
+    const { store } = newStore() // fixed clock at 1000 for every write
+    store.ensureHost('host-a', 'http://a')
+    store.insertInstance(instance())
+    const snapshot = store.getInstance('a'.repeat(24))!
+    expect(snapshot.revision).toBe(0)
+
+    // First write at the same `updated_at_ms` as the snapshot.
+    expect(store.casState('a'.repeat(24), ['running'], 'running', 1000)).toBe(
+      true
+    )
+    const updated = store.getInstance('a'.repeat(24))!
+    expect(updated.updatedAtMs).toBe(snapshot.updatedAtMs)
+    expect(updated.revision).toBeGreaterThan(snapshot.revision)
+
+    // A decision made from the old snapshot is now stale, even though the
+    // timestamps are equal.
+    expect(store.casStateSnapshot(snapshot, 'deleting', 1000)).toBe(false)
+    expect(store.getInstance('a'.repeat(24))?.state).toBe('running')
+    store.close()
+  })
+
+  test('every store operation after close throws StoreClosedError', () => {
+    const { store } = newStore()
+    store.ensureHost('host-a', 'http://a')
+    store.insertInstance(instance())
+    store.close()
+    const key = { teamId: 'team-1', challengeIntegrationId: 'chal-1' }
+    const operations: Array<() => unknown> = [
+      () => store.getHost('host-a'),
+      () => store.getInstance('a'.repeat(24)),
+      () => store.listInstances(),
+      () => store.getLiveInstance(key),
+      () => store.reservedByHost(),
+      () => store.casState('a'.repeat(24), ['running'], 'deleting', 1000),
+      () => store.updateExpiry('a'.repeat(24), ['running'], 5000, 1000),
+      () => store.transaction(() => undefined),
+    ]
+    for (const operation of operations) {
+      expect(operation).toThrow(StoreClosedError)
+    }
   })
 })

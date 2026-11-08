@@ -56,6 +56,36 @@ export interface HeldCreate {
   release: () => void
 }
 
+/** One extend whose response is held until `release()`. */
+export interface HeldExtend {
+  /** Resolves with the argument once the PATCH is captured. */
+  captured: Promise<{ id: string; expiresAtMs: number }>
+  release: () => void
+}
+
+/** Stable per-instance spec hash: excludes `expiresAtMs` and flag values. */
+export const specHashOf = (spec: AgentInstanceSpec): string =>
+  JSON.stringify({
+    id: spec.id,
+    teamKey: spec.teamKey,
+    image: spec.image,
+    vcpus: spec.vcpus,
+    memMiB: spec.memMiB,
+    diskMiB: spec.diskMiB,
+    kernelArgs: spec.kernelArgs ?? null,
+    egress: spec.egress,
+    bootTimeoutSeconds: spec.bootTimeoutSeconds,
+    readiness: spec.readiness,
+    env: spec.env,
+    expose: spec.expose.map(expose => ({
+      kind: expose.kind,
+      hostPrefix: expose.hostPrefix,
+      port: expose.port,
+      title: expose.title ?? null,
+    })),
+    flags: spec.flags.map(flag => flag.provider),
+  })
+
 export class FakeAgent implements AgentClient {
   readonly instances = new Map<string, AgentInstance>()
   readonly tombstones = new Map<string, number>()
@@ -72,9 +102,19 @@ export class FakeAgent implements AgentClient {
   rejectCode: ErrorCode = 'no_capacity'
   latencyMs = 0
   infoMode: InfoMode = 'ok'
+  /** Await this before answering `info()` (holds a heartbeat tick open). */
+  infoHold: Promise<void> | null = null
+  /** A DELETE of an unknown id still writes the tombstone; `expired` throws. */
   deleteMissingMode: DeleteMissingMode = 'ok'
+  /** Error returned for a DELETE of a KNOWN id (before any mutation). */
+  deleteErrorMode: 'none' | 'expired' | 'internal' = 'none'
   /** (agent - controller) clock offset reported in AgentInfo.timeMs. */
   clockOffsetMs = 0
+  /** Runs inside `info()` after the request started (can step the clock). */
+  infoHook: (() => void) | null = null
+  /** Optional dead-man: destroy a VM once now > expiresAtMs + expiryGraceMs. */
+  deadmanEnabled = false
+  expiryGraceMs = 5000
   /** Return this stale snapshot from `list()` instead of the live map. */
   listSnapshotOverride: AgentInstance[] | null = null
   /** Runs after `list()` captured its snapshot but before returning it. */
@@ -87,6 +127,26 @@ export class FakeAgent implements AgentClient {
     capture: (instance: AgentInstance) => void
     released: Promise<void>
   } | null = null
+  private extendGate: {
+    capture: (call: { id: string; expiresAtMs: number }) => void
+    released: Promise<void>
+  } | null = null
+
+  /** The agent's own clock (controller clock + configured offset). */
+  private agentNow(): number {
+    return this.now() + this.clockOffsetMs
+  }
+
+  /** Model the agent's dead-man deadline destroying VMs on its own. */
+  private expireDeadman(): void {
+    if (!this.deadmanEnabled) return
+    const at = this.agentNow()
+    for (const [id, instance] of this.instances) {
+      if (instance.expiresAtMs + this.expiryGraceMs <= at) {
+        this.instances.delete(id)
+      }
+    }
+  }
 
   constructor(
     readonly hostId: string,
@@ -141,6 +201,8 @@ export class FakeAgent implements AgentClient {
     if (this.infoMode === 'hang') {
       return new Promise<AgentInfo>(() => undefined)
     }
+    if (this.infoHold !== null) await this.infoHold
+    if (this.infoHook !== null) this.infoHook()
     this.infoCalls.push(this.now())
     this.assertReachable()
     if (this.infoMode === 'unreachable') {
@@ -160,6 +222,7 @@ export class FakeAgent implements AgentClient {
 
   async list(): Promise<AgentInstance[]> {
     await this.delay()
+    this.expireDeadman()
     this.assertReachable()
     const snapshot = this.listSnapshotOverride ?? [...this.instances.values()]
     // Snapshot BEFORE the hook: a listing must be allowed to be stale relative
@@ -170,6 +233,7 @@ export class FakeAgent implements AgentClient {
 
   async create(spec: AgentInstanceSpec): Promise<AgentInstance> {
     await this.delay()
+    this.expireDeadman()
     this.assertReachable()
     this.createCalls.push(spec)
 
@@ -235,7 +299,18 @@ export class FakeAgent implements AgentClient {
     }
 
     const existing = this.instances.get(spec.id)
-    if (existing !== undefined) return { ...existing }
+    if (existing !== undefined) {
+      // Idempotent only for the same logical spec. Delay/flag-value changes
+      // (which the hash excludes) are fine; anything else is a real mismatch.
+      if (existing.specHash !== specHashOf(spec)) {
+        throw new AgentRejectedError(
+          this.hostId,
+          'spec_mismatch',
+          'instance exists with a different spec'
+        )
+      }
+      return { ...existing }
+    }
 
     const usage = this.usage()
     if (
@@ -257,17 +332,14 @@ export class FakeAgent implements AgentClient {
         this.createMode === 'create-then-unreachable'
           ? 'running'
           : this.createState,
-      createdAtMs: this.now(),
+      createdAtMs: this.agentNow(),
       expiresAtMs: spec.expiresAtMs,
       endpoints: spec.expose.map((expose, index) => ({
         kind: expose.kind,
         host: `${this.hostId}.fc.test`,
         port: 20000 + index,
       })),
-      specHash: JSON.stringify({
-        ...spec,
-        flags: spec.flags.map(flag => flag.provider),
-      }),
+      specHash: specHashOf(spec),
     }
     this.instances.set(spec.id, instance)
     return instance
@@ -275,6 +347,7 @@ export class FakeAgent implements AgentClient {
 
   async get(id: string): Promise<AgentInstance | undefined> {
     await this.delay()
+    this.expireDeadman()
     this.assertReachable()
     const instance = this.instances.get(id)
     return instance === undefined ? undefined : { ...instance }
@@ -282,6 +355,7 @@ export class FakeAgent implements AgentClient {
 
   async extend(id: string, expiresAtMs: number): Promise<AgentInstance> {
     await this.delay()
+    this.expireDeadman()
     this.assertReachable()
     this.extendCalls.push({ id, expiresAtMs })
     const instance = this.instances.get(id)
@@ -290,7 +364,16 @@ export class FakeAgent implements AgentClient {
     }
     // Monotonic: a competing/out-of-order push never shortens the deadline.
     instance.expiresAtMs = Math.max(instance.expiresAtMs, expiresAtMs)
-    return { ...instance }
+    const snapshot = { ...instance }
+    const gate = this.extendGate
+    if (gate !== null) {
+      this.extendGate = null
+      gate.capture({ id, expiresAtMs })
+      // The agent applied the update but the response is stuck on the wire:
+      // another extend can complete (and be observed) first.
+      await gate.released
+    }
+    return snapshot
   }
 
   async delete(id: string): Promise<void> {
@@ -304,17 +387,33 @@ export class FakeAgent implements AgentClient {
     this.assertReachable()
     this.deleteCalls.push(id)
     const known = this.instances.has(id)
-    if (!known && this.deleteMissingMode !== 'ok') {
+    if (!known) {
+      // Faithful FENCING: the agent writes the durable tombstone BEFORE it
+      // answers (404 for an unknown id, or an error mode's 410/expired).
+      this.tombstones.set(id, this.agentNow())
+      if (
+        this.deleteMissingMode !== 'ok' &&
+        this.deleteMissingMode !== 'not_found'
+      ) {
+        throw new AgentRejectedError(
+          this.hostId,
+          this.deleteMissingMode,
+          `fake delete missing instance (${this.deleteMissingMode})`
+        )
+      }
+      // `not_found` is the agent's 404 body; AgentClient.delete resolves on
+      // HTTP 404, so the fake resolves too.
+      return
+    }
+    if (this.deleteErrorMode !== 'none') {
       throw new AgentRejectedError(
         this.hostId,
-        this.deleteMissingMode,
-        `fake delete missing instance (${this.deleteMissingMode})`
+        this.deleteErrorMode,
+        `fake delete failed (${this.deleteErrorMode})`
       )
     }
     this.instances.delete(id)
-    // DELETE always fences the id, including when it was already unknown
-    // ("already finished").
-    this.tombstones.set(id, this.now())
+    this.tombstones.set(id, this.agentNow())
   }
 
   // ---- test controls ----------------------------------------------------
@@ -353,8 +452,47 @@ export class FakeAgent implements AgentClient {
     return { created, release }
   }
 
+  /** Hold the next PATCH response after the agent applied it. */
+  holdNextExtend(): HeldExtend {
+    let capture!: (call: { id: string; expiresAtMs: number }) => void
+    const captured = new Promise<{ id: string; expiresAtMs: number }>(
+      resolve => {
+        capture = resolve
+      }
+    )
+    let release!: () => void
+    const released = new Promise<void>(resolve => {
+      release = resolve
+    })
+    this.extendGate = { capture, released }
+    return { captured, release }
+  }
+
   isTombstoned(id: string): boolean {
     return this.tombstones.has(id)
+  }
+
+  /**
+   * Simulate an agent process restart: durable state (instances + tombstones)
+   * survives; transient test controls (failures, gates, latency) reset.
+   */
+  simulateRestart(): void {
+    this.unreachable = false
+    this.deleteUnreachable = false
+    this.accepting = true
+    this.createMode = 'ok'
+    this.createState = 'running'
+    this.latencyMs = 0
+    this.infoMode = 'ok'
+    this.infoHold = null
+    this.deleteMissingMode = 'ok'
+    this.deleteErrorMode = 'none'
+    this.infoHook = null
+    this.listSnapshotOverride = null
+    this.listHook = null
+    this.delayedGate = null
+    this.holdGate = null
+    this.extendGate = null
   }
 
   loseState(): void {

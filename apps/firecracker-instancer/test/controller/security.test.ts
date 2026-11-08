@@ -43,6 +43,8 @@ describe('controller persistence security', () => {
       newId: () => 'i' + 'a'.repeat(23),
     })
     try {
+      // The host needs a successful clock sample before it accepts creates.
+      await service.start()
       await service.create(
         makeCreateRequest('team-secret', {
           flags: [{ provider: 'rctf', flag }],
