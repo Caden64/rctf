@@ -1,0 +1,58 @@
+[Unit]
+Description=rCTF Firecracker host agent
+Documentation=https://github.com/redpwn/rctf
+After=network-online.target
+Wants=network-online.target
+# A KVM-less host cannot run Firecracker; fail clearly instead of looping.
+ConditionPathExists=/dev/kvm
+
+[Service]
+Type=simple
+# Adjust the interpreter and checkout path to your installation. The agent is a
+# Bun program (package @rctf/firecracker-instancer).
+EnvironmentFile=-/etc/rctf-firecracker/agent.env
+WorkingDirectory=/opt/rctf-firecracker
+ExecStart=/usr/local/bin/bun /opt/rctf-firecracker/apps/firecracker-instancer/src/agent/index.ts
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+
+# ---------------------------------------------------------------------------
+# Why root?
+# ---------------------------------------------------------------------------
+# The agent must: own the `inet rctf_fc` nftables table (CAP_NET_ADMIN), create
+# and delete tap devices and add addresses (CAP_NET_ADMIN/CAP_NET_RAW), and run
+# the jailer, which chroots, mounts, setuid/setgids into a per-VM uid and writes
+# cgroups (CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SETUID/SETGID, CAP_CHOWN,
+# CAP_FOWNER, CAP_KILL, CAP_MKNOD). It also needs /dev/kvm.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
+NoNewPrivileges=yes
+
+# ---------------------------------------------------------------------------
+# Filesystem / kernel hardening that is compatible with the above.
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+# ReadWritePaths keeps exactly the agent-owned state + Traefik output writable.
+ReadWritePaths=/var/lib/rctf-firecracker /etc/traefik/dynamic/rctf-firecracker /run
+# NOT set on purpose:
+#  - PrivateDevices: /dev/kvm must stay available.
+#  - ProtectHostname: the jailer may set the hostname inside its UTS namespace.
+#  - ProtectControlGroups: the jailer creates/writes per-VM cgroups.
+#  - MemoryDenyWriteExecute: Bun/JSC JIT requires writable-executable memory.
+#  - RestrictNamespaces: the jailer creates mount/pid/... namespaces.
+#  - SystemCallFilter: Firecracker + jailer need a broad, version-dependent set.
+
+# Keep only the address families the agent and its children use.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

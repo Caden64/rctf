@@ -1,0 +1,33 @@
+# rCTF Firecracker instancer - sample Traefik STATIC configuration.
+#
+# The agent writes one dynamic file per instance into
+# /etc/traefik/dynamic/rctf-firecracker (network.traefikDynamicDir). Traefik
+# terminates TLS for http/https/tcp-ssl routes; tcp/raw routes never touch
+# Traefik (they are nftables DNAT rules).
+#
+# The file provider directory is watched: new/changed rctf-fc-*.yml files are
+# picked up without restarting Traefik.
+
+log:
+  level: INFO
+
+entryPoints:
+  web:
+    address: ':80'
+  websecure:
+    address: ':443'
+  #
+  # Optional dedicated entrypoint for expose kind `tcp-ssl`. To use it, set
+  # the agent's network.tcpSslEntrypoint: tcps and network.tcpSslPort: 8443
+  # (the port reported to players). By default the agent reuses `websecure`,
+  # where Traefik multiplexes HTTP routers and HostSNI TCP routers.
+  #
+  # tcps:
+  #   address: ':8443'
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic/rctf-firecracker
+    watch: true
+    # The agent writes YAML files atomically (temp + rename), so a partial file
+    # is never observed by the provider.
