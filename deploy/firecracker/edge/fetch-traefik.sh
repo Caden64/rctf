@@ -11,7 +11,11 @@
 #   * PINNED_BINARY_SHA256 is the sha256 of the `traefik` member extracted from
 #     that verified tarball.
 # The cached binary is re-hashed on EVERY use (run.sh calls `--verify`); a
-# mismatch is fatal and never silently accepted.
+# mismatch is fatal and never silently accepted. Concurrent cold fetches
+# serialize on a lock beside the binary; downloads and verification happen
+# in a private staging directory, and the binary is published with an atomic
+# same-directory rename, so a concurrent reader only ever observes a
+# complete binary or none.
 #
 # Usage:
 #   ./fetch-traefik.sh            # verify the cache, or download + verify + install
@@ -56,18 +60,34 @@ if [ -e "$BIN" ]; then
   exit 0
 fi
 
-mkdir -p "$DEST"
-echo "== downloading Traefik v$VERSION"
-curl -fsSL -o "$DEST/$TARBALL" "$BASE/$TARBALL" || die "download failed"
+# Serialize cold fetches on this cache (same flock pattern as vmtest's vm.sh).
+# The loser of the race rechecks the cache under the lock and finds the
+# winner's published binary. Download, verify and extract in a private
+# staging directory; publish with a same-directory rename.
+BIN_DIR=$(dirname -- "$BIN")
+mkdir -p "$BIN_DIR"
+exec 9>"$BIN_DIR/.fetch-traefik.lock"
+flock 9 || die "could not lock $BIN_DIR/.fetch-traefik.lock"
 
-got=$(hash_of "$DEST/$TARBALL")
+if [ -e "$BIN" ]; then
+  verify_bin
+  exit 0
+fi
+
+stage=$(mktemp -d "$BIN_DIR/.fetch.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+
+echo "== downloading Traefik v$VERSION"
+curl -fsSL -o "$stage/$TARBALL" "$BASE/$TARBALL" || die "download failed"
+
+got=$(hash_of "$stage/$TARBALL")
 [ "$got" = "$PINNED_TARBALL_SHA256" ] ||
   die "tarball sha256 mismatch: got $got want $PINNED_TARBALL_SHA256 (repo pin)"
 
 # Second source: the published checksums file. It must agree with the repo pin;
 # a disagreement is fatal even if the tarball matched the pin.
-if curl -fsSL -o "$DEST/checksums.txt" "$BASE/traefik_v${VERSION}_checksums.txt"; then
-  published=$(grep " $TARBALL\$" "$DEST/checksums.txt" | cut -d' ' -f1)
+if curl -fsSL -o "$stage/checksums.txt" "$BASE/traefik_v${VERSION}_checksums.txt"; then
+  published=$(grep " $TARBALL\$" "$stage/checksums.txt" | cut -d' ' -f1)
   [ -n "$published" ] || die "no checksum for $TARBALL in the published checksums file"
   [ "$published" = "$PINNED_TARBALL_SHA256" ] ||
     die "published checksum $published disagrees with the repo pin $PINNED_TARBALL_SHA256"
@@ -76,15 +96,14 @@ else
   echo "warning: could not download the published checksums file; the repo pin is authoritative" >&2
 fi
 
-tmp=$(mktemp -d "$DEST/.extract.XXXXXX")
-trap 'rm -rf "$tmp" "$DEST/$TARBALL"' EXIT
-tar -xzf "$DEST/$TARBALL" -C "$tmp" traefik || die "could not extract traefik from the tarball"
-gotbin=$(hash_of "$tmp/traefik")
+tar -xzf "$stage/$TARBALL" -C "$stage" traefik || die "could not extract traefik from the tarball"
+gotbin=$(hash_of "$stage/traefik")
 [ "$gotbin" = "$PINNED_BINARY_SHA256" ] ||
   die "extracted binary sha256 mismatch: got $gotbin want $PINNED_BINARY_SHA256"
-chmod +x "$tmp/traefik"
-mv "$tmp/traefik" "$BIN"
-rm -f "$DEST/$TARBALL"
+chmod +x "$stage/traefik"
+# Atomic publish: a concurrent reader sees either no binary or the complete
+# verified one, never a partial download.
+mv "$stage/traefik" "$BIN"
+rm -rf "$stage"
 trap - EXIT
-rm -rf "$tmp"
 verify_bin

@@ -46,21 +46,33 @@ die() {
 # ---------------------------------------------------------------------------
 # Unique ports (this host is shared with other unprivileged test workers).
 # ---------------------------------------------------------------------------
-free_tcp() {
+# All five ports are bound SIMULTANEOUSLY before any is released, so the five
+# are distinct from each other by construction (five separate bind(0)+close
+# round trips can hand the same ephemeral port to two of them). A residual
+# window remains between the release here and each consumer's bind: another
+# run claiming a port in that window fails this run's consumer loudly (QEMU
+# exits nonzero on a hostfwd bind failure, the seed servers fail to bind, and
+# the controller forward uses ExitOnForwardFailure), never silently, and the
+# ports are recorded in the run log.
+free_tcp_set() {
   python3 - <<'PY'
 import socket
-s = socket.socket()
-s.bind(('127.0.0.1', 0))
-print(s.getsockname()[1])
-s.close()
+socks = [socket.socket() for _ in range(5)]
+try:
+    for s in socks:
+        s.bind(('127.0.0.1', 0))
+    print(' '.join(str(s.getsockname()[1]) for s in socks))
+finally:
+    for s in socks:
+        s.close()
 PY
 }
 
-A_SSH=$(free_tcp)
-B_SSH=$(free_tcp)
-A_SEED=$(free_tcp)
-B_SEED=$(free_tcp)
-CTRL_PORT=$(free_tcp)
+ports=$(free_tcp_set)
+read -r A_SSH B_SSH A_SEED B_SEED CTRL_PORT <<<"$ports"
+case " $A_SSH $B_SSH $A_SEED $B_SEED $CTRL_PORT " in
+  *[!\ 0-9]*) die "port allocation failed: $ports" ;;
+esac
 
 # The private link between the two VMs is a pair of AF_UNIX datagram sockets
 # (QEMU -netdev dgram), one bound by each QEMU, in a per-run directory that is
