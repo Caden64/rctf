@@ -24,6 +24,8 @@ import { createLogger, type Logger } from '../log'
 import type { AgentConfig } from './config'
 
 export const MAX_REQUEST_BODY_BYTES = 1024 * 1024
+/** A create may legitimately take ~30s; do not cut the connection earlier. */
+export const SERVER_IDLE_TIMEOUT_SECONDS = 60
 
 /** Constant-time comparison of two opaque tokens (hash first: equal lengths). */
 export const constantTimeEqual = (a: string, b: string): boolean => {
@@ -76,10 +78,35 @@ const readJson = async (request: Request): Promise<unknown> => {
       throw new HttpProblem(413, 'invalid_request', 'request body too large')
     }
   }
-  const buffer = await request.arrayBuffer()
-  if (buffer.byteLength > MAX_REQUEST_BODY_BYTES) {
-    throw new HttpProblem(413, 'invalid_request', 'request body too large')
+
+  const body = request.body
+  let buffer: Uint8Array
+  if (!body) {
+    buffer = new Uint8Array(0)
+  } else {
+    // Count bytes as they stream in: a chunked request has no content-length,
+    // and must not be allowed to buffer past the limit before we look at it.
+    const reader = body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > MAX_REQUEST_BODY_BYTES) {
+        await reader.cancel().catch(() => {})
+        throw new HttpProblem(413, 'invalid_request', 'request body too large')
+      }
+      chunks.push(value)
+    }
+    buffer = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      buffer.set(chunk, offset)
+      offset += chunk.byteLength
+    }
   }
+
   const text = new TextDecoder().decode(buffer)
   try {
     return JSON.parse(text)
@@ -90,13 +117,16 @@ const readJson = async (request: Request): Promise<unknown> => {
 
 export interface AgentServer {
   server: ReturnType<typeof Bun.serve>
-  stop: () => Promise<void>
+  /** Stop accepting, then drain in-flight requests under a deadline. */
+  stop: (timeoutMs?: number) => Promise<void>
 }
 
 export const createAgentServer = (deps: {
   config: AgentConfig
   manager: InstanceManager
   logger?: Logger
+  /** Test seam: raise Bun's transport cap to exercise the streaming check. */
+  maxRequestBodyBytes?: number
 }): AgentServer => {
   const { config, manager } = deps
   const logger = deps.logger ?? createLogger('firecracker-agent-http', 'silent')
@@ -107,7 +137,27 @@ export const createAgentServer = (deps: {
     )
   }
 
+  let closing = false
+  let stopped = false
+  const inflight = new Set<Promise<void>>()
+  const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+    let resolve!: () => void
+    const promise = new Promise<void>(r => {
+      resolve = r
+    })
+    return { promise, resolve }
+  }
+
   const fetch = async (request: Request): Promise<Response> => {
+    if (closing) {
+      return errorResponse('draining', 'agent is shutting down', 503)
+    }
+    return handleRequest(request)
+  }
+
+  const handleRequest = async (request: Request): Promise<Response> => {
+    const done = deferred()
+    inflight.add(done.promise)
     try {
       if (!tokensMatch(request.headers.get('authorization'), token)) {
         return errorResponse('unauthorized', 'invalid or missing bearer token')
@@ -191,6 +241,9 @@ export const createAgentServer = (deps: {
         'unhandled agent request error'
       )
       return errorResponse('internal', 'internal error')
+    } finally {
+      done.resolve()
+      inflight.delete(done.promise)
     }
   }
 
@@ -198,6 +251,9 @@ export const createAgentServer = (deps: {
   const server = Bun.serve({
     hostname: listen.host,
     port: listen.port,
+    /** Reject oversized bodies before Bun buffers them. */
+    maxRequestBodySize: deps.maxRequestBodyBytes ?? MAX_REQUEST_BODY_BYTES,
+    idleTimeout: SERVER_IDLE_TIMEOUT_SECONDS,
     fetch,
     error(err) {
       logger.error(
@@ -210,8 +266,28 @@ export const createAgentServer = (deps: {
 
   return {
     server,
-    stop: async () => {
-      server.stop(true)
+    stop: async (timeoutMs = (config.shutdownTimeoutSeconds ?? 15) * 1000) => {
+      if (stopped) return
+      // Stop accepting immediately, but do NOT await a server.stop() that may
+      // wait forever on active connections before the drain deadline.
+      closing = true
+      const stopPromise = server.stop(false)
+      const deadline = Date.now() + Math.max(0, timeoutMs)
+      while (inflight.size > 0) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) break
+        await new Promise(resolve =>
+          setTimeout(resolve, Math.min(10, remaining))
+        )
+      }
+      if (inflight.size > 0) {
+        // Deadline hit: force the remaining requests/connections.
+        void stopPromise.catch(() => {})
+        await Promise.resolve(server.stop(true)).catch(() => {})
+      } else {
+        await stopPromise.catch(() => {})
+      }
+      stopped = true
     },
   }
 }

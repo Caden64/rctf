@@ -36,7 +36,7 @@ export const runAgent = async (configPath: string): Promise<void> => {
     logger.info(vmPreflight, 'vm preflight')
   } catch (err) {
     logger.error(
-      { error: err instanceof Error ? err.message : String(err) },
+      { errorType: err instanceof Error ? err.name : typeof err },
       'vm preflight failed'
     )
   }
@@ -45,7 +45,7 @@ export const runAgent = async (configPath: string): Promise<void> => {
     logger.info({ checks: netChecks }, 'network preflight')
   } catch (err) {
     logger.error(
-      { error: err instanceof Error ? err.message : String(err) },
+      { errorType: err instanceof Error ? err.name : typeof err },
       'network preflight failed'
     )
   }
@@ -66,10 +66,15 @@ export const runAgent = async (configPath: string): Promise<void> => {
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return
     stopping = true
-    logger.info({ signal }, 'shutting down agent (running VMs are left alone)')
+    const timeoutMs = (config.shutdownTimeoutSeconds ?? 15) * 1000
+    logger.info(
+      { signal, timeoutMs },
+      'shutting down agent (running VMs are left alone)'
+    )
     try {
-      await manager.stop()
-      await agent.stop()
+      // Stop accepting first, then drain HTTP requests and manager work; both
+      // are bounded by the same deadline. VMs are never destroyed here.
+      await Promise.allSettled([agent.stop(timeoutMs), manager.stop()])
     } finally {
       process.exit(0)
     }

@@ -1,5 +1,6 @@
 import { createInstanceManager } from '../../src/agent/manager'
 import type { AgentConfig } from '../../src/agent/config'
+import { StateStore, TombstoneStore } from '../../src/agent/state'
 import type { InstanceManager } from '../../src/interfaces'
 import type { Logger } from '../../src/log'
 import {
@@ -12,6 +13,18 @@ import {
   type TestClock,
 } from './fakes'
 
+interface SpawnOptions {
+  vm?: FakeVmDriver
+  net?: FakeNetworkManager
+  sweepIntervalMs?: number
+  erroredTtlMs?: number
+  tombstoneTtlMs?: number
+  operationTimeoutMs?: number
+  sweepConcurrency?: number
+  store?: StateStore
+  tombstones?: TombstoneStore
+}
+
 export interface Harness {
   dir: string
   config: AgentConfig
@@ -21,13 +34,7 @@ export interface Harness {
   mgr: InstanceManager
   logger?: Logger
   /** Build another manager over the same state dir (restart / second agent). */
-  spawn: (opts?: {
-    vm?: FakeVmDriver
-    net?: FakeNetworkManager
-    sweepIntervalMs?: number
-    erroredTtlMs?: number
-    tombstoneTtlMs?: number
-  }) => InstanceManager
+  spawn: (opts?: SpawnOptions) => InstanceManager
   cleanup: () => Promise<void>
 }
 
@@ -37,6 +44,8 @@ export const createHarness = async (opts?: {
   sweepIntervalMs?: number
   erroredTtlMs?: number
   tombstoneTtlMs?: number
+  operationTimeoutMs?: number
+  sweepConcurrency?: number
   clock?: TestClock
   vm?: FakeVmDriver
   net?: FakeNetworkManager
@@ -48,13 +57,7 @@ export const createHarness = async (opts?: {
   const config = makeConfig(dir, opts?.config)
   const managers: InstanceManager[] = []
 
-  const spawn = (spawnOpts?: {
-    vm?: FakeVmDriver
-    net?: FakeNetworkManager
-    sweepIntervalMs?: number
-    erroredTtlMs?: number
-    tombstoneTtlMs?: number
-  }): InstanceManager => {
+  const spawn = (spawnOpts?: SpawnOptions): InstanceManager => {
     const manager = createInstanceManager({
       config,
       vm: spawnOpts?.vm ?? vm,
@@ -65,7 +68,15 @@ export const createHarness = async (opts?: {
       erroredTtlMs: spawnOpts?.erroredTtlMs ?? opts?.erroredTtlMs ?? 600_000,
       tombstoneTtlMs:
         spawnOpts?.tombstoneTtlMs ?? opts?.tombstoneTtlMs ?? 86_400_000,
+      operationTimeoutMs:
+        spawnOpts?.operationTimeoutMs ?? opts?.operationTimeoutMs ?? 30_000,
+      sweepConcurrency:
+        spawnOpts?.sweepConcurrency ?? opts?.sweepConcurrency ?? 8,
       orphanGraceMs: 0,
+      ...(spawnOpts?.store === undefined ? {} : { store: spawnOpts.store }),
+      ...(spawnOpts?.tombstones === undefined
+        ? {}
+        : { tombstones: spawnOpts.tombstones }),
     })
     managers.push(manager)
     return manager

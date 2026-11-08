@@ -31,6 +31,8 @@ export const agentConfigSchema = z.object({
   erroredTtlSeconds: z.optional(z.prefault(z.int(), 600)),
   /** Fence deleted ids for this long so delayed duplicate PUTs cannot resurrect them. */
   tombstoneTtlSeconds: z.optional(z.prefault(z.int(), 86400)),
+  /** Drain in-flight work for at most this long during shutdown, then force. */
+  shutdownTimeoutSeconds: z.optional(z.prefault(z.int(), 15)),
   vm: z.optional(z.prefault(vmConfigSchema, {})),
   network: networkConfigSchema,
 })
