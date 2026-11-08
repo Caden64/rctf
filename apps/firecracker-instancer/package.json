@@ -1,0 +1,23 @@
+{
+  "name": "@rctf/firecracker-instancer",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "controller": "bun src/controller/index.ts",
+    "agent": "bun src/agent/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rctf/firecracker-protocol": "workspace:*",
+    "pino": "catalog:",
+    "yaml": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:"
+  },
+  "peerDependencies": {
+    "typescript": "catalog:"
+  }
+}
