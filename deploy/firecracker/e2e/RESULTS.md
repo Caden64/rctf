@@ -14,7 +14,7 @@ with real Firecracker microVMs under KVM.
 | Artifacts   | `$HOME/.cache/rctf-fc-smoke` (read-only): Firecracker v1.17.0, kernel 6.1.155, smoke `rootfs.ext4` |
 | Namespace   | `unshare -Urn` (private user + network namespace), no root, no sudo                                |
 | Run dir     | `/run/user/1000/fce-LV2Syk` (`mktemp` under `$XDG_RUNTIME_DIR`)                                    |
-| cgroup root | the user's systemd-delegated cgroup2 subtree (see finding below)                                   |
+| cgroup root | (original run) the user's delegated cgroup2 subtree. **Re-run after fix d5c17f1c with the default `/sys/fs/cgroup` and no workaround: 122/122 passed.** |
 | Wall time   | 11:30:42 → 11:32:35 ≈ **113 s**                                                                    |
 | Exit code   | **0**                                                                                              |
 
@@ -286,7 +286,9 @@ table arp rctf_fc_arp
 
 ## Product finding
 
-### F1 — `mode: direct` agents are never `accepting` without a writable cgroup2 root
+### F1 — `mode: direct` agents are never `accepting` without a writable cgroup2 root (FIXED)
+
+**Status: fixed** in commit d5c17f1c (`cgroupRoot` preflight is now gated on jailer mode, with a regression test in `apps/firecracker-instancer/test/vm/preflight.test.ts`). The harness originally worked around it by pointing `vm.cgroupRoot` at the user's delegated cgroup subtree; that workaround and the repro script were removed and the full run re-verified against the fix. The text below is the original finding.
 
 **Repro:** `deploy/firecracker/e2e/repros/direct-mode-cgroup-root.sh` (real agent, real preflight,
 inside `unshare -Urn`, `vm.mode: direct`, `vm.cgroupRoot: /sys/fs/cgroup`).

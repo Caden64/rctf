@@ -19,19 +19,6 @@ ip link add dummy0 type dummy 2>/dev/null || true
 ip link set dummy0 up
 sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || echo "(warning: ip_forward not writable)"
 
-# The agent's vm preflight requires a writable cgroup2 root even in `direct`
-# mode (where cgroups are not used). Inside a user namespace /sys/fs/cgroup is
-# read-only, so point the agent at this user's own systemd-delegated cgroup2
-# subtree, which is a real cgroup2 mount descendant and is writable as userns
-# root. (This is an environment accommodation, not a fake: see RESULTS.md.)
-CGROUP_PATH=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
-if [ -n "${CGROUP_PATH:-}" ] && [ -d "/sys/fs/cgroup$CGROUP_PATH" ]; then
-  export E2E_CGROUP_ROOT="/sys/fs/cgroup$CGROUP_PATH"
-else
-  export E2E_CGROUP_ROOT=/sys/fs/cgroup
-fi
-echo "cgroup root for the agent: $E2E_CGROUP_ROOT"
-
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM

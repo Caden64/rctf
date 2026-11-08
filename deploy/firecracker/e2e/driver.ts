@@ -119,7 +119,6 @@ vm:
   allowUntrustedImages: true   # host-owned parents map to 'nobody' in a user namespace
   readinessIntervalMs: 200
   apiTimeoutMs: 5000
-  cgroupRoot: ${process.env.E2E_CGROUP_ROOT ?? '/sys/fs/cgroup'}
 network:
   publicHost: 10.200.0.1
   httpDomain: smoke.test

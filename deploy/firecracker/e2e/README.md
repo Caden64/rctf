@@ -46,7 +46,6 @@ Useful knobs:
 | `E2E_TIMEOUT`       | `900`                    | outer hard bound (seconds, `timeout(1)`)          |
 | `E2E_INNER_TIMEOUT` | `840`                    | bound for the driver itself                       |
 | `LOG_LEVEL`         | `info`                   | controller/agent pino level                       |
-| `E2E_CGROUP_ROOT`   | auto                     | see “cgroup root” below                           |
 
 A run creates a unique short directory under `$XDG_RUNTIME_DIR` (`fce-XXXXXX`, ~24 bytes; the longest
 unix socket path is `$RUN/agent/run/<24-char id>/api.sock` ≈ 68 bytes, well under `SUN_LEN` 108).
@@ -134,22 +133,11 @@ which makes “row is still `creating`” and “the fence ran” deterministic 
 - Fixed loopback ports (17000 controller, 17001 agent, 17002 proxy) are safe because the network
   namespace is private.
 
-### cgroup root (environment accommodation)
-
-The agent's `vm.preflight` requires `vm.cgroupRoot` to be a writable cgroup2 mount **even in
-`mode: direct`**, where cgroups are never used. Inside a user namespace `/sys/fs/cgroup` is read-only,
-so the agent would report `accepting: false` and the controller would refuse every placement. This is
-a real product finding (see `RESULTS.md` and `repros/direct-mode-cgroup-root.sh`). The harness works
-around it by pointing `vm.cgroupRoot` at this user's systemd-delegated cgroup2 subtree (computed from
-`/proc/self/cgroup`), which is a real cgroup2 mount descendant and is writable as userns root. It is
-not a fake: the preflight's real `stat`/`access`/`/proc/mounts` checks run against it.
-
 ## Files
 
 - `run.sh` — outer wrapper: checks prerequisites, creates the short run dir, `exec`s `unshare`.
-- `inner.sh` — namespace setup (lo, dummy0, ip_forward, cgroup root), trap, runs the driver.
+- `inner.sh` — namespace setup (lo, dummy0, ip_forward), trap, runs the driver.
 - `driver.ts` — real provider + process orchestration + scenarios/assertions + leftover report.
 - `harness.ts` — assertions/report, polling, HTTP, SQLite observation, filesystem grep, process control.
 - `proxy.ts` — the TCP fault proxy used only by scenario 7.
-- `repros/direct-mode-cgroup-root.sh` — minimal repro for the `direct`-mode cgroup gate.
 - `RESULTS.md` — dated log of the actual run with excerpts.
