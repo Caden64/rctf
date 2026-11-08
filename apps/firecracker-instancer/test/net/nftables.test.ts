@@ -216,6 +216,53 @@ describe('renderRuleset invariants', () => {
       )
     }
   })
+
+  test('(j) ARP from unleased fctap* interfaces is dropped with the leased set', () => {
+    const text = renderRuleset(leases, config)
+    const arp = text.slice(text.indexOf('table arp rctf_fc_arp {'))
+    expect(arp).toContain(
+      'iifname "fctap*" iifname != { "fctap0", "fctap1" } drop'
+    )
+    const empty = renderRuleset([], config)
+    const emptyArp = empty.slice(empty.indexOf('table arp rctf_fc_arp {'))
+    expect(emptyArp).toContain('iifname "fctap*" drop')
+    // No per-lease ARP rules with zero leases.
+    expect(emptyArp).not.toContain('arp saddr ip !=')
+  })
+
+  test('fenced leases keep only blocking rules (no DNAT, no accepts)', () => {
+    const fenced = new Set([instanceId(1)])
+    const text = renderRuleset(leases, config, { fenced })
+    const prerouting = section(text, 'prerouting')
+    expect(prerouting).not.toContain('20000')
+    expect(prerouting).toContain('20001')
+    const forward = section(text, 'forward')
+    expect(forward).not.toContain(
+      `iifname "fctap0" ip saddr 10.200.0.2 ct state established,related accept`
+    )
+    expect(forward).not.toContain('tcp dport 8080')
+    expect(forward).not.toContain(
+      'iifname "fctap0" oifname "wan0" ip saddr 10.200.0.2 accept'
+    )
+    // Explicit blocking in both directions, including established.
+    expect(forward).toContain(
+      'ip saddr 10.200.0.2 ct state established,related drop'
+    )
+    expect(forward).toContain(
+      'ip daddr 10.200.0.2 ct state established,related drop'
+    )
+    expect(forward).toContain('iifname "fctap0" drop')
+    expect(forward).toContain('oifname "fctap0" drop')
+    expect(forward).toContain('ip saddr 10.200.0.2 drop')
+    expect(forward).toContain('ip daddr 10.200.0.2 drop')
+    const postrouting = section(text, 'postrouting')
+    expect(postrouting).not.toContain('fctap0')
+    // The other lease is untouched.
+    expect(prerouting).toContain('20001')
+    expect(forward).toContain(
+      'iifname "fctap1" ip saddr 10.200.0.6 ct state established,related accept'
+    )
+  })
 })
 
 describe('renderRuleset purity and validation', () => {

@@ -6,16 +6,19 @@
  * DNAT mapping or an established flow keyed on the previous tenant's guest
  * IP/port would still match a blanket `ct state established,related accept`
  * and let the next tenant inherit it. Every release (and every unpublish)
- * therefore deletes the lease's entries in all four directions, plus the
- * public DNAT ports, before the addresses/ports become reusable.
+ * therefore deletes the lease's entries in all four directions.
+ *
+ * Deliberately NO `--orig-port-dst <publicPort>` deletion: that selector has no
+ * address component, so it would delete every tracked TCP connection to that
+ * destination port (other tenants' egress, host connections). Published DNAT
+ * flows have `reply-src == guestIp`, so the four guest-IP selectors cover them
+ * without collateral damage.
  */
 import type { CommandResult, CommandRunner } from '../../interfaces'
-import { assertIpv4, assertPort } from './validate'
+import { assertIpv4 } from './validate'
 
 export interface ConntrackFlushRequest {
   guestIp: string
-  /** Public DNAT ports of the lease (tcp/raw exposes). */
-  publicPorts?: Iterable<number>
 }
 
 const NO_ENTRIES = /0 flow entries have been deleted/i
@@ -26,32 +29,19 @@ export const isNoEntriesResult = (result: CommandResult): boolean =>
   result.code === 1 && NO_ENTRIES.test(`${result.stdout}\n${result.stderr}`)
 
 /**
- * Exact argv lists to run for one lease. Pure and deterministic (ports are
- * sorted) so tests can assert the command set without a host.
+ * Exact argv lists to run for one lease. Pure and deterministic so tests can
+ * assert the command set without a host.
  */
 export const conntrackDeleteCommands = (
   request: ConntrackFlushRequest
 ): string[][] => {
   const guestIp = assertIpv4(request.guestIp)
-  const commands: string[][] = [
+  return [
     ['conntrack', '-D', '--orig-src', guestIp],
     ['conntrack', '-D', '--orig-dst', guestIp],
     ['conntrack', '-D', '--reply-src', guestIp],
     ['conntrack', '-D', '--reply-dst', guestIp],
   ]
-  const ports = [...(request.publicPorts ?? [])].sort((a, b) => a - b)
-  for (const port of ports) {
-    assertPort(port)
-    commands.push([
-      'conntrack',
-      '-D',
-      '--orig-port-dst',
-      String(port),
-      '-p',
-      'tcp',
-    ])
-  }
-  return commands
 }
 
 /** True when conntrack-tools is installed and runnable. */

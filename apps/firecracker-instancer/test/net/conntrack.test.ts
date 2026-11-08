@@ -20,29 +20,34 @@ class RecordingRunner implements CommandRunner {
 }
 
 describe('conntrack delete commands', () => {
-  test('flushes the guest address in all four directions and every public port', () => {
+  test('flushes only the guest address in all four directions', () => {
     expect(
       conntrackDeleteCommands({
         guestIp: '10.200.0.2',
-        publicPorts: [20001, 20000],
       })
     ).toEqual([
       ['conntrack', '-D', '--orig-src', '10.200.0.2'],
       ['conntrack', '-D', '--orig-dst', '10.200.0.2'],
       ['conntrack', '-D', '--reply-src', '10.200.0.2'],
       ['conntrack', '-D', '--reply-dst', '10.200.0.2'],
-      ['conntrack', '-D', '--orig-port-dst', '20000', '-p', 'tcp'],
-      ['conntrack', '-D', '--orig-port-dst', '20001', '-p', 'tcp'],
     ])
   })
 
-  test('rejects injection in the guest IP or a port', () => {
+  test('never deletes by destination port alone (that would hit other tenants)', () => {
+    // Regression: `conntrack -D --orig-port-dst <publicPort> -p tcp` deletes
+    // EVERY tracked TCP connection to that destination port, including other
+    // tenants' egress and host connections. Published DNAT flows always have
+    // reply-src == guestIp, so the four address selectors are enough.
+    for (const argv of conntrackDeleteCommands({ guestIp: '10.200.0.2' })) {
+      expect(argv).not.toContain('--orig-port-dst')
+      expect(argv).not.toContain('-p')
+    }
+  })
+
+  test('rejects injection in the guest IP', () => {
     expect(() =>
       conntrackDeleteCommands({ guestIp: '10.200.0.2; rm -rf /' })
     ).toThrow('invalid IPv4')
-    expect(() =>
-      conntrackDeleteCommands({ guestIp: '10.200.0.2', publicPorts: [0] })
-    ).toThrow('invalid port')
   })
 
   test('treats "0 flow entries have been deleted" (exit 1) as success', () => {
@@ -64,7 +69,7 @@ describe('conntrack delete commands', () => {
 })
 
 describe('flushConntrack', () => {
-  test('runs every delete and tolerates empty results', async () => {
+  test('runs every direction and tolerates empty results', async () => {
     const runner = new RecordingRunner()
     runner.response = () => ({
       code: 1,
@@ -73,16 +78,13 @@ describe('flushConntrack', () => {
     })
     await flushConntrack(runner, {
       guestIp: '10.200.0.2',
-      publicPorts: [20000],
     })
-    expect(runner.calls.length).toBe(5)
-    expect(runner.calls[4]).toEqual([
+    expect(runner.calls.length).toBe(4)
+    expect(runner.calls[3]).toEqual([
       'conntrack',
       '-D',
-      '--orig-port-dst',
-      '20000',
-      '-p',
-      'tcp',
+      '--reply-dst',
+      '10.200.0.2',
     ])
   })
 

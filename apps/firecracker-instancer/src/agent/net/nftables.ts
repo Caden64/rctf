@@ -44,6 +44,14 @@ export interface RulesetOptions {
    * regardless, so `unpublish` can never strip them from a live tap.
    */
   published?: ReadonlySet<string>
+  /**
+   * Leases being released/unpublished. They render ONLY blocking rules (no
+   * DNAT, no forward/input accept, explicit drops for the tap and guest IP in
+   * both directions, including established/related). The lease stays reserved
+   * until these rules are installed, so traffic cannot slip through between a
+   * conntrack flush and the final ruleset replacement.
+   */
+  fenced?: ReadonlySet<string>
 }
 
 interface ValidatedLease {
@@ -164,8 +172,13 @@ export const renderRuleset = (
   const pool = parseSubnetPool(config.subnetPool)
   const validated = validateLeases(leases)
   const published = options.published
+  const fenced = options.fenced
   const isPublished = (lease: NetLease): boolean =>
     published === undefined || published.has(lease.instanceId)
+  const isFenced = (lease: NetLease): boolean =>
+    fenced !== undefined && fenced.has(lease.instanceId)
+  const allowed = validated.filter(entry => !isFenced(entry.lease))
+  const fencedLeases = validated.filter(entry => isFenced(entry.lease))
 
   const lines: string[] = [
     '# rctf-firecracker: managed nftables tables. Generated file, manual edits are lost.',
@@ -188,10 +201,17 @@ export const renderRuleset = (
     )
     lines.push(`    iifname "${lease.tapName}" meta nfproto ipv6 drop`)
   }
-  for (const { lease } of validated) {
+  for (const { lease } of allowed) {
     lines.push(
       `    iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
     )
+  }
+  for (const { lease } of fencedLeases) {
+    lines.push(
+      `    # fenced lease ${lease.instanceId}: unconditional (new + established)`
+    )
+    lines.push(`    iifname "${lease.tapName}" drop`)
+    lines.push(`    ip saddr ${lease.guestIp} drop`)
   }
   lines.push(
     '    iifname "fctap*" drop',
@@ -215,6 +235,26 @@ export const renderRuleset = (
     lines.push(`    iifname "${lease.tapName}" meta nfproto ipv6 drop`)
   }
 
+  if (fencedLeases.length > 0) {
+    lines.push(
+      '    # (a2) Fenced leases (release/unpublish in progress): block EVERYTHING',
+      '    #      to/from their tap and guest address, explicitly including flows',
+      '    #      that conntrack still considers established/related.'
+    )
+    for (const { lease } of fencedLeases) {
+      lines.push(
+        `    ip saddr ${lease.guestIp} ct state established,related drop`
+      )
+      lines.push(
+        `    ip daddr ${lease.guestIp} ct state established,related drop`
+      )
+      lines.push(`    iifname "${lease.tapName}" drop`)
+      lines.push(`    oifname "${lease.tapName}" drop`)
+      lines.push(`    ip saddr ${lease.guestIp} drop`)
+      lines.push(`    ip daddr ${lease.guestIp} drop`)
+    }
+  }
+
   lines.push('    # (g) invalid conntrack state, scoped to our taps only.')
   lines.push('    iifname "fctap*" ct state invalid drop')
   lines.push('    oifname "fctap*" ct state invalid drop')
@@ -223,7 +263,7 @@ export const renderRuleset = (
     '    # (f) return traffic, scoped to the lease interface/address pair so',
     '    #     inherited conntrack state can never be accepted across tenants.'
   )
-  for (const { lease } of validated) {
+  for (const { lease } of allowed) {
     lines.push(
       `    iifname "${lease.tapName}" ip saddr ${lease.guestIp} ct state established,related accept`
     )
@@ -236,13 +276,13 @@ export const renderRuleset = (
     '    # (d) Egress is denied by default: leases without egress cannot start flows.',
     '    #     (Inbound DNAT is not iifname <tap>, and its replies are established.)'
   )
-  for (const { lease } of validated) {
+  for (const { lease } of allowed) {
     if (!lease.egress) {
       lines.push(`    iifname "${lease.tapName}" ct state new drop`)
     }
   }
 
-  const egress = validated.filter(entry => entry.lease.egress)
+  const egress = allowed.filter(entry => entry.lease.egress)
   if (egress.length > 0) {
     lines.push(
       '    # (d) Egress lease: internet only, never local/link-local/RFC1918/pool.'
@@ -261,7 +301,7 @@ export const renderRuleset = (
     }
   }
 
-  const dnat = validated
+  const dnat = allowed
     .filter(entry => isPublished(entry.lease))
     .flatMap(({ lease, routes }) =>
       routes.map(route => ({
@@ -333,6 +373,18 @@ export const renderRuleset = (
       `    iifname "${lease.tapName}" arp operation request arp daddr ip != ${lease.hostIp} drop`
     )
   }
+  lines.push(
+    '    # (j) Unknown fctap* interfaces (up but not leased, or a half-created',
+    '    #     tap) have no per-lease ARP rules. Drop all ARP from any fctap*',
+    '    #     that is not in the leased set (with zero leases: drop all of it).'
+  )
+  const tapNames = validated.map(entry => entry.lease.tapName)
+  if (tapNames.length === 0) {
+    lines.push('    iifname "fctap*" drop')
+  } else {
+    const set = tapNames.map(name => `"${name}"`).join(', ')
+    lines.push(`    iifname "fctap*" iifname != { ${set} } drop`)
+  }
   lines.push('  }', '}', '')
 
   return lines.join('\n')
@@ -352,4 +404,63 @@ export const applyRuleset = async (
       `nft -f - failed (${result.code}): ${result.stderr.trim() || result.stdout.trim() || 'no output'}`
     )
   }
+}
+
+/**
+ * Read the currently installed `inet rctf_fc` table, or `''` when it does not
+ * exist (fresh host / reboot). Used by restore to detect an egress-policy
+ * change, which needs a fence+flush before the new ruleset is rendered.
+ */
+export const readInstalledRuleset = async (
+  runner: CommandRunner
+): Promise<string> => {
+  let result: Awaited<ReturnType<CommandRunner['run']>>
+  try {
+    result = await runner.run(['nft', 'list', 'table', 'inet', NFT_TABLE], {
+      timeoutMs: 10_000,
+    })
+  } catch {
+    return ''
+  }
+  if (result.code === 0) {
+    return result.stdout
+  }
+  const text = `${result.stdout}\n${result.stderr}`
+  if (/no such file|does not exist|not found|cannot find/i.test(text)) {
+    return ''
+  }
+  // A missing/unusable nft binary must not make restore impossible; absence of
+  // evidence is treated like an empty table (no egress transition detected).
+  return ''
+}
+
+const normaliseRuleText = (text: string): string =>
+  text.replace(/\s+/g, ' ').trim()
+
+/**
+ * `true`/`false` when the installed table clearly contains this lease's egress
+ * policy, `undefined` when the lease is absent or the evidence is ambiguous.
+ */
+export const detectInstalledEgress = (
+  ruleset: string,
+  lease: NetLease,
+  config: NetworkConfig
+): boolean | undefined => {
+  if (ruleset.trim() === '') {
+    return undefined
+  }
+  const text = normaliseRuleText(ruleset)
+  const deny = normaliseRuleText(`iifname "${lease.tapName}" ct state new drop`)
+  const allow = normaliseRuleText(
+    `iifname "${lease.tapName}" oifname "${config.externalInterface}" ip saddr ${lease.guestIp} accept`
+  )
+  const hasDeny = text.includes(deny)
+  const hasAllow = text.includes(allow)
+  if (hasAllow && !hasDeny) {
+    return true
+  }
+  if (hasDeny && !hasAllow) {
+    return false
+  }
+  return undefined
 }

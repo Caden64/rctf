@@ -64,7 +64,6 @@ describe('real host (FC_REAL)', () => {
   real('conntrack flush succeeds on an empty table', async () => {
     await flushConntrack(bunCommandRunner, {
       guestIp: '198.51.100.6',
-      publicPorts: [24001],
     })
   })
 })

@@ -68,7 +68,17 @@ export interface AllocatorOptions {
 
 interface FreedIndex {
   index: number
-  at: number
+  /**
+   * Absolute epoch-ms deadline. Absolute (not `at + quarantineMs`) so a
+   * persisted quarantine keeps the same deadline if the configured quarantine
+   * length changes across a restart.
+   */
+  expiresAt: number
+}
+
+export interface QuarantineEntry {
+  id: number
+  expiresAtMs: number
 }
 
 /**
@@ -110,14 +120,14 @@ export class Ipv4Pool {
     return this.freed.length
   }
 
-  private rememberFreed(index: number, at: number): void {
+  private rememberFreed(index: number, expiresAt: number): void {
     const existing = this.freed.find(entry => entry.index === index)
     if (existing !== undefined) {
-      existing.at = Math.max(existing.at, at)
+      existing.expiresAt = Math.max(existing.expiresAt, expiresAt)
       return
     }
-    this.freed.push({ index, at })
-    this.freed.sort((a, b) => a.at - b.at || a.index - b.index)
+    this.freed.push({ index, expiresAt })
+    this.freed.sort((a, b) => a.expiresAt - b.expiresAt || a.index - b.index)
   }
 
   reserve(): number {
@@ -129,7 +139,7 @@ export class Ipv4Pool {
     const now = this.now()
     // Oldest release first, but only once its quarantine has elapsed.
     const head = this.freed[0]
-    if (head !== undefined && now - head.at >= this.quarantineMs) {
+    if (head !== undefined && now >= head.expiresAt) {
       this.freed.shift()
       if (!this.used.has(head.index) && !this.blocked.has(head.index)) {
         this.used.add(head.index)
@@ -171,14 +181,14 @@ export class Ipv4Pool {
   }
 
   /** Release a live index; it enters the reuse quarantine. */
-  release(index: number): void {
+  release(index: number, expiresAt = this.now() + this.quarantineMs): void {
     if (this.blocked.has(index)) {
       return
     }
     if (!this.used.delete(index)) {
       return
     }
-    this.rememberFreed(index, this.now())
+    this.rememberFreed(index, expiresAt)
   }
 
   /**
@@ -192,7 +202,7 @@ export class Ipv4Pool {
       return
     }
     this.used.delete(index)
-    this.rememberFreed(index, this.now() - this.quarantineMs)
+    this.rememberFreed(index, this.now())
   }
 
   /**
@@ -218,7 +228,46 @@ export class Ipv4Pool {
     if (this.used.has(index) || this.blocked.has(index)) {
       return
     }
-    this.rememberFreed(index, this.now())
+    this.rememberFreed(index, this.now() + this.quarantineMs)
+  }
+
+  /** Conservative fail-closed gate used when the quarantine file is corrupt. */
+  quarantineAll(): void {
+    if (this.quarantineMs <= 0) {
+      return
+    }
+    const expiresAt = this.now() + this.quarantineMs
+    for (let index = 0; index < this.pool.capacity; index++) {
+      if (!this.used.has(index) && !this.blocked.has(index)) {
+        this.rememberFreed(index, expiresAt)
+      }
+    }
+  }
+
+  /** Current (possibly expired) quarantine entries, for durable persistence. */
+  quarantineEntries(): QuarantineEntry[] {
+    return this.freed.map(entry => ({
+      id: entry.index,
+      expiresAtMs: entry.expiresAt,
+    }))
+  }
+
+  /** Re-apply persisted deadlines without resetting them to `now`. */
+  applyQuarantine(entries: readonly QuarantineEntry[]): void {
+    for (const entry of entries) {
+      if (
+        !Number.isInteger(entry.id) ||
+        entry.id < 0 ||
+        entry.id >= this.pool.capacity ||
+        !Number.isFinite(entry.expiresAtMs)
+      ) {
+        continue
+      }
+      if (this.used.has(entry.id) || this.blocked.has(entry.id)) {
+        continue
+      }
+      this.rememberFreed(entry.id, entry.expiresAtMs)
+    }
   }
 
   private forgetFreed(index: number): void {
@@ -274,7 +323,8 @@ export class Ipv4Pool {
  */
 export class PortAllocator {
   private readonly used = new Set<number>()
-  private readonly freedAt = new Map<number, number>()
+  /** port -> absolute epoch-ms quarantine deadline. */
+  private readonly expiresAt = new Map<number, number>()
   private readonly quarantineMs: number
   private readonly now: Clock
 
@@ -299,7 +349,7 @@ export class PortAllocator {
   }
 
   get quarantined(): number {
-    return this.freedAt.size
+    return this.expiresAt.size
   }
 
   reserve(count: number): number[] {
@@ -311,8 +361,8 @@ export class PortAllocator {
     }
     const now = this.now()
     const result: number[] = []
-    const released = [...this.freedAt.entries()]
-      .filter(([, at]) => now - at >= this.quarantineMs)
+    const released = [...this.expiresAt.entries()]
+      .filter(([, expiresAt]) => now >= expiresAt)
       .sort((a, b) => a[1] - b[1] || a[0] - b[0])
     for (const [port] of released) {
       if (result.length >= count) {
@@ -327,18 +377,18 @@ export class PortAllocator {
       port <= this.to && result.length < count;
       port++
     ) {
-      if (!this.used.has(port) && !this.freedAt.has(port)) {
+      if (!this.used.has(port) && !this.expiresAt.has(port)) {
         result.push(port)
       }
     }
     if (result.length !== count) {
       throw new NetworkCapacityError(
-        `tcpPortRange ${this.from}-${this.to} exhausted (${this.used.size}/${this.size} in use, ${this.freedAt.size} in reuse quarantine)`
+        `tcpPortRange ${this.from}-${this.to} exhausted (${this.used.size}/${this.size} in use, ${this.expiresAt.size} in reuse quarantine)`
       )
     }
     for (const port of result) {
       this.used.add(port)
-      this.freedAt.delete(port)
+      this.expiresAt.delete(port)
     }
     return result
   }
@@ -358,16 +408,18 @@ export class PortAllocator {
     if (this.used.has(port)) {
       throw new Error(`public port ${port} is allocated twice`)
     }
-    this.freedAt.delete(port)
+    this.expiresAt.delete(port)
     this.used.add(port)
   }
 
   /** Release ports; they enter the reuse quarantine. */
-  release(ports: Iterable<number>): void {
-    const now = this.now()
+  release(
+    ports: Iterable<number>,
+    expiresAt = this.now() + this.quarantineMs
+  ): void {
     for (const port of ports) {
       if (this.used.delete(port)) {
-        this.freedAt.set(port, now)
+        this.expiresAt.set(port, expiresAt)
       }
     }
   }
@@ -376,7 +428,52 @@ export class PortAllocator {
   discard(ports: Iterable<number>): void {
     for (const port of ports) {
       this.used.delete(port)
-      this.freedAt.delete(port)
+      this.expiresAt.delete(port)
+    }
+  }
+
+  /** Conservative fail-closed gate used when the quarantine file is corrupt. */
+  quarantineAll(): void {
+    if (this.quarantineMs <= 0) {
+      return
+    }
+    const expiresAt = this.now() + this.quarantineMs
+    for (let port = this.from; port <= this.to; port++) {
+      if (!this.used.has(port)) {
+        this.expiresAt.set(port, expiresAt)
+      }
+    }
+  }
+
+  /** Current (possibly expired) quarantine entries, for durable persistence. */
+  quarantineEntries(): QuarantineEntry[] {
+    return [...this.expiresAt.entries()].map(([port, expiresAtMs]) => ({
+      id: port,
+      expiresAtMs,
+    }))
+  }
+
+  /** Re-apply persisted deadlines without resetting them to `now`. */
+  applyQuarantine(entries: readonly QuarantineEntry[]): void {
+    for (const entry of entries) {
+      if (
+        !isValidPort(entry.id) ||
+        entry.id < this.from ||
+        entry.id > this.to ||
+        !Number.isFinite(entry.expiresAtMs)
+      ) {
+        continue
+      }
+      if (this.used.has(entry.id)) {
+        continue
+      }
+      const existing = this.expiresAt.get(entry.id)
+      this.expiresAt.set(
+        entry.id,
+        existing === undefined
+          ? entry.expiresAtMs
+          : Math.max(existing, entry.expiresAtMs)
+      )
     }
   }
 }
