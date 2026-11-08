@@ -1,0 +1,31 @@
+#!/bin/sh
+# Guest service used by the edge test (installed as /app/start by the harness).
+# Reads the env the real guest init exported from MMDS. Serves the team identity
+# over HTTP :8080, holds raw TCP connections on :9000, and probes:
+#   PROBE_PEER  an URL (upstream HTTP for the egress test)
+#   PROBE_HOST  an URL on the host side of its own tap
+#   SCAN_PEER   another guest's address (busybox nc connect, port SCAN_PORT)
+set -u
+mkdir -p /www
+printf '%s\n' "${GUEST_NAME:-unknown}" >/www/id.txt
+echo ok >/www/index.html
+
+httpd -f -p 8080 -h /www >/dev/null 2>&1 &
+# One long-lived raw TCP listener: a client that connects and stays connected
+# creates a conntrack entry through this guest's DNAT mapping. tcpsvd keeps the
+# listening socket open while each connection is handled by `cat`.
+busybox tcpsvd 0.0.0.0 9000 busybox cat >/dev/null 2>&1 &
+
+while :; do
+  p=blocked
+  h=blocked
+  s=blocked
+  [ -n "${PROBE_PEER:-}" ] && wget -T 2 -qO- "$PROBE_PEER" >/dev/null 2>&1 && p=REACHED
+  [ -n "${PROBE_HOST:-}" ] && wget -T 2 -qO- "$PROBE_HOST" >/dev/null 2>&1 && h=REACHED
+  if [ -n "${SCAN_PEER:-}" ]; then
+    printf '' | nc -w 1 "$SCAN_PEER" "${SCAN_PORT:-8080}" >/dev/null 2>&1 && s=REACHED
+  fi
+  printf 'peer=%s host=%s scan=%s\n' "$p" "$h" "$s" >/www/probe.tmp
+  mv /www/probe.tmp /www/probe.txt
+  sleep 1
+done
