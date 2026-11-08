@@ -92,10 +92,11 @@ expect_eq "$(printf '%s' "$INFO" | jq -c '.images | sort')" '["smoke","vmtest"]'
 
 # ---------------------------------------------------------------------------
 # The jailer forks and setuid/setgid()s to jailUid/jailGid (10000) before it
-# execs Firecracker. The shipped unit must deliver CAP_SETUID and CAP_SETGID
-# to the agent's effective set with NO test-only drop-in (systemd 255 +
-# NoNewPrivileges + a seccomp filter otherwise loses CAP_SETUID; see the unit's
-# comment and repros/systemd-unit-setuid.sh).
+# execs Firecracker. The shipped unit must deliver CAP_SETUID to the agent's
+# effective set with NO test-only drop-in (systemd 255 + NoNewPrivileges + a
+# seccomp filter drops exactly CAP_SETUID; see the unit's comment and
+# repros/systemd-unit-setuid.sh). CAP_SETGID is already effective and stays in
+# the bounding set.
 # ---------------------------------------------------------------------------
 if [ -d "$DROPIN" ] && [ -n "$(ls -A "$DROPIN" 2>/dev/null)" ]; then
   bad "test-only systemd drop-in is still installed ($(ls "$DROPIN"))"
@@ -103,10 +104,11 @@ else
   ok "no systemd drop-in: the agent runs from the shipped unit alone"
 fi
 expect_eq "$(systemctl show -p AmbientCapabilities --value rctf-firecracker-agent | tr ' ' '\n' | sort | tr '\n' ' ')" \
-  "cap_setgid cap_setuid " \
-  "shipped unit applies AmbientCapabilities=CAP_SETUID CAP_SETGID"
-CAPEFF=$(grep '^CapEff:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')
-CAPBND=$(grep '^CapBnd:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')
+  "cap_setuid " \
+  "shipped unit applies AmbientCapabilities=CAP_SETUID only"
+AGENTPID=$(agent_main_pid)
+CAPEFF=$(cap_field "$AGENTPID" CapEff)
+CAPBND=$(cap_field "$AGENTPID" CapBnd)
 echo "  CapEff: $CAPEFF"
 echo "  CapBnd: $CAPBND"
 if [ $((0x$CAPEFF & 0x80)) -ne 0 ] && [ $((0x$CAPEFF & 0x40)) -ne 0 ]; then
@@ -114,13 +116,12 @@ if [ $((0x$CAPEFF & 0x80)) -ne 0 ] && [ $((0x$CAPEFF & 0x40)) -ne 0 ]; then
 else
   bad "agent process lacks CAP_SETUID/CAP_SETGID effective under the shipped unit; jailer setuid will fail"
 fi
-expect_eq "$(grep '^CapAmb:' "/proc/$(agent_main_pid)/status" | awk '{print $2}')" 00000000000000c0 \
-  "the two restored capabilities are ambient (inherited across the jailer exec)"
+assert_agent_caps "$AGENTPID" "shipped unit"
 expect_eq "$(api "$API/v1/info" | jq -r '.accepting')" true \
   "preflight accepting:true with no drop-in"
 
 echo
-echo "NOTE: the shipped unit keeps RestrictAddressFamilies= and restores the two"
-echo "      capabilities the jailer needs via AmbientCapabilities=."
+echo "NOTE: the shipped unit keeps RestrictAddressFamilies= and restores the one"
+echo "      measured-missing capability (CAP_SETUID) via AmbientCapabilities=."
 echo "      minimal repro/experiment: deploy/firecracker/vmtest/repros/systemd-unit-setuid.sh"
 finish

@@ -14,6 +14,7 @@
 #   ./vm.sh status
 #   ./vm.sh stop     # kill qemu + seed http server, keep the disk
 #   ./vm.sh destroy  # stop and remove the overlay (base image is kept)
+#   ./vm.sh selftest # unprivileged check of the pidfile authentication
 #
 # Environment:
 #   VM_DIR          default $HOME/.cache/rctf-vmtest
@@ -79,20 +80,154 @@ ssh_opts=(
   -o BatchMode=yes
 )
 
-is_running() {
-  [ -f "$QEMU_PID" ] || return 1
-  local pid
-  pid=$(cat "$QEMU_PID" 2>/dev/null) || return 1
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+# ---------------------------------------------------------------------------
+# PID file authentication
+# ---------------------------------------------------------------------------
+# A bare PID cannot identify a process: PIDs are reused, and a pidfile can
+# outlive a reboot. Every pidfile written by this script is therefore versioned
+# and contains the kernel boot id, the process start time (/proc/<pid>/stat
+# field 22, clock ticks since boot), the canonical executable, and the
+# run-specific argv elements (this VM_DIR's pidfile / seed directory). A signal
+# is sent only when *all* of them still match. Anything else is treated as a
+# stale pidfile: it is removed with a warning and no process is signalled.
+current_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+process_start_ticks() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+process_exe() { readlink "/proc/$1/exe" 2>/dev/null; }
+cmdline_digest() { sha256sum "/proc/$1/cmdline" 2>/dev/null | awk '{print $1}'; }
+
+pidfile_record() { # pidfile_record <file> <kind> <pid> [argv-element...]
+  local file=$1 kind=$2 pid=$3 a tmp=$1.tmp.$$
+  shift 3
+  local boot start exe
+  boot=$(current_boot_id) || return 1
+  start=$(process_start_ticks "$pid") || return 1
+  exe=$(process_exe "$pid") || return 1
+  [ -n "$boot" ] && [ -n "$start" ] && [ -n "$exe" ] || return 1
+  {
+    printf 'version=2\nkind=%s\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
+      "$kind" "$pid" "$boot" "$start" "$exe"
+    for a in "$@"; do printf 'arg=%s\n' "$a"; done
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$file"
 }
 
-stop_seed_server() {
-  [ -f "$SEED_PID" ] || return 0
-  local pid
-  pid=$(cat "$SEED_PID" 2>/dev/null) || return 0
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
-  rm -f "$SEED_PID"
+pidfile_verify() { # pidfile_verify <file> <kind>; sets PIDFILE_PID, returns 0 on match
+  local file=$1 kind=$2 line key val
+  local version= pid= boot= start= exe=
+  local -a recorded=() live=() required=()
+  PIDFILE_PID=
+  PIDFILE_REASON=
+  [ -f "$file" ] || { PIDFILE_REASON="file is missing"; return 1; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [[ $line != *=* ]]; then
+      PIDFILE_REASON="unsupported legacy pidfile (bare PID '$line'); cannot authenticate"
+      return 1
+    fi
+    key=${line%%=*}
+    val=${line#*=}
+    case "$key" in
+      version) version=$val ;;
+      kind) [ "$val" = "$kind" ] || { PIDFILE_REASON="kind is '$val', expected '$kind'"; return 1; } ;;
+      pid) pid=$val ;;
+      boot_id) boot=$val ;;
+      start_ticks) start=$val ;;
+      exe) exe=$val ;;
+      arg) recorded+=("$val") ;;
+      *) PIDFILE_REASON="unknown field '$key'"; return 1 ;;
+    esac
+  done <"$file"
+  [ "$version" = 2 ] || { PIDFILE_REASON="unsupported pidfile version '${version:-none}'"; return 1; }
+  case "$pid" in '' | *[!0-9]*) PIDFILE_REASON="invalid pid '$pid'"; return 1 ;; esac
+  if [ "$boot" != "$(current_boot_id)" ]; then
+    PIDFILE_REASON="recorded boot id '${boot:-none}' != current '$(current_boot_id)' (stale after reboot)"
+    return 1
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    PIDFILE_REASON="pid $pid is not running"
+    return 1
+  fi
+  if [ "$start" != "$(process_start_ticks "$pid")" ]; then
+    PIDFILE_REASON="pid $pid start ticks '${start:-none}' != live '$(process_start_ticks "$pid")' (pid reused)"
+    return 1
+  fi
+  if [ "$exe" != "$(process_exe "$pid")" ]; then
+    PIDFILE_REASON="pid $pid executable '${exe:-none}' != live '$(process_exe "$pid")'"
+    return 1
+  fi
+
+  while IFS= read -r -d '' val; do live+=("$val"); done <"/proc/$pid/cmdline" 2>/dev/null || true
+  case "$kind" in
+    qemu) required=(-pidfile "$QEMU_PID") ;;
+    seed) required=(-m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR") ;;
+    *) PIDFILE_REASON="unknown process kind '$kind'"; return 1 ;;
+  esac
+  local needle candidate found
+  for needle in "${required[@]}"; do
+    found=0
+    for candidate in "${live[@]}"; do
+      if [ "$candidate" = "$needle" ]; then found=1; break; fi
+    done
+    if [ "$found" = 0 ]; then
+      PIDFILE_REASON="pid $pid cmdline lacks required argument '$needle' (not this VM_DIR)"
+      return 1
+    fi
+  done
+  for needle in "${recorded[@]}"; do
+    found=0
+    for candidate in "${live[@]}"; do
+      if [ "$candidate" = "$needle" ]; then found=1; break; fi
+    done
+    if [ "$found" = 0 ]; then
+      PIDFILE_REASON="pid $pid cmdline lacks recorded argument '$needle'"
+      return 1
+    fi
+  done
+  PIDFILE_PID=$pid
+  return 0
 }
+
+pidfile_take() { # pidfile_take <file> <kind>: verified pid, or remove stale and return 1
+  local file=$1 kind=$2
+  [ -f "$file" ] || return 1
+  if pidfile_verify "$file" "$kind"; then
+    printf '%s\n' "$PIDFILE_PID"
+    return 0
+  fi
+  log "WARNING: removing stale pidfile $file ($PIDFILE_REASON); not signalling any process"
+  rm -f "$file"
+  return 1
+}
+
+is_running() { pidfile_take "$QEMU_PID" qemu >/dev/null; }
+
+# Stop a process recorded in a pidfile. The identity is snapshotted before the
+# first signal so a SIGKILL is only sent to the same process (qemu may unlink its
+# own pidfile on the way out, and the PID may have been reused by then).
+stop_recorded() { # stop_recorded <file> <kind> <label> <term-wait-ticks>
+  local file=$1 kind=$2 label=$3 wait=$4 pid boot start exe digest
+  pid=$(pidfile_take "$file" "$kind") || return 0
+  boot=$(current_boot_id)
+  start=$(process_start_ticks "$pid")
+  exe=$(process_exe "$pid")
+  digest=$(cmdline_digest "$pid")
+  log "stopping $label (pid $pid)"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 "$wait"); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+  if kill -0 "$pid" 2>/dev/null; then
+    if [ "$(current_boot_id)" = "$boot" ] &&
+      [ "$(process_start_ticks "$pid")" = "$start" ] &&
+      [ "$(process_exe "$pid")" = "$exe" ] &&
+      [ "$(cmdline_digest "$pid")" = "$digest" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    else
+      log "WARNING: $label pid $pid changed identity before SIGKILL; not signalling"
+    fi
+  fi
+  rm -f "$file"
+}
+
+stop_seed_server() { stop_recorded "$SEED_PID" seed "cloud-init seed server" 25; }
 
 # Print the PID(s) listening on <port>, or "unknown" when ss cannot attribute
 # the socket to a process. Returns 1 when nothing is listening.
@@ -132,19 +267,10 @@ check_port_free() { # check_port_free <port> <allowed-pid> <description>
   done
 }
 
-recorded_pid() { # recorded_pid <pidfile> <expected-command-prefix>
-  local file=$1 want=$2 pid
-  [ -f "$file" ] || return 1
-  pid=$(cat "$file" 2>/dev/null) || return 1
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  ps -o comm= -p "$pid" 2>/dev/null | grep -q "^$want" || return 1
-  printf '%s\n' "$pid"
-}
-
 check_boot_ports() {
-  local qpid spid
-  qpid=$(recorded_pid "$QEMU_PID" qemu-system-x86 || true)
-  spid=$(recorded_pid "$SEED_PID" python || true)
+  local qpid= spid=
+  if pidfile_verify "$QEMU_PID" qemu; then qpid=$PIDFILE_PID; fi
+  if pidfile_verify "$SEED_PID" seed; then spid=$PIDFILE_PID; fi
   check_port_free "$VM_SSH_PORT" "$qpid" "VM ssh"
   check_port_free "$VM_SEED_PORT" "$spid" "cloud-init seed"
 }
@@ -297,12 +423,18 @@ EOF
 
 start_seed_server() {
   if curl -sf --max-time 2 "http://127.0.0.1:$VM_SEED_PORT/meta-data" >/dev/null 2>&1; then
+    # A seed server from an interrupted run is still serving. It is only
+    # acceptable if its pidfile authenticates; check_boot_ports already refused
+    # to boot when the port belonged to anything else.
     return 0
   fi
   command -v python3 >/dev/null || die "python3 is required to serve the cloud-init seed"
   nohup python3 -m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" \
     >"$VM_DIR/seed-http.log" 2>&1 &
-  echo $! >"$SEED_PID"
+  local spid=$!
+  pidfile_record "$SEED_PID" seed "$spid" \
+    -m http.server "$VM_SEED_PORT" --bind 127.0.0.1 --directory "$SEED_DIR" ||
+    die "could not record authenticated seed pidfile $SEED_PID"
   local i
   for i in $(seq 1 50); do
     curl -sf --max-time 2 "http://127.0.0.1:$VM_SEED_PORT/meta-data" >/dev/null 2>&1 && return 0
@@ -338,8 +470,9 @@ boot() {
   [ -r /dev/kvm ] || die "/dev/kvm is not readable (KVM is required)"
   mkdir -p "$VM_DIR"
   check_boot_ports
-  if is_running; then
-    log "VM already running (pid $(cat "$QEMU_PID"))"
+  local qpid
+  if qpid=$(pidfile_take "$QEMU_PID" qemu); then
+    log "VM already running (pid $qpid)"
     return 0
   fi
   ensure_base_image
@@ -360,11 +493,147 @@ boot() {
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
     -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${VM_SEED_PORT}/"
+  qpid=$(cat "$QEMU_PID" 2>/dev/null) || qpid=
+  [ -n "$qpid" ] || die "qemu did not write $QEMU_PID"
+  pidfile_record "$QEMU_PID" qemu "$qpid" -pidfile "$QEMU_PID" ||
+    die "could not record authenticated qemu pidfile $QEMU_PID"
   if ! wait_ssh; then
     tail -40 "$CONSOLE" >&2 || true
     die "VM did not become reachable over ssh"
   fi
   wait_cloud_init
+}
+
+# ---------------------------------------------------------------------------
+# Unprivileged self-test for the pidfile authentication above. Runs on the
+# host, needs no VM, no root and no port: it starts decoy `sleep`/`python3`
+# processes and proves that a stale pidfile pointing at an unrelated live
+# process is never signalled (while a correctly recorded one still is).
+# ---------------------------------------------------------------------------
+selftest() {
+  local fail=0 line
+  local save_vm_dir=$VM_DIR save_qpid=$QEMU_PID save_spid=$SEED_PID
+  local save_seed=$SEED_DIR save_sport=$VM_SEED_PORT
+  SELFTEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vmtest-selftest.XXXXXX")
+  SELFTEST_DECOYS=()
+  selftest_cleanup() {
+    local p
+    for p in "${SELFTEST_DECOYS[@]}"; do kill "$p" 2>/dev/null || true; done
+    rm -rf "$SELFTEST_TMP"
+  }
+  trap selftest_cleanup EXIT
+  local tmp=$SELFTEST_TMP
+  local -a decoys=()
+  VM_DIR=$tmp
+  QEMU_PID=$tmp/qemu.pid
+  SEED_PID=$tmp/seed-http.pid
+  SEED_DIR=$tmp/seed
+  VM_SEED_PORT=$((20000 + RANDOM % 20000))
+  mkdir -p "$SEED_DIR"
+
+  st_ok() { printf '  PASS: %s\n' "$*"; }
+  st_bad() { printf '  FAIL: %s\n' "$*" >&2; fail=$((fail + 1)); }
+  st_alive() { # st_alive <pid> <label>
+    if kill -0 "$1" 2>/dev/null; then st_ok "$2: live decoy was NOT signalled"; else st_bad "$2: live decoy was signalled"; fi
+  }
+  st_dead() { # st_dead <pid> <label>
+    if kill -0 "$1" 2>/dev/null; then st_bad "$2: process is still alive"; else st_ok "$2: process was stopped"; fi
+  }
+  st_message() { # st_message <label> <pattern>
+    if grep -q -- "$2" "$tmp/stop.out"; then st_ok "$1: warning explains the mismatch"; else
+      st_bad "$1: expected warning matching '$2', got: $(tr '\n' ' ' <"$tmp/stop.out")"
+    fi
+  }
+  st_removed() { # st_removed <label>
+    if [ -e "$QEMU_PID" ] || [ -e "$SEED_PID" ]; then st_bad "$1: stale pidfile was not removed"; else st_ok "$1: stale pidfile was removed"; fi
+  }
+
+  printf 'pidfile authentication selftest (no VM, no root)\n'
+
+  # 1. Old-format pidfile (bare PID): cannot be authenticated at all.
+  sleep 300 >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  printf '%s\n' "$decoy" >"$QEMU_PID"
+  stop_recorded "$QEMU_PID" qemu "selftest bare-pid decoy" 2 >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "bare PID"
+  st_message "bare PID" "unsupported legacy pidfile"
+  st_removed "bare PID"
+
+  # 2. Authentic-looking metadata, but an unrelated command line.
+  sleep 300 >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  {
+    printf 'version=2\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
+      "$decoy" "$(current_boot_id)" "$(process_start_ticks "$decoy")" "$(process_exe "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+  } >"$QEMU_PID"
+  stop_recorded "$QEMU_PID" qemu "selftest cmdline decoy" 2 >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "command-line mismatch"
+  st_message "command-line mismatch" "lacks required argument"
+  st_removed "command-line mismatch"
+
+  # 3. Correct executable/args but a different boot id (stale after reboot).
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  {
+    printf 'version=2\nkind=qemu\npid=%s\nboot_id=00000000-0000-0000-0000-000000000000\nstart_ticks=%s\nexe=%s\n' \
+      "$decoy" "$(process_start_ticks "$decoy")" "$(process_exe "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+  } >"$QEMU_PID"
+  stop_recorded "$QEMU_PID" qemu "selftest boot-id decoy" 2 >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "boot-id mismatch"
+  st_message "boot-id mismatch" "stale after reboot"
+  st_removed "boot-id mismatch"
+
+  # 4. Correct boot/exe/args but a different start time (PID reused).
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  start=$(process_start_ticks "$decoy")
+  {
+    printf 'version=2\nkind=qemu\npid=%s\nboot_id=%s\nstart_ticks=%s\nexe=%s\n' \
+      "$decoy" "$(current_boot_id)" "$((start + 1))" "$(process_exe "$decoy")"
+    printf 'arg=-pidfile\narg=%s\n' "$QEMU_PID"
+  } >"$QEMU_PID"
+  stop_recorded "$QEMU_PID" qemu "selftest start-time decoy" 2 >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "start-time mismatch"
+  st_message "start-time mismatch" "pid reused"
+  st_removed "start-time mismatch"
+
+  # 5. Positive control: a process whose identity matches exactly IS stopped.
+  python3 -c 'import time; time.sleep(300)' -pidfile "$QEMU_PID" >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  sleep 0.2
+  pidfile_record "$QEMU_PID" qemu "$decoy" -pidfile "$QEMU_PID" ||
+    st_bad "could not record the positive-control pidfile"
+  stop_recorded "$QEMU_PID" qemu "selftest positive control" 25 >"$tmp/stop.out" 2>&1
+  st_dead "$decoy" "positive control"
+  st_removed "positive control"
+
+  # 6. A stale seed-server pidfile is also not signalled.
+  sleep 300 >/dev/null 2>&1 &
+  decoy=$!
+  SELFTEST_DECOYS+=("$decoy")
+  printf '%s\n' "$decoy" >"$SEED_PID"
+  stop_seed_server >"$tmp/stop.out" 2>&1
+  st_alive "$decoy" "stale seed pidfile"
+  st_removed "stale seed pidfile"
+
+  VM_DIR=$save_vm_dir
+  QEMU_PID=$save_qpid
+  SEED_PID=$save_spid
+  SEED_DIR=$save_seed
+  VM_SEED_PORT=$save_sport
+
+  printf 'RESULT: pidfile selftest %s (%d failure(s))\n' \
+    "$([ "$fail" -eq 0 ] && echo PASS || echo FAIL)" "$fail"
+  [ "$fail" -eq 0 ]
 }
 
 cmd=${1:-}
@@ -378,8 +647,8 @@ case "$cmd" in
     exec ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 "$@"
     ;;
   status)
-    if is_running; then
-      echo "running pid=$(cat "$QEMU_PID") ssh=127.0.0.1:$VM_SSH_PORT"
+    if pid=$(pidfile_take "$QEMU_PID" qemu); then
+      echo "running pid=$pid ssh=127.0.0.1:$VM_SSH_PORT"
     else
       echo "stopped"
       exit 1
@@ -387,16 +656,10 @@ case "$cmd" in
     ;;
   ip) echo "127.0.0.1:$VM_SSH_PORT" ;;
   stop)
-    if is_running; then
-      pid=$(cat "$QEMU_PID")
-      log "stopping VM (pid $pid)"
-      kill "$pid" 2>/dev/null || true
-      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$QEMU_PID"
+    stop_recorded "$QEMU_PID" qemu "VM" 50
     stop_seed_server
     ;;
+  selftest) selftest ;;
   destroy)
     "$0" stop
     log "removing overlay $OVERLAY"

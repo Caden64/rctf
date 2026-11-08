@@ -6,9 +6,9 @@
 # fails to setuid(10000):
 #   Failed to exec into Firecracker: Operation not permitted (os error 1)
 #
-# The shipped unit restores exactly those bits with
-# AmbientCapabilities=CAP_SETUID CAP_SETGID (and keeps the socket filter).
-# This script measures all three combinations on the running system.
+# The shipped unit restores the one measured-missing bit with
+# AmbientCapabilities=CAP_SETUID (CAP_SETGID is already effective). This script
+# measures all three combinations on the running system.
 #
 # Run as root inside the test VM:
 #   sudo bash repros/systemd-unit-setuid.sh
@@ -45,10 +45,10 @@ run both -p NoNewPrivileges=yes -p "$RAF"
 echo "  => CAP_SETUID (0x80) is in CapBnd but missing from CapPrm/CapEff."
 
 echo
-echo "== the shipped unit's fix: add AmbientCapabilities=CAP_SETUID CAP_SETGID =="
+echo "== the shipped unit's fix: add AmbientCapabilities=CAP_SETUID (one bit) =="
 run fixed -p NoNewPrivileges=yes -p "$RAF" \
-  -p 'AmbientCapabilities=CAP_SETUID CAP_SETGID'
-echo "  => CapEff=CapBnd, CapAmb=0xc0."
+  -p 'AmbientCapabilities=CAP_SETUID'
+echo "  => CapEff=CapBnd=0x82c31eb, CapAmb=0x80 (CAP_SETGID was never missing)."
 
 echo
 echo "== the shipped unit (from the repository) =="
@@ -71,9 +71,9 @@ systemd-run --wait --pipe --collect --unit="repro-setuid-bad-$$" \
   -p User=root -p NoNewPrivileges=yes -p CapabilityBoundingSet="$CAPS" -p "$RAF" \
   /usr/bin/setpriv --reuid=10000 --regid=10000 --clear-groups /usr/bin/id 2>&1 |
   grep -E 'setpriv|uid=|Operation not permitted' | tail -3
-echo "-- with the shipped unit's ambient caps (works):"
+echo "-- with the shipped unit's ambient cap (works):"
 systemd-run --wait --pipe --collect --unit="repro-setuid-ok-$$" \
   -p User=root -p NoNewPrivileges=yes -p CapabilityBoundingSet="$CAPS" -p "$RAF" \
-  -p 'AmbientCapabilities=CAP_SETUID CAP_SETGID' \
+  -p 'AmbientCapabilities=CAP_SETUID' \
   /usr/bin/setpriv --reuid=10000 --regid=10000 --clear-groups /usr/bin/id 2>&1 |
   grep -E 'setpriv|uid=|Operation not permitted' | tail -3

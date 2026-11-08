@@ -261,6 +261,60 @@ wait_agent_active() {
 
 agent_main_pid() { systemctl show -p MainPID --value rctf-firecracker-agent; }
 
+# Documented agent capability set. CapabilityBoundingSet= in the shipped unit is
+# CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_KILL, CAP_SETGID, CAP_SETUID,
+# CAP_SETPCAP, CAP_NET_ADMIN, CAP_NET_RAW, CAP_SYS_CHROOT, CAP_SYS_PTRACE,
+# CAP_SYS_ADMIN, CAP_MKNOD = 0x82c31eb. AmbientCapabilities=CAP_SETUID restores
+# the one bit systemd drops (0x80), so CapEff must equal CapBnd and CapAmb must
+# be exactly CAP_SETUID.
+AGENT_CAPBND=00000000082c31eb
+AGENT_CAPAMB=0000000000000080
+
+cap_field() { grep -E "^$2:" "/proc/$1/status" 2>/dev/null | awk '{print $2}'; }
+
+assert_agent_caps() { # assert_agent_caps <pid> <label>
+  local pid=$1 label=$2
+  expect_eq "$(cap_field "$pid" CapBnd)" "$AGENT_CAPBND" \
+    "agent CapBnd equals the documented unit set ($label)"
+  expect_eq "$(cap_field "$pid" CapEff)" "$AGENT_CAPBND" \
+    "agent CapEff equals CapBnd, so CAP_SETUID was restored ($label)"
+  expect_eq "$(cap_field "$pid" CapPrm)" "$AGENT_CAPBND" \
+    "agent CapPrm equals CapBnd ($label)"
+  expect_eq "$(cap_field "$pid" CapAmb)" "$AGENT_CAPAMB" \
+    "agent CapAmb is only CAP_SETUID ($label)"
+  expect_eq "$(cap_field "$pid" NoNewPrivs)" 1 \
+    "agent NoNewPrivs=1 ($label)"
+}
+
+# Every live process belonging to the instance: the jailer execs Firecracker in
+# place (same PID), but enumerate descendants too in case it ever forks.
+fc_family_pids() { # fc_family_pids <rootpid>
+  local root=$1 child
+  printf '%s\n' "$root"
+  for child in $(pgrep -P "$root" 2>/dev/null || true); do
+    fc_family_pids "$child"
+  done
+}
+
+assert_no_caps() { # assert_no_caps <pid> <label>: guest-facing process is unprivileged
+  local pid=$1 label=$2
+  expect_eq "$(cap_field "$pid" CapPrm)" 0000000000000000 \
+    "pid $pid has zero permitted capabilities ($label)"
+  expect_eq "$(cap_field "$pid" CapEff)" 0000000000000000 \
+    "pid $pid has zero effective capabilities ($label)"
+  expect_eq "$(cap_field "$pid" CapAmb)" 0000000000000000 \
+    "pid $pid has zero ambient capabilities ($label)"
+  expect_eq "$(cap_field "$pid" NoNewPrivs)" 1 \
+    "pid $pid runs with NoNewPrivs=1 ($label)"
+}
+
+assert_instance_no_caps() { # assert_instance_no_caps <rootpid> <label>
+  local root=$1 label=$2 pid
+  for pid in $(fc_family_pids "$root"); do
+    assert_no_caps "$pid" "$label"
+  done
+}
+
 # A firecracker process is identified by the exact process name and --id, never
 # by a command line that merely mentions the id (the check's own shell does).
 fc_procs() { # fc_procs <id>
