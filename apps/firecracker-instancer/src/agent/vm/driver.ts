@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import {
   access,
   chmod,
@@ -16,7 +17,10 @@ import {
 } from 'node:fs/promises'
 import { isIPv4, createConnection } from 'node:net'
 import path from 'node:path'
-import { KERNEL_ARGS_REGEX } from '@rctf/firecracker-protocol'
+import {
+  INSTANCE_ID_REGEX,
+  KERNEL_ARGS_REGEX,
+} from '@rctf/firecracker-protocol'
 import type {
   Clock,
   CommandRunner,
@@ -31,20 +35,18 @@ import { bunCommandRunner } from '../../util/exec'
 import { FirecrackerApi } from './api'
 import type { VmConfig } from './config'
 import type { ResolvedImage } from './images'
-import { listImageNames, resolveImage } from './images'
+import { checkImagesTrusted, listImageNames, resolveImage } from './images'
 import {
   VmValidationError,
   assertInstanceId,
-  fileExists,
   isPathInside,
   removeInstanceTree,
 } from './paths'
 import {
-  cmdlineMatchesInstance,
   findInstanceProcesses,
+  inspectProcess,
   listProcessInstanceIds,
-  processMatches,
-  readCmdline,
+  processMatchesIdentity,
   readStartTicks,
 } from './proc'
 
@@ -117,6 +119,31 @@ const sleepAbortable = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener('abort', onAbort, { once: true })
   })
 
+/** Resolve the configured binary once. Missing paths fall back lexically so preflight can report false. */
+const resolveConfiguredBinary = (target: string): string => {
+  try {
+    return realpathSync(target)
+  } catch {
+    return path.resolve(target)
+  }
+}
+
+/** Combine the caller's cancellation with a per-attempt timeout. */
+const combineAbortSignals = (a: AbortSignal, b: AbortSignal): AbortSignal => {
+  const anySignal = (
+    AbortSignal as unknown as {
+      any?: (signals: AbortSignal[]) => AbortSignal
+    }
+  ).any
+  if (typeof anySignal === 'function') return anySignal([a, b])
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  if (a.aborted || b.aborted) controller.abort()
+  a.addEventListener('abort', abort, { once: true })
+  b.addEventListener('abort', abort, { once: true })
+  return controller.signal
+}
+
 interface RateLimiter {
   ops: { size: number; one_time_burst: number; refill_time: number }
   bandwidth: { size: number; one_time_burst: number; refill_time: number }
@@ -187,10 +214,15 @@ const validateLaunchRequest = (request: VmLaunchRequest): void => {
   }
 }
 
-/** Boot contract v1: kernel IP autoconfig on the single virtio NIC. */
+/**
+ * Boot contract v1: kernel IP autoconfig on the single virtio NIC. `init=` is
+ * emitted before the challenge's extra args, so a later `init=` in
+ * `kernelArgs` still wins.
+ */
 export const buildBootArgs = (
   lease: VmLaunchRequest['lease'],
-  extra?: string
+  extra?: string,
+  defaultInit = '/rctf/init'
 ): string => {
   const base = [
     'console=ttyS0',
@@ -198,6 +230,7 @@ export const buildBootArgs = (
     'panic=1',
     'pci=off',
     `ip=${lease.guestIp}::${lease.hostIp}:255.255.255.252::eth0:off`,
+    `init=${defaultInit}`,
   ].join(' ')
   return extra === undefined || extra.length === 0 ? base : `${base} ${extra}`
 }
@@ -223,10 +256,17 @@ export const createVmDriver = (
   const runDirAbs = path.resolve(config.runDir)
   const chrootBaseAbs = path.resolve(config.chrootBase)
   const cgroupRootAbs = path.resolve(config.cgroupRoot)
-  const firecrackerBase = path.basename(config.firecrackerBin)
 
+  // Resolved ONCE. The jailer canonicalizes `--exec-file` and names the jail
+  // after the *resolved* basename, so every path and process check uses this.
+  const firecrackerBinAbs = resolveConfiguredBinary(config.firecrackerBin)
+  const firecrackerBase = path.basename(firecrackerBinAbs)
+  const jailerBinAbs = resolveConfiguredBinary(config.jailerBin)
+  const firecrackerExeNames: ReadonlySet<string> = new Set([firecrackerBase])
+
+  const jailParent = (): string => path.join(chrootBaseAbs, firecrackerBase)
   const jailBase = (instanceId: string): string =>
-    path.join(chrootBaseAbs, firecrackerBase, instanceId)
+    path.join(jailParent(), instanceId)
   const jailRoot = (instanceId: string): string =>
     path.join(jailBase(instanceId), 'root')
   const instanceDir = (instanceId: string): string =>
@@ -241,12 +281,50 @@ export const createVmDriver = (
   const dirForHandle = (instanceId: string): string =>
     config.mode === 'jailer' ? jailBase(instanceId) : instanceDir(instanceId)
 
-  const ensureRunDir = async (): Promise<void> => {
-    await mkdir(runDirAbs, { recursive: true, mode: 0o700 })
-    const st = await stat(runDirAbs)
-    if (!st.isDirectory()) {
-      throw new VmValidationError(`runDir is not a directory: ${runDirAbs}`)
+  const assertRealDirectory = async (
+    target: string,
+    what: string
+  ): Promise<void> => {
+    let st
+    try {
+      st = await lstat(target)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new VmValidationError(`${what} does not exist: ${target}`)
+      }
+      throw err
     }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new VmValidationError(
+        `${what} must be a real directory (not a symlink): ${target}`
+      )
+    }
+  }
+
+  const ensureRunDir = async (): Promise<void> => {
+    try {
+      await lstat(runDirAbs)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      await mkdir(runDirAbs, { recursive: true, mode: 0o700 })
+    }
+    await assertRealDirectory(runDirAbs, 'runDir')
+  }
+
+  const createExclusiveDir = async (
+    target: string,
+    what: string
+  ): Promise<void> => {
+    try {
+      await mkdir(target, { mode: 0o700 })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new VmValidationError(`${what} already exists: ${target}`)
+      }
+      throw err
+    }
+    await chmod(target, 0o700)
+    await assertRealDirectory(target, what)
   }
 
   const createInstanceDir = async (instanceId: string): Promise<string> => {
@@ -254,20 +332,21 @@ export const createVmDriver = (
     if (!isPathInside(runDirAbs, dir)) {
       throw new VmValidationError(`instance dir escapes runDir: ${dir}`)
     }
+    await createExclusiveDir(dir, 'instance dir')
+    return dir
+  }
+
+  const ensureJailParent = async (): Promise<void> => {
+    await assertRealDirectory(chrootBaseAbs, 'chrootBase')
+    const parent = jailParent()
     try {
-      const st = await lstat(dir)
-      if (st.isSymbolicLink()) {
-        throw new VmValidationError(
-          `refusing to reuse symlinked instance dir: ${dir}`
-        )
-      }
-      throw new VmValidationError(`instance dir already exists: ${dir}`)
+      await lstat(parent)
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      await mkdir(parent, { mode: 0o700 })
+      await chmod(parent, 0o700)
     }
-    await mkdir(dir, { mode: 0o700 })
-    await chmod(dir, 0o700)
-    return dir
+    await assertRealDirectory(parent, 'jail parent')
   }
 
   const copyRootfs = async (src: string, dst: string): Promise<void> => {
@@ -318,9 +397,11 @@ export const createVmDriver = (
     rootfsApiPath: string
     initrdApiPath?: string
   }> => {
+    await ensureJailParent()
+    const base = jailBase(instanceId)
+    await createExclusiveDir(base, 'jail dir')
     const root = jailRoot(instanceId)
-    await mkdir(root, { recursive: true, mode: 0o700 })
-    await chmod(root, 0o700)
+    await createExclusiveDir(root, 'jail root')
 
     const kernelDst = path.join(root, 'vmlinux')
     await copyFile(image.vmlinux, kernelDst)
@@ -354,8 +435,9 @@ export const createVmDriver = (
   /**
    * Jailer argv. The instance id is validated by INSTANCE_ID_REGEX, all paths
    * are absolute and passed as separate argv elements: no shell is involved
-   * and nothing can be injected. Firecracker args after `--` are minimal: the
-   * whole configuration goes over the API socket. Seccomp stays at
+   * and nothing can be injected. Jailer already passes `--id <id>` to the
+   * Firecracker it execs, so only `--api-sock` follows `--`: passing `--id`
+   * again makes Firecracker reject the duplicate flag. Seccomp stays at
    * Firecracker's default level (jailer does not disable it).
    */
   const buildSpawnArgv = (
@@ -365,7 +447,7 @@ export const createVmDriver = (
   ): string[] => {
     if (config.mode === 'direct') {
       return [
-        config.firecrackerBin,
+        firecrackerBinAbs,
         '--id',
         instanceId,
         '--api-sock',
@@ -373,11 +455,11 @@ export const createVmDriver = (
       ]
     }
     return [
-      config.jailerBin,
+      jailerBinAbs,
       '--id',
       instanceId,
       '--exec-file',
-      config.firecrackerBin,
+      firecrackerBinAbs,
       '--uid',
       String(config.jailUid),
       '--gid',
@@ -400,14 +482,20 @@ export const createVmDriver = (
       '--resource-limit',
       `no-file=${config.noFileLimit}`,
       '--',
-      '--id',
-      instanceId,
       '--api-sock',
       '/api.sock',
     ]
   }
 
-  const killChild = async (child: SpawnedVm): Promise<void> => {
+  const killChild = async (
+    child: SpawnedVm,
+    startTicks: number | undefined
+  ): Promise<void> => {
+    // Never signal a recycled pid: the child must still have the start ticks
+    // captured right after this launch's spawn. Without ticks, leave it to the
+    // strict scan/rollback path.
+    if (startTicks === undefined) return
+    if ((await readStartTicks(child.pid)) !== startTicks) return
     try {
       child.kill('SIGKILL')
     } catch {
@@ -422,12 +510,14 @@ export const createVmDriver = (
   /**
    * With `--new-pid-ns` the jailer forks Firecracker into a new PID namespace
    * and exits; the host-visible Firecracker pid is written to
-   * `<jailRoot>/<firecracker basename>.pid` (jailer docs/source).
+   * `<jailRoot>/<firecracker basename>.pid` (jailer docs/source). The pid file
+   * is never trusted on its own: the pid must pass the strict identity scan
+   * (canonical executable + `--id <id>`) before we track it.
    */
   const waitForJailerChildPid = async (
     child: SpawnedVm,
     instanceId: string
-  ): Promise<number> => {
+  ): Promise<{ pid: number; startTicks: number }> => {
     const pidFile = path.join(jailRoot(instanceId), `${firecrackerBase}.pid`)
     let exitCode: number | undefined
     child.exited.then(
@@ -438,16 +528,29 @@ export const createVmDriver = (
         exitCode = -1
       }
     )
+    let sawPidFile = false
     const deadline = now() + config.apiStartTimeoutMs
     while (now() < deadline) {
+      let pid: number | undefined
       try {
         const raw = await readFile(pidFile, 'utf8')
-        const pid = Number(raw.trim())
-        if (Number.isSafeInteger(pid) && pid > 0) return pid
+        const parsed = Number(raw.trim())
+        if (Number.isSafeInteger(parsed) && parsed > 0) pid = parsed
       } catch {
         // not written yet
       }
-      if (exitCode !== undefined) {
+      if (pid !== undefined) {
+        sawPidFile = true
+        const identity = await inspectProcess(
+          pid,
+          firecrackerExeNames,
+          instanceId
+        )
+        if (identity !== undefined) {
+          return { pid: identity.pid, startTicks: identity.startTicks }
+        }
+      }
+      if (exitCode !== undefined && !sawPidFile) {
         throw new Error(
           `jailer exited (code ${exitCode}) before writing its child pid file`
         )
@@ -459,33 +562,92 @@ export const createVmDriver = (
     )
   }
 
-  const captureStartTicks = async (pid: number): Promise<number> => {
-    const deadline = now() + 2000
-    while (now() < deadline) {
-      const ticks = await readStartTicks(pid)
-      if (ticks !== undefined) return ticks
+  /**
+   * Wait until the spawned process is verifiably our Firecracker (canonical
+   * executable basename + adjacent `--id <id>`), returning the start ticks
+   * captured by that same scan.
+   */
+  const waitForVerifiedProcess = async (
+    pid: number,
+    instanceId: string,
+    timeoutMs = config.apiStartTimeoutMs
+  ): Promise<number> => {
+    const deadline = now() + timeoutMs
+    for (;;) {
+      const identity = await inspectProcess(
+        pid,
+        firecrackerExeNames,
+        instanceId
+      )
+      if (identity !== undefined) return identity.startTicks
+      if ((await readStartTicks(pid)) === undefined) {
+        throw new Error(
+          `firecracker (pid ${pid}) exited before it could be verified`
+        )
+      }
+      if (now() >= deadline) {
+        throw new Error(
+          `timed out after ${timeoutMs}ms verifying firecracker (pid ${pid})`
+        )
+      }
       await sleep(10)
     }
-    throw new Error(`timed out reading /proc/${pid}/stat`)
   }
 
+  const connectUnix = (
+    socketPath: string,
+    timeoutMs: number
+  ): Promise<boolean> =>
+    new Promise(resolve => {
+      let settled = false
+      const socket = createConnection({ path: socketPath })
+      const finish = (value: boolean): void => {
+        if (settled) return
+        settled = true
+        socket.destroy()
+        resolve(value)
+      }
+      socket.setTimeout(timeoutMs)
+      socket.once('connect', () => finish(true))
+      socket.once('timeout', () => finish(false))
+      socket.once('error', () => finish(false))
+    })
+
+  /**
+   * API socket readiness is a successful connect, not the existence of a
+   * socket *file* (stale files, or a file created before listen(), would lie).
+   * Retries with backoff until the deadline and fails if the VM dies.
+   */
   const waitForApiSocket = async (
     pid: number,
-    apiSocketHostPath: string
+    pidStartTicks: number,
+    apiSocketHostPath: string,
+    instanceId: string
   ): Promise<void> => {
     const deadline = now() + config.apiStartTimeoutMs
-    while (now() < deadline) {
-      if (await fileExists(apiSocketHostPath)) return
-      if ((await readStartTicks(pid)) === undefined) {
+    let backoff = 10
+    for (;;) {
+      if (
+        !(await processMatchesIdentity(
+          pid,
+          pidStartTicks,
+          firecrackerExeNames,
+          instanceId
+        ))
+      ) {
         throw new Error(
           `firecracker (pid ${pid}) exited before creating its API socket`
         )
       }
-      await sleep(50)
+      if (await connectUnix(apiSocketHostPath, 250)) return
+      if (now() >= deadline) {
+        throw new Error(
+          `timed out after ${config.apiStartTimeoutMs}ms waiting for the firecracker API socket`
+        )
+      }
+      await sleep(backoff)
+      backoff = Math.min(100, Math.ceil(backoff * 1.5))
     }
-    throw new Error(
-      `timed out after ${config.apiStartTimeoutMs}ms waiting for the firecracker API socket`
-    )
   }
 
   const configureAndStart = async (
@@ -507,7 +669,11 @@ export const createVmDriver = (
 
     await api.put('/boot-source', {
       kernel_image_path: storage.kernelApiPath,
-      boot_args: buildBootArgs(request.lease, request.kernelArgs),
+      boot_args: buildBootArgs(
+        request.lease,
+        request.kernelArgs,
+        config.defaultInit
+      ),
       ...(storage.initrdApiPath === undefined
         ? {}
         : { initrd_path: storage.initrdApiPath }),
@@ -547,27 +713,46 @@ export const createVmDriver = (
     await rm(expected, { force: true })
   }
 
+  const removeJailTree = async (instanceId: string): Promise<void> => {
+    const parent = jailParent()
+    let st
+    try {
+      st = await lstat(parent)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw err
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      throw new VmValidationError(
+        `refusing to clean up through non-directory jail parent: ${parent}`
+      )
+    }
+    await removeInstanceTree(parent, instanceId)
+  }
+
   const removeInstanceStorage = async (instanceId: string): Promise<void> => {
     await removeInstanceTree(runDirAbs, instanceId)
-    await removeInstanceTree(
-      path.join(chrootBaseAbs, firecrackerBase),
-      instanceId
+    await removeJailTree(instanceId)
+  }
+
+  const cgroupParents = (): string[] => [
+    ...new Set([config.parentCgroup ?? firecrackerBase, firecrackerBase]),
+  ]
+
+  const cgroupCandidates = (instanceId: string): string[] => {
+    const candidates = [
+      path.join(cgroupRootAbs, instanceId),
+      ...cgroupParents().map(parent =>
+        path.join(cgroupRootAbs, parent, instanceId)
+      ),
+    ]
+    return [...new Set(candidates)].filter(candidate =>
+      isPathInside(cgroupRootAbs, candidate)
     )
   }
 
   const removeCgroups = async (instanceId: string): Promise<void> => {
-    const parents = new Set([
-      config.parentCgroup ?? firecrackerBase,
-      firecrackerBase,
-    ])
-    const candidates = [
-      path.join(cgroupRootAbs, instanceId),
-      ...[...parents].map(parent =>
-        path.join(cgroupRootAbs, parent, instanceId)
-      ),
-    ]
-    for (const candidate of candidates) {
-      if (!isPathInside(cgroupRootAbs, candidate)) continue
+    for (const candidate of cgroupCandidates(instanceId)) {
       try {
         await rmdir(candidate)
       } catch (err) {
@@ -580,17 +765,18 @@ export const createVmDriver = (
   }
 
   const isAlive = async (handle: VmHandle): Promise<boolean> => {
-    if (!(await processMatches(handle.pid, handle.pidStartTicks))) return false
-    // A process that is mid-exec (jailer -> firecracker, or a test wrapper)
-    // briefly exposes an empty cmdline. Retry a few times before calling it
-    // dead; pid + start ticks already prove this is the process we captured.
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const argv = await readCmdline(handle.pid)
-      if (argv !== undefined && argv.length > 0) {
-        return cmdlineMatchesInstance(argv, handle.instanceId)
+      const identity = await inspectProcess(
+        handle.pid,
+        firecrackerExeNames,
+        handle.instanceId
+      )
+      if (identity !== undefined) {
+        return identity.startTicks === handle.pidStartTicks
       }
-      if (!(await processMatches(handle.pid, handle.pidStartTicks)))
-        return false
+      if ((await readStartTicks(handle.pid)) === undefined) return false
+      // A process that is mid-exec briefly exposes an empty cmdline. Retry a
+      // few times before calling it dead.
       await sleep(5)
     }
     return false
@@ -599,17 +785,25 @@ export const createVmDriver = (
   const tcpProbe = (
     host: string,
     port: number,
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
   ): Promise<boolean> =>
     new Promise(resolve => {
       let settled = false
       const socket = createConnection({ host, port })
+      const onAbort = (): void => finish(false)
       const finish = (value: boolean): void => {
         if (settled) return
         settled = true
+        signal?.removeEventListener('abort', onAbort)
         socket.destroy()
         resolve(value)
       }
+      if (signal?.aborted) {
+        finish(false)
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
       socket.setTimeout(timeoutMs)
       socket.once('connect', () => finish(true))
       socket.once('timeout', () => finish(false))
@@ -621,11 +815,15 @@ export const createVmDriver = (
     port: number,
     pathname: string,
     expectStatus: number,
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
   ): Promise<boolean> => {
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const fetchSignal =
+      signal === undefined ? timeout : combineAbortSignals(signal, timeout)
     try {
       const response = await fetch(`http://${host}:${port}${pathname}`, {
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: fetchSignal,
         redirect: 'manual',
       })
       await response.body?.cancel()
@@ -659,15 +857,31 @@ export const createVmDriver = (
       const attemptTimeout = Math.max(50, Math.min(2000, deadline - now()))
       const ok =
         readiness.kind === 'tcp'
-          ? await tcpProbe(probe.guestIp, readiness.port, attemptTimeout)
+          ? await tcpProbe(
+              probe.guestIp,
+              readiness.port,
+              attemptTimeout,
+              signal
+            )
           : await httpProbe(
               probe.guestIp,
               readiness.port,
               readiness.path ?? '/',
               readiness.expectStatus ?? 200,
-              attemptTimeout
+              attemptTimeout,
+              signal
             )
-      if (ok) return
+      if (ok) {
+        // A probe can succeed just as the caller cancels or the VM dies; do
+        // not report readiness for either.
+        if (signal?.aborted) throw abortError(signal.reason)
+        if (!(await isAlive(handle))) {
+          throw new Error(
+            `VM ${handle.instanceId} exited before readiness passed`
+          )
+        }
+        return
+      }
       const remaining = deadline - now()
       if (remaining <= 0) {
         throw new Error(
@@ -682,7 +896,7 @@ export const createVmDriver = (
   }
 
   const stop: VmDriver['stop'] = async (handle, opts) => {
-    if (!(await processMatches(handle.pid, handle.pidStartTicks))) {
+    if (!(await isAlive(handle))) {
       await removeExpectedSocket(handle)
       return
     }
@@ -701,15 +915,16 @@ export const createVmDriver = (
 
     const graceDeadline = now() + Math.max(0, opts.graceMs)
     while (now() < graceDeadline) {
-      if (!(await processMatches(handle.pid, handle.pidStartTicks))) {
+      if (!(await isAlive(handle))) {
         await removeExpectedSocket(handle)
         return
       }
       await sleep(100)
     }
 
-    // Re-verify immediately before signalling: never SIGKILL a recycled pid.
-    if (await processMatches(handle.pid, handle.pidStartTicks)) {
+    // Re-verify the full identity immediately before signalling: never
+    // SIGKILL a recycled pid (or any process that is not this Firecracker).
+    if (await isAlive(handle)) {
       try {
         process.kill(handle.pid, 'SIGKILL')
       } catch (err) {
@@ -719,10 +934,10 @@ export const createVmDriver = (
 
     const killDeadline = now() + config.killWaitMs
     while (now() < killDeadline) {
-      if (!(await processMatches(handle.pid, handle.pidStartTicks))) break
+      if (!(await isAlive(handle))) break
       await sleep(50)
     }
-    if (await processMatches(handle.pid, handle.pidStartTicks)) {
+    if (await isAlive(handle)) {
       throw new Error(
         `VM ${handle.instanceId} (pid ${handle.pid}) did not exit after SIGKILL`
       )
@@ -730,11 +945,26 @@ export const createVmDriver = (
     await removeExpectedSocket(handle)
   }
 
-  const destroy = async (instanceId: string): Promise<void> => {
-    assertInstanceId(instanceId)
-    const processes = await findInstanceProcesses(instanceId)
+  /** Kill every strictly-identified process for this instance; true when all are gone. */
+  const terminateInstanceProcesses = async (
+    instanceId: string
+  ): Promise<boolean> => {
+    const processes = await findInstanceProcesses(
+      instanceId,
+      firecrackerExeNames
+    )
     for (const proc of processes) {
-      if (!(await processMatches(proc.pid, proc.startTicks))) continue
+      // Only signal a pid that still passes the strict check (ticks included).
+      if (
+        !(await processMatchesIdentity(
+          proc.pid,
+          proc.startTicks,
+          firecrackerExeNames,
+          instanceId
+        ))
+      ) {
+        continue
+      }
       try {
         process.kill(proc.pid, 'SIGKILL')
       } catch (err) {
@@ -742,11 +972,21 @@ export const createVmDriver = (
       }
     }
     const deadline = now() + config.killWaitMs
-    while (now() < deadline) {
-      if ((await findInstanceProcesses(instanceId)).length === 0) break
+    for (;;) {
+      if (
+        (await findInstanceProcesses(instanceId, firecrackerExeNames))
+          .length === 0
+      ) {
+        return true
+      }
+      if (now() >= deadline) return false
       await sleep(50)
     }
-    if ((await findInstanceProcesses(instanceId)).length > 0) {
+  }
+
+  const destroy = async (instanceId: string): Promise<void> => {
+    assertInstanceId(instanceId)
+    if (!(await terminateInstanceProcesses(instanceId))) {
       throw new Error(`firecracker for ${instanceId} survived SIGKILL`)
     }
     await removeInstanceStorage(instanceId)
@@ -758,20 +998,32 @@ export const createVmDriver = (
     if (config.mode === 'direct') {
       logger.warn(
         { instanceId: request.instanceId },
-        'SECURITY: Firecracker is running in direct mode (no jailer, no ' +
-          'chroot/cgroups/seccomp isolation). Never use this in production.'
+        'SECURITY: Firecracker is running in direct mode (no jailer: no ' +
+          'chroot, uid/gid drop, cgroup or pid-namespace isolation). ' +
+          "Firecracker's built-in seccomp filter remains enabled. Never use " +
+          'this in production.'
       )
     }
     const image = await resolveImage(config, request.image, request.diskMiB)
     await ensureRunDir()
 
+    // Stale state from a previous launch/restart: never reuse it, and never
+    // touch a live process that actually belongs to this instance.
+    if (
+      (await findInstanceProcesses(request.instanceId, firecrackerExeNames))
+        .length > 0
+    ) {
+      throw new VmValidationError(
+        `instance ${request.instanceId} already has a live firecracker process`
+      )
+    }
+    await removeInstanceStorage(request.instanceId)
+    await removeCgroups(request.instanceId)
+
     let child: SpawnedVm | undefined
-    let createdDir = false
-    let trackedPid: number | undefined
-    let trackedTicks: number | undefined
+    let childStartTicks: number | undefined
     try {
       const dir = await createInstanceDir(request.instanceId)
-      createdDir = true
       const runRootfs = path.join(dir, 'rootfs.ext4')
       await copyRootfs(image.rootfs, runRootfs)
       await chmod(runRootfs, 0o600)
@@ -806,13 +1058,20 @@ export const createVmDriver = (
         request.diskMiB
       )
       child = spawn(argv, { cwd: dir })
+      childStartTicks = await readStartTicks(child.pid)
+
       let firecrackerPid = child.pid
+      let pidStartTicks: number
       if (config.mode === 'jailer') {
-        firecrackerPid = await waitForJailerChildPid(child, request.instanceId)
+        const verified = await waitForJailerChildPid(child, request.instanceId)
+        firecrackerPid = verified.pid
+        pidStartTicks = verified.startTicks
+      } else {
+        pidStartTicks = await waitForVerifiedProcess(
+          firecrackerPid,
+          request.instanceId
+        )
       }
-      trackedPid = firecrackerPid
-      const pidStartTicks = await captureStartTicks(firecrackerPid)
-      trackedTicks = pidStartTicks
       const handle: VmHandle = {
         instanceId: request.instanceId,
         pid: firecrackerPid,
@@ -821,7 +1080,12 @@ export const createVmDriver = (
         dir: dirForHandle(request.instanceId),
       }
 
-      await waitForApiSocket(firecrackerPid, storage.apiSocketHostPath)
+      await waitForApiSocket(
+        firecrackerPid,
+        pidStartTicks,
+        storage.apiSocketHostPath,
+        request.instanceId
+      )
       await configureAndStart(handle, request, storage)
       return handle
     } catch (err) {
@@ -832,72 +1096,88 @@ export const createVmDriver = (
         },
         'VM launch failed; rolling back'
       )
-      if (child !== undefined) await killChild(child)
+      if (child !== undefined) await killChild(child, childStartTicks)
       // In jailer mode Firecracker is a child of a (usually already exited)
-      // jailer, so the spawned pid alone is not enough to roll back.
-      if (
-        trackedPid !== undefined &&
-        (child === undefined || trackedPid !== child.pid)
-      ) {
-        if (
-          trackedTicks === undefined ||
-          (await processMatches(trackedPid, trackedTicks))
-        ) {
-          try {
-            process.kill(trackedPid, 'SIGKILL')
-          } catch {
-            // already gone / not ours anymore
-          }
-        }
-        const killDeadline = now() + config.killWaitMs
-        while (
-          now() < killDeadline &&
-          (await readStartTicks(trackedPid)) !== undefined
-        ) {
-          await sleep(50)
-        }
+      // jailer, and the pid file may be missing entirely. Scan for every
+      // strictly-identified process instead of trusting the tracked pid.
+      const terminated = await terminateInstanceProcesses(request.instanceId)
+      if (!terminated) {
+        // Keep the storage: `listInstanceIds` still reports it, so the
+        // manager/reconciler can retry cleanup later.
+        logger.error(
+          { instanceId: request.instanceId },
+          'VM launch rollback could not confirm process exit; keeping storage for later cleanup'
+        )
+        throw err
       }
-      if (createdDir) {
-        try {
-          await removeInstanceStorage(request.instanceId)
-          await removeCgroups(request.instanceId)
-        } catch (cleanupErr) {
-          logger.error(
-            {
-              instanceId: request.instanceId,
-              err:
-                cleanupErr instanceof Error
-                  ? cleanupErr.message
-                  : String(cleanupErr),
-            },
-            'VM launch rollback failed'
-          )
-        }
+      try {
+        await removeInstanceStorage(request.instanceId)
+        await removeCgroups(request.instanceId)
+      } catch (cleanupErr) {
+        logger.error(
+          {
+            instanceId: request.instanceId,
+            err:
+              cleanupErr instanceof Error
+                ? cleanupErr.message
+                : String(cleanupErr),
+          },
+          'VM launch rollback failed'
+        )
       }
       throw err
     }
   }
 
-  const listInstanceIds = async (): Promise<string[]> => {
-    const ids = new Set<string>(await listProcessInstanceIds())
+  const scanInstanceDirs = async (
+    base: string,
+    ids: Set<string>
+  ): Promise<void> => {
+    let entries
     try {
-      const entries = await readdir(runDirAbs, { withFileTypes: true })
-      for (const entry of entries) {
-        if (entry.isDirectory() && /^[a-z0-9]{16,32}$/.test(entry.name)) {
-          ids.add(entry.name)
-        }
-      }
+      entries = await readdir(base, { withFileTypes: true })
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw err
+    }
+    for (const entry of entries) {
+      if (
+        entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        INSTANCE_ID_REGEX.test(entry.name)
+      ) {
+        ids.add(entry.name)
+      }
+    }
+  }
+
+  const listInstanceIds = async (): Promise<string[]> => {
+    const ids = new Set<string>(
+      await listProcessInstanceIds(firecrackerExeNames)
+    )
+    await scanInstanceDirs(runDirAbs, ids)
+    // Jail-only leftovers (e.g. Firecracker died but the chroot remained).
+    await scanInstanceDirs(jailParent(), ids)
+    // cgroup leftovers: direct children plus the default/parent locations.
+    const cgroupBases = new Set([
+      cgroupRootAbs,
+      path.join(cgroupRootAbs, firecrackerBase),
+      ...cgroupParents().map(parent => path.join(cgroupRootAbs, parent)),
+    ])
+    for (const base of cgroupBases) {
+      if (!isPathInside(cgroupRootAbs, base)) continue
+      await scanInstanceDirs(base, ids)
     }
     return [...ids].sort()
   }
 
   const adopt = async (instanceId: string): Promise<VmHandle | undefined> => {
     assertInstanceId(instanceId)
-    const processes = await findInstanceProcesses(instanceId)
+    const processes = await findInstanceProcesses(
+      instanceId,
+      firecrackerExeNames
+    )
     for (const proc of processes) {
-      if (proc.jailer) continue
       const handle: VmHandle = {
         instanceId,
         pid: proc.pid,
@@ -973,10 +1253,11 @@ export const createVmDriver = (
 
     const checks: Record<string, boolean> = {
       kvm,
-      firecrackerBin: await isExecutable(config.firecrackerBin),
+      firecrackerBin: await isExecutable(firecrackerBinAbs),
       jailerBin:
-        config.mode === 'jailer' ? await isExecutable(config.jailerBin) : true,
+        config.mode === 'jailer' ? await isExecutable(jailerBinAbs) : true,
       imagesDir: await isDirectoryAccessible(config.imagesDir),
+      imagesTrusted: await checkImagesTrusted(config),
       runDir: await isDirectoryAccessible(runDirAbs),
       chrootBase:
         config.mode === 'jailer'

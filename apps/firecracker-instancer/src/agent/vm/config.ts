@@ -1,5 +1,13 @@
 import * as z from 'zod/mini'
 
+const CGROUP_SEGMENT = '[A-Za-z0-9_.-]+'
+/** Relative cgroup path: safe segments separated by `/`, never `.`/`..`, empty or absolute. */
+const PARENT_CGROUP_REGEX = new RegExp(
+  `^(?!\\.{1,2}(?:/|$))${CGROUP_SEGMENT}(?:/(?!\\.{1,2}(?:/|$))${CGROUP_SEGMENT})*$`
+)
+/** `<file>=<value>`; values may contain commas (cpuset lists) but no whitespace/shell metachars. */
+const CGROUP_LIMIT_REGEX = /^[A-Za-z0-9_.-]+=[A-Za-z0-9:._,+-]+$/
+
 /**
  * Owner: track 2 (VM). Extend freely; keep the export names.
  *
@@ -18,13 +26,28 @@ export const vmConfigSchema = z.object({
   /** Per-instance writable data and jail roots. Must be on a reflink-capable fs for fast copies. */
   runDir: z.prefault(z.string(), '/var/lib/rctf-firecracker/run'),
   mode: z.prefault(z.enum(['jailer', 'direct']), 'jailer'),
+  /**
+   * Kernel `init=` path installed by `deploy/firecracker/guest/build-rootfs.sh`
+   * (`/rctf/init`). It is emitted before the challenge's `kernelArgs`, so a
+   * later `init=` in `kernelArgs` still wins.
+   */
+  defaultInit: z.prefault(
+    z
+      .string()
+      .check(
+        z.regex(
+          /^\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9._-]+)*$/
+        )
+      ),
+    '/rctf/init'
+  ),
   /** Jailer identity the Firecracker process drops to. */
   jailUid: z.prefault(z.int(), 10000),
   jailGid: z.prefault(z.int(), 10000),
   /**
    * Jailer `--chroot-base-dir`. The actual jail for an instance is
-   * `<chrootBase>/<firecracker basename>/<instanceId>` (jailer's own layout)
-   * with the chroot root in its `root/` subdirectory.
+   * `<chrootBase>/<resolved firecracker basename>/<instanceId>` (jailer's own
+   * layout) with the chroot root in its `root/` subdirectory.
    */
   chrootBase: z.prefault(z.string(), '/srv/jailer'),
   /** cgroup v2 mount root; jailer creates `<cgroupRoot>/<id>` (or under parentCgroup). */
@@ -32,12 +55,13 @@ export const vmConfigSchema = z.object({
   /**
    * Jailer cgroup placement. With cgroup v2 the jailer only creates a child
    * cgroup when at least one `--cgroup` value is given; `cgroupLimits` holds
-   * `<file>=<value>` pairs (e.g. `pids.max=512`). `parentCgroup` defaults to
-   * the Firecracker binary name (jailer's default).
+   * `<file>=<value>` pairs (e.g. `pids.max=512`, `cpuset.cpus=0,1,2`).
+   * Nested relative paths such as `all_uvms/external_uvms` are allowed.
+   * `parentCgroup` defaults to the Firecracker binary name (jailer's default).
    */
-  parentCgroup: z.optional(z.string().check(z.regex(/^[A-Za-z0-9_.-]+$/))),
+  parentCgroup: z.optional(z.string().check(z.regex(PARENT_CGROUP_REGEX))),
   cgroupLimits: z.prefault(
-    z.array(z.string().check(z.regex(/^[A-Za-z0-9_.-]+=[A-Za-z0-9:._-]+$/))),
+    z.array(z.string().check(z.regex(CGROUP_LIMIT_REGEX))),
     []
   ),
   /**
@@ -62,5 +86,12 @@ export const vmConfigSchema = z.object({
   killWaitMs: z.prefault(z.int(), 5000),
   /** Refuse world-writable base image dirs (a local user could swap the rootfs). */
   forbidWorldWritableImages: z.prefault(z.boolean(), true),
+  /**
+   * Full image-trust enforcement: `imagesDir` (and its non-sticky ancestors)
+   * plus the image dir must not be group/world-writable and must be owned by
+   * root or the agent uid; `vmlinux`/`rootfs.ext4` must not be group/other
+   * writable. Development escape hatch only.
+   */
+  allowUntrustedImages: z.prefault(z.boolean(), false),
 })
 export type VmConfig = z.output<typeof vmConfigSchema>

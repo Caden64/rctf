@@ -1,5 +1,19 @@
-import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import {
+  access,
+  chmod,
+  constants as fsConstants,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
 import { createServer } from 'node:net'
+import os from 'node:os'
 import path from 'node:path'
 import type {
   CommandRunner,
@@ -18,18 +32,78 @@ export const FAKE_SCRIPT = path.join(import.meta.dir, 'fake-firecracker.ts')
 export const shQuote = (value: string): string =>
   `'${value.replaceAll("'", "'\\''")}'`
 
-/** Write an executable `firecracker` wrapper that runs the fake API server. */
+/**
+ * Compile the fake once per content hash. `/proc/<pid>/exe` must have the
+ * canonical binary basename, which a `#!/bin/sh` wrapper cannot provide (the
+ * kernel reports the interpreter instead), so tests run a real native binary.
+ */
+let compiledFakePromise: Promise<string> | undefined
+
+export const compiledFakeFirecracker = (): Promise<string> => {
+  if (compiledFakePromise !== undefined) return compiledFakePromise
+  compiledFakePromise = (async () => {
+    const source = await readFile(FAKE_SCRIPT)
+    const hash = createHash('sha256')
+      .update(source)
+      .update(process.versions.bun ?? 'bun')
+      .digest('hex')
+      .slice(0, 16)
+    const dir = path.join(os.tmpdir(), 'rctf-fake-firecracker', hash)
+    const binary = path.join(dir, 'firecracker-v1.2.3')
+    try {
+      await access(binary, fsConstants.X_OK)
+      return binary
+    } catch {
+      // build it
+    }
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    const staging = `${binary}.${process.pid}.${Date.now()}.tmp`
+    const proc = Bun.spawn(
+      [
+        process.execPath,
+        'build',
+        '--compile',
+        FAKE_SCRIPT,
+        '--outfile',
+        staging,
+      ],
+      { stdout: 'ignore', stderr: 'pipe', env: process.env }
+    )
+    const code = await proc.exited
+    if (code !== 0) {
+      const stderr = await new Response(proc.stderr).text()
+      await rm(staging, { force: true }).catch(() => undefined)
+      throw new Error(
+        `could not compile fake firecracker (exit ${code}): ${stderr.slice(0, 512)}`
+      )
+    }
+    await chmod(staging, 0o755)
+    await rename(staging, binary)
+    return binary
+  })()
+  return compiledFakePromise
+}
+
+/** Write `<root>/bin/firecracker` as a symlink to the canonical compiled fake. */
 export const ensureFakeFirecracker = async (root: string): Promise<string> => {
   const binDir = path.join(root, 'bin')
   await mkdir(binDir, { recursive: true, mode: 0o700 })
   const wrapper = path.join(binDir, 'firecracker')
-  const contents =
-    '#!/bin/sh\n' +
-    `exec ${shQuote(process.execPath)} ${shQuote(FAKE_SCRIPT)} "$@"\n`
-  await writeFile(wrapper, contents, { mode: 0o755 })
-  await chmod(wrapper, 0o755)
+  const binary = await compiledFakeFirecracker()
+  await rm(wrapper, { force: true })
+  await symlink(binary, wrapper)
   return wrapper
 }
+
+/** Canonical executable basename the driver resolves for this config. */
+export const canonicalFirecrackerBasename = async (
+  firecrackerBin: string
+): Promise<string> => path.basename(await realpath(firecrackerBin))
+
+export const exeNamesFor = async (
+  firecrackerBin: string
+): Promise<ReadonlySet<string>> =>
+  new Set([await canonicalFirecrackerBasename(firecrackerBin)])
 
 export interface RecordedRunner {
   runner: CommandRunner

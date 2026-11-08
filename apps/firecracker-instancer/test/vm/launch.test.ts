@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import pino from 'pino'
+import type { Logger } from '../../src/log'
 import {
   chmod,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
   truncate,
+  writeFile,
 } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,6 +22,7 @@ import { findInstanceProcesses } from '../../src/agent/vm/proc'
 import {
   FLAG_VALUE,
   clearFakeEnv,
+  exeNamesFor,
   makeDirs,
   makeImage,
   makeLogger,
@@ -117,7 +122,8 @@ describe('vm launch', () => {
       )
       expect(boot.boot_args).toBe(
         'console=ttyS0 reboot=k panic=1 pci=off ' +
-          'ip=10.200.0.2::10.200.0.1:255.255.255.252::eth0:off init_on_alloc=1'
+          'ip=10.200.0.2::10.200.0.1:255.255.255.252::eth0:off ' +
+          'init=/rctf/init init_on_alloc=1'
       )
 
       const drive = JSON.parse(requests[1]?.body ?? '{}')
@@ -168,7 +174,7 @@ describe('vm launch', () => {
 
       const [argv] = h.spawnCalls
       expect(argv).toEqual([
-        h.config.firecrackerBin,
+        await realpath(h.config.firecrackerBin),
         '--id',
         id,
         '--api-sock',
@@ -218,6 +224,46 @@ describe('vm launch', () => {
     }
   })
 
+  test('leaks no flag through errors, pino logs or files when /mmds echoes its body', async () => {
+    const h = await harness()
+    const id = newInstanceId()
+    await makeImage(h.config.imagesDir, 'web-demo')
+    setFakeEnv(id, {
+      LOG: path.join(h.dirs.logsDir, `${id}.jsonl`),
+      FAIL_PATH: '/mmds',
+      FAIL_STATUS: '400',
+      ECHO_BODY: '1',
+    })
+    const chunks: string[] = []
+    const logger = pino(
+      { level: 'debug' },
+      { write: (chunk: string) => chunks.push(chunk) }
+    ) as unknown as Logger
+    const driver = createVmDriver(h.config, {
+      runner: h.runner.runner,
+      logger,
+      spawn: spawnWithEnv,
+    })
+    let message = ''
+    try {
+      await driver.launch(makeRequest(id, 'web-demo'))
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err)
+    } finally {
+      clearFakeEnv(id)
+    }
+    expect(message).toContain('HTTP 400')
+    expect(message).not.toContain(FLAG_VALUE)
+    expect(chunks.join('')).not.toContain(FLAG_VALUE)
+    for (const file of [
+      ...(await readTree(h.config.runDir)),
+      ...(await readTree(h.config.chrootBase)),
+    ]) {
+      expect(file.contents.toString('utf8')).not.toContain(FLAG_VALUE)
+    }
+    await teardown(h, id)
+  })
+
   test('passes an initrd image to /boot-source', async () => {
     const h = await harness()
     const id = newInstanceId()
@@ -245,13 +291,16 @@ describe('vm launch', () => {
     let handle: VmHandle | undefined
     try {
       handle = await h.driver.launch(makeRequest(id, 'web-demo'))
-      expect(
-        h.logger.lines.some(
-          line =>
-            line.level === 'warn' &&
-            JSON.stringify(line.args).includes('direct mode')
-        )
-      ).toBe(true)
+      const warning = h.logger.lines.find(
+        line =>
+          line.level === 'warn' &&
+          JSON.stringify(line.args).includes('direct mode')
+      )
+      expect(warning).toBeDefined()
+      const text = JSON.stringify(warning?.args)
+      expect(text).toContain('seccomp')
+      expect(text).toContain('remains enabled')
+      expect(text).not.toContain('no seccomp')
     } finally {
       if (handle !== undefined) await teardown(h, id, handle)
       else await teardown(h, id)
@@ -272,7 +321,12 @@ describe('vm launch', () => {
           h.driver.launch(makeRequest(id, 'web-demo'))
         ).rejects.toThrow(new RegExp(failPath))
         expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
-        expect(await findInstanceProcesses(id)).toEqual([])
+        expect(
+          await findInstanceProcesses(
+            id,
+            await exeNamesFor(h.config.firecrackerBin)
+          )
+        ).toEqual([])
         expect(await h.driver.listInstanceIds()).not.toContain(id)
       } finally {
         await teardown(h, id)
@@ -333,7 +387,51 @@ describe('vm launch', () => {
         h.driver.launch(makeRequest(id, 'web-demo'))
       ).rejects.toThrow(/API socket/)
       expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
-      expect(await findInstanceProcesses(id)).toEqual([])
+      expect(
+        await findInstanceProcesses(
+          id,
+          await exeNamesFor(h.config.firecrackerBin)
+        )
+      ).toEqual([])
+    } finally {
+      await teardown(h, id)
+    }
+  })
+
+  test('retries until the API socket is listening', async () => {
+    const h = await harness({ apiStartTimeoutMs: 3000 })
+    const id = newInstanceId()
+    await makeImage(h.config.imagesDir, 'web-demo')
+    setFakeEnv(id, {
+      LOG: path.join(h.dirs.logsDir, `${id}.jsonl`),
+      SOCKET_DELAY_MS: '200',
+    })
+    let handle: VmHandle | undefined
+    try {
+      handle = await h.driver.launch(makeRequest(id, 'web-demo'))
+      expect(await h.driver.isAlive(handle)).toBe(true)
+    } finally {
+      if (handle !== undefined) await teardown(h, id, handle)
+      else await teardown(h, id)
+    }
+  })
+
+  test('does not accept a socket file without a listener as ready', async () => {
+    const h = await harness({ apiStartTimeoutMs: 500 })
+    const id = newInstanceId()
+    await makeImage(h.config.imagesDir, 'web-demo')
+    setFakeEnv(id, { STALE_SOCKET: '1' })
+    try {
+      await expect(
+        h.driver.launch(makeRequest(id, 'web-demo'))
+      ).rejects.toThrow(/API socket/)
+      expect(await pathExists(path.join(h.config.runDir, id))).toBe(false)
+      expect(
+        await findInstanceProcesses(
+          id,
+          await exeNamesFor(h.config.firecrackerBin)
+        )
+      ).toEqual([])
     } finally {
       await teardown(h, id)
     }
@@ -366,6 +464,86 @@ describe('vm launch', () => {
       /instance id/
     )
     expect(h.spawnCalls).toEqual([])
+  })
+})
+
+describe('jailer canonical layout', () => {
+  test('uses the resolved binary basename for exec-file, jail layout, adopt and cleanup', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-jail-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const jailerBin = path.join(root, 'bin', 'jailer')
+    await mkdir(path.dirname(jailerBin), { recursive: true, mode: 0o700 })
+    await writeFile(
+      jailerBin,
+      `#!/bin/sh
+set -eu
+id=
+exec_file=
+base=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --id) id=$2; shift 2 ;;
+    --exec-file) exec_file=$2; shift 2 ;;
+    --chroot-base-dir) base=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+b=$(basename "$exec_file")
+dir=$base/$b/$id/root
+mkdir -p "$dir"
+"$exec_file" --id "$id" --api-sock "$dir/api.sock" </dev/null >/dev/null 2>&1 &
+printf '%s\\n' "$!" > "$dir/$b.pid"
+`,
+      { mode: 0o755 }
+    )
+    const config = await makeVmConfig({
+      dirs,
+      overrides: {
+        mode: 'jailer',
+        jailerBin,
+        apiStartTimeoutMs: 3000,
+        killWaitMs: 3000,
+      },
+    })
+    const spawnCalls: string[][] = []
+    const driver = createVmDriver(config, {
+      runner: makeRunner().runner,
+      logger: makeLogger().logger,
+      spawn: (argv, opts) => {
+        spawnCalls.push([...argv])
+        return spawnWithEnv(argv, opts)
+      },
+    })
+    const id = newInstanceId()
+    await makeImage(config.imagesDir, 'web-demo')
+    let handle: VmHandle | undefined
+    try {
+      handle = await driver.launch(makeRequest(id, 'web-demo'))
+      const canonical = await realpath(config.firecrackerBin)
+      const fcBase = path.basename(canonical)
+      const jail = path.join(config.chrootBase, fcBase, id)
+      expect(handle.dir).toBe(jail)
+      expect(handle.apiSocket).toBe(path.join(jail, 'root', 'api.sock'))
+      expect(await driver.isAlive(handle)).toBe(true)
+      expect((await driver.adopt(id))?.pid).toBe(handle.pid)
+      expect(await driver.listInstanceIds()).toContain(id)
+
+      const argv = spawnCalls[0] ?? []
+      expect(argv[argv.indexOf('--exec-file') + 1]).toBe(canonical)
+      expect(argv.slice(argv.indexOf('--') + 1)).toEqual([
+        '--api-sock',
+        '/api.sock',
+      ])
+      expect(await pathExists(path.join(jail, 'root', `${fcBase}.pid`))).toBe(
+        true
+      )
+    } finally {
+      if (handle !== undefined) {
+        await driver.stop(handle, { graceMs: 500 }).catch(() => undefined)
+      }
+      await driver.destroy(id).catch(() => undefined)
+    }
   })
 })
 
@@ -417,7 +595,10 @@ describe('jailer argv', () => {
 
     expect(recorded).toHaveLength(1)
     const argv = recorded[0] ?? []
-    expect(argv[0]).toBe(fakeJailer)
+    expect(argv[0]).toBe(await realpath(fakeJailer))
+    expect(argv[argv.indexOf('--exec-file') + 1]).toBe(
+      await realpath(config.firecrackerBin)
+    )
     expect(argv).toContain('--uid')
     expect(argv[argv.indexOf('--uid') + 1]).toBe('12345')
     expect(argv[argv.indexOf('--gid') + 1]).toBe('12346')
@@ -437,13 +618,10 @@ describe('jailer argv', () => {
     expect(limits).toEqual([`fsize=${64 * 1024 * 1024}`, 'no-file=512'])
     const separator = argv.indexOf('--')
     expect(separator).toBeGreaterThan(0)
-    expect(argv.slice(separator + 1)).toEqual([
-      '--id',
-      id,
-      '--api-sock',
-      '/api.sock',
-    ])
-    expect(argv.filter(arg => arg === '--id')).toHaveLength(2)
+    // Jailer already passes `--id <id>` to Firecracker; passing it again after
+    // `--` is a duplicate flag and Firecracker refuses to start.
+    expect(argv.slice(separator + 1)).toEqual(['--api-sock', '/api.sock'])
+    expect(argv.filter(arg => arg === '--id')).toHaveLength(1)
     // No shell metacharacters reach argv; the fake jailer would have been
     // exec'd with an argv array, so injection is impossible by construction.
     for (const arg of argv) expect(typeof arg).toBe('string')

@@ -101,8 +101,41 @@ describe('image resolution', () => {
         cgroupRoot: config.cgroupRoot,
         logsDir: path.join(root, 'logs'),
       },
-      overrides: { forbidWorldWritableImages: false },
+      overrides: {
+        forbidWorldWritableImages: false,
+        allowUntrustedImages: true,
+      },
     })
+    await expect(resolveImage(relaxed, 'web-demo', 64)).resolves.toBeDefined()
+  })
+
+  test('rejects a group-writable imagesDir or image file', async () => {
+    await makeImage(config.imagesDir, 'web-demo')
+    await chmod(config.imagesDir, 0o770)
+    await expect(resolveImage(config, 'web-demo', 64)).rejects.toThrow(
+      /not trusted|group\/world-writable/
+    )
+    await chmod(config.imagesDir, 0o700)
+
+    await chmod(path.join(config.imagesDir, 'web-demo', 'vmlinux'), 0o664)
+    await expect(resolveImage(config, 'web-demo', 64)).rejects.toThrow(
+      /not trusted|group\/other-writable/
+    )
+    await chmod(path.join(config.imagesDir, 'web-demo', 'vmlinux'), 0o444)
+
+    // The escape hatch still allows a development image.
+    const relaxed = await makeVmConfig({
+      dirs: {
+        root,
+        imagesDir: config.imagesDir,
+        runDir: config.runDir,
+        chrootBase: config.chrootBase,
+        cgroupRoot: config.cgroupRoot,
+        logsDir: path.join(root, 'logs'),
+      },
+      overrides: { allowUntrustedImages: true },
+    })
+    await chmod(path.join(config.imagesDir, 'web-demo', 'vmlinux'), 0o664)
     await expect(resolveImage(relaxed, 'web-demo', 64)).resolves.toBeDefined()
   })
 

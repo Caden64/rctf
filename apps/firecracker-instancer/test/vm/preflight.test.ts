@@ -44,6 +44,7 @@ describe('preflight', () => {
       'chrootBase',
       'firecrackerBin',
       'imagesDir',
+      'imagesTrusted',
       'jailerBin',
       'kvm',
       'reflink',
@@ -52,6 +53,7 @@ describe('preflight', () => {
     expect(result.checks.firecrackerBin).toBe(true)
     expect(result.checks.jailerBin).toBe(true)
     expect(result.checks.imagesDir).toBe(true)
+    expect(result.checks.imagesTrusted).toBe(true)
     expect(result.checks.runDir).toBe(true)
     expect(typeof result.checks.kvm).toBe('boolean')
     expect(typeof result.checks.reflink).toBe('boolean')
@@ -89,5 +91,24 @@ describe('preflight', () => {
       logger: makeLogger().logger,
     })
     expect((await missingDriver.preflight()).checks.imagesDir).toBe(false)
+  })
+
+  test('reports untrusted image directories', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'rctf-vm-pre-'))
+    roots.push(root)
+    const dirs = await makeDirs(root)
+    const firecrackerBin = await bin(root, 'firecracker')
+    const config = await makeVmConfig({
+      dirs,
+      overrides: { firecrackerBin },
+    })
+    await makeImage(config.imagesDir, 'web-demo')
+    await chmod(config.imagesDir, 0o770)
+    const driver = createVmDriver(config, { logger: makeLogger().logger })
+    expect((await driver.preflight()).checks.imagesTrusted).toBe(false)
+
+    await chmod(config.imagesDir, 0o700)
+    await chmod(path.join(config.imagesDir, 'web-demo', 'rootfs.ext4'), 0o660)
+    expect((await driver.preflight()).checks.imagesTrusted).toBe(false)
   })
 })
