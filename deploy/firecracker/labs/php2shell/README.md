@@ -33,11 +33,11 @@ same image the toolkit calibrated against), so its Apache, `libphp.so`,
 modules and extension configuration are the image's own bytes. The runner
 asserts, in the VM, exactly what is proven:
 
-| Image | Build | Assertions |
-| --- | --- | --- |
-| `php2shell-vuln` | `php:8.4.26-apache` + lab php.ini (8M) | stage-1 stale-id OOM leak **and** stage-2 libphp leak reproduce; stage 3 executes `id>/www/p` as `uid=33(www-data)` when a calibrated profile is present |
-| `php2shell-patched` | `php:8.4.27-apache` + lab php.ini (8M) | serves 8.4.27; both leak primitives are **absent**; the chain fails closed with no proof |
-| `php2shell-hardened` | `php:8.4.26-apache` + 128M php.ini | serves 8.4.26 with `memory_limit=128M`; at the shipped 12 MiB OOM body neither leak reproduces and the chain fails closed |
+| Image                | Build                                  | Assertions                                                                                                                                               |
+| -------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `php2shell-vuln`     | `php:8.4.26-apache` + lab php.ini (8M) | stage-1 stale-id OOM leak **and** stage-2 libphp leak reproduce; stage 3 executes `id>/www/p` as `uid=33(www-data)` when a calibrated profile is present |
+| `php2shell-patched`  | `php:8.4.27-apache` + lab php.ini (8M) | serves 8.4.27; both leak primitives are **absent**; the chain fails closed with no proof                                                                 |
+| `php2shell-hardened` | `php:8.4.26-apache` + 128M php.ini     | serves 8.4.26 with `memory_limit=128M`; at the shipped 12 MiB OOM body neither leak reproduces and the chain fails closed                                |
 
 Stage 3 is **env/config-gated**: it runs only when a calibration profile (or
 explicit `P2S_STAGE3_HTDATA`/`P2S_STAGE3_PADS`) provides a geometry recorded
@@ -49,18 +49,18 @@ The lab is deliberately built around the _laboratory conditions_ the chain
 needs. It is not a claim that a default production PHP is exploitable in the
 same way:
 
-| Condition | Lab value | Why |
-| --- | --- | --- |
-| PHP | 8.4.26 | last vulnerable 8.4 release; fixed in 8.4.27 |
-| SAPI | Apache prefork + `mod_php`, one worker | chain assumes one child |
-| `display_errors` | `On` | the heap leak is rendered in a request-startup warning |
-| `output_buffering` | `0` (no `php.ini`) | the warning must be flushed so `SG(headers_sent)=1`; a stock `php.ini-production` (4096) silently kills stage 1 |
-| `log_errors` | `Off` | measured: turning logging on also kills the stage-1 Set-Cookie leak even with `display_errors=On` |
-| `memory_limit` | `8M` | the OOM field is `memory_limit + 12M` |
-| `post_max_size` | `512M` | the OOM body must not be rejected |
-| `session.upload_progress.enabled` | `On` | the trigger |
-| `session.use_cookies` | `1`, `use_strict_mode = 0` | session behavior |
-| landing page | `<?php echo "OK\n";` | any allocation on the POST path moves the free list and misses the stage-1 reclaim slot |
+| Condition                         | Lab value                              | Why                                                                                                             |
+| --------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| PHP                               | 8.4.26                                 | last vulnerable 8.4 release; fixed in 8.4.27                                                                    |
+| SAPI                              | Apache prefork + `mod_php`, one worker | chain assumes one child                                                                                         |
+| `display_errors`                  | `On`                                   | the heap leak is rendered in a request-startup warning                                                          |
+| `output_buffering`                | `0` (no `php.ini`)                     | the warning must be flushed so `SG(headers_sent)=1`; a stock `php.ini-production` (4096) silently kills stage 1 |
+| `log_errors`                      | `Off`                                  | measured: turning logging on also kills the stage-1 Set-Cookie leak even with `display_errors=On`               |
+| `memory_limit`                    | `8M`                                   | the OOM field is `memory_limit + 12M`                                                                           |
+| `post_max_size`                   | `512M`                                 | the OOM body must not be rejected                                                                               |
+| `session.upload_progress.enabled` | `On`                                   | the trigger                                                                                                     |
+| `session.use_cookies`             | `1`, `use_strict_mode = 0`             | session behavior                                                                                                |
+| landing page                      | `<?php echo "OK\n";`                   | any allocation on the POST path moves the free list and misses the stage-1 reclaim slot                         |
 
 The hardened control keeps everything else identical and raises
 `memory_limit` to `128M`, above the 12 MiB OOM field. The patched control keeps
@@ -81,16 +81,16 @@ limit mitigates the vulnerability. `P2S_HARDENED_LIMIT_PROBE=1` runs the
 `fetch.sh` and `build-oci.sh` verify all of these before use. Re-pinning is a
 reviewed change; a changed upstream file is a hard failure.
 
-| Artifact | Version | SHA-256 / commit |
-| --- | --- | --- |
-| PHP (vulnerable) | 8.4.26 | `c248abaebc4bb777b80968f0760da0da8e989836e896c9ff637b6775d7d37662` |
-| PHP (fixed control) | 8.4.27 | `5bafed9994c1a49796b25b5f61c22c9183bfe046b6acc7b363842d03c77f972f` |
-| Apache httpd (source build only) | 2.4.69 | `c551b9861e26f146f57e1b1765e69c89a60b3db0ec252ccab0d36283487016bb` |
-| Ubuntu base rootfs (source build only) | 24.04.5 amd64 | `e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86` |
-| devploit/php2shell toolkit | `2479e2d` | `2479e2dd95c64fd9a8bf83f9f482c17e2cbc987b` |
-| 9bie/php2shell-bypass-aslr-exp | `d6f888e` | `d6f888ebd3f0e188bb662e16f23747afdf35e42f` |
-| Official OCI image (positive/hardened) | `php:8.4.26-apache` amd64 | manifest `sha256:b0ae0e0d…f50d1`, index `sha256:60111400…c11a` |
-| Official OCI image (patched control) | `php:8.4.27-apache` amd64 | manifest `sha256:7c3d8b9e…7354c`, index `sha256:884f64b4…530d0` |
+| Artifact                               | Version                   | SHA-256 / commit                                                   |
+| -------------------------------------- | ------------------------- | ------------------------------------------------------------------ |
+| PHP (vulnerable)                       | 8.4.26                    | `c248abaebc4bb777b80968f0760da0da8e989836e896c9ff637b6775d7d37662` |
+| PHP (fixed control)                    | 8.4.27                    | `5bafed9994c1a49796b25b5f61c22c9183bfe046b6acc7b363842d03c77f972f` |
+| Apache httpd (source build only)       | 2.4.69                    | `c551b9861e26f146f57e1b1765e69c89a60b3db0ec252ccab0d36283487016bb` |
+| Ubuntu base rootfs (source build only) | 24.04.5 amd64             | `e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86` |
+| devploit/php2shell toolkit             | `2479e2d`                 | `2479e2dd95c64fd9a8bf83f9f482c17e2cbc987b`                         |
+| 9bie/php2shell-bypass-aslr-exp         | `d6f888e`                 | `d6f888ebd3f0e188bb662e16f23747afdf35e42f`                         |
+| Official OCI image (positive/hardened) | `php:8.4.26-apache` amd64 | manifest `sha256:b0ae0e0d…f50d1`, index `sha256:60111400…c11a`     |
+| Official OCI image (patched control)   | `php:8.4.27-apache` amd64 | manifest `sha256:7c3d8b9e…7354c`, index `sha256:884f64b4…530d0`    |
 
 Every OCI config and layer digest, with sizes, is pinned in `oci-pins.sh`.
 The registry is addressed by digest only: the tags above are provenance, never
@@ -119,16 +119,16 @@ by digest with `curl` and assembles the rootfs with the guest's
 
 Only these paths are added to the image; everything else is the image's own:
 
-| Path | Purpose |
-| --- | --- |
-| `/etc/apache2/ports.conf` | `Listen 8080` |
-| `/etc/apache2/conf-enabled/zz-php2shell.conf` | `KeepAlive Off`, one prefork worker |
-| `/etc/apache2/conf-enabled/zz-lab.conf` | `DocumentRoot /www`, PHP handler for `/www` |
-| `/usr/local/etc/php/conf.d/zz-php2shell.ini` | laboratory php.ini (8M, no `log_errors`) |
-| `/www/index.php`, `/www/version.php` | inert landing page; version + `memory_limit` for assertions |
-| `/app/start` | MMDS flag publish, `/www` ownership, `apache2-foreground` |
-| `/usr/local/bin/{busybox,ip,nc}` | boot-contract `ip route`/`ip link` (busybox from the sha256-verified shared smoke artifacts) |
-| `/rctf/{init,jq}` | installed by `guest/build-rootfs.sh` |
+| Path                                          | Purpose                                                                                      |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `/etc/apache2/ports.conf`                     | `Listen 8080`                                                                                |
+| `/etc/apache2/conf-enabled/zz-php2shell.conf` | `KeepAlive Off`, one prefork worker                                                          |
+| `/etc/apache2/conf-enabled/zz-lab.conf`       | `DocumentRoot /www`, PHP handler for `/www`                                                  |
+| `/usr/local/etc/php/conf.d/zz-php2shell.ini`  | laboratory php.ini (8M, no `log_errors`)                                                     |
+| `/www/index.php`, `/www/version.php`          | inert landing page; version + `memory_limit` for assertions                                  |
+| `/app/start`                                  | MMDS flag publish, `/www` ownership, `apache2-foreground`                                    |
+| `/usr/local/bin/{busybox,ip,nc}`              | boot-contract `ip route`/`ip link` (busybox from the sha256-verified shared smoke artifacts) |
+| `/rctf/{init,jq}`                             | installed by `guest/build-rootfs.sh`                                                         |
 
 No `php.ini` is installed: the official image ships none, and
 `output_buffering=0` is required by the stage-1 leak. `build-oci.sh` fails if a
@@ -136,21 +136,21 @@ future pinned image starts shipping one.
 
 Output (under `~/.cache/rctf-p2s-lab/images` by default):
 
-| Image | PHP | php.ini | Purpose |
-| --- | --- | --- | --- |
-| `php2shell-vuln` | 8.4.26 | `lab/php-oci.ini` (8M) | positive chain |
-| `php2shell-patched` | 8.4.27 | `lab/php-oci.ini` (8M) | negative control A |
+| Image                | PHP    | php.ini                           | Purpose            |
+| -------------------- | ------ | --------------------------------- | ------------------ |
+| `php2shell-vuln`     | 8.4.26 | `lab/php-oci.ini` (8M)            | positive chain     |
+| `php2shell-patched`  | 8.4.27 | `lab/php-oci.ini` (8M)            | negative control A |
 | `php2shell-hardened` | 8.4.26 | `lab/php-oci-hardened.ini` (128M) | negative control B |
 
 Offsets measured from the pinned images (2026-11-09):
 
-| Image | `zif_system` | `zval_ptr_dtor` |
-| --- | --- | --- |
-| vuln / hardened (8.4.26, trixie) | `0x465370` | `0x65eb60` |
-| patched (8.4.27, trixie) | `0x46ad70` | `0x66a620` |
+| Image                            | `zif_system` | `zval_ptr_dtor` |
+| -------------------------------- | ------------ | --------------- |
+| vuln / hardened (8.4.26, trixie) | `0x465370`   | `0x65eb60`      |
+| patched (8.4.27, trixie)         | `0x46ad70`   | `0x66a620`      |
 
 `build.sh` remains as an alternative **source** build (Ubuntu 24.04 chroot,
-Apache/PHP built with the official Dockerfile flags). It is *not* byte-identical
+Apache/PHP built with the official Dockerfile flags). It is _not_ byte-identical
 to the official image and its stage-1 heap alignment differs; use it only with
 `P2S_GUEST=source` and a profile calibrated for that build. The OCI guest is
 the default for a reason: it is the environment the toolkit's profile and this
@@ -184,6 +184,10 @@ Environment:
 
 - `P2S_CHAIN_RETRIES` (default `1`): full chain attempts per image. Stage 3 is
   probabilistic even when calibrated; raise it on a slow host.
+- `P2S_LEAK_RETRIES` (default `5`) and `P2S_CHAIN_LEAK_RETRIES` (default `3`):
+  attempts per leak stage. Stage 1 has a genuine prefork race (request B must
+  be served by the child that request A left stale); retries are expected, not
+  a workaround for a missing leak.
 - `KEEP_VM=1`: leave the VM running for debugging.
 - `P2S_SKIP_BUILD=1`: reuse cached images.
 - `P2S_GUEST=official` (default) or `source`.
@@ -255,29 +259,29 @@ ruled out for this image. The carrier layout is the calibrated one.
 
 ## Files
 
-| Path | Purpose |
-| --- | --- |
-| `fetch.sh` | pinned downloads + git commits, SHA-256 verification, TOFU note |
-| `build-oci.sh` | official-image guest build (default; no docker/root) |
-| `oci.sh` | digest-addressed registry fetch, verification, layer extraction |
-| `oci-pins.sh` | pinned index/manifest/config/layer digests and sizes |
-| `build.sh` | optional source build (Ubuntu chroot) |
-| `run.sh` | full vmtest VM end-to-end run with controls |
-| `leaks.py` | stage-1/2 leak assertions with machine-readable exit codes |
-| `chain.py` | full chain with an explicit `--htdata-offset` |
-| `amd64.py` | narrows the toolkit's wide pointer filters to amd64 userspace |
-| `calibration/` | the measured profile and its provenance |
-| `selftest.sh` | unprivileged fail-closed self-test |
-| `lib.sh` | pinned constants, offsets/proof helpers, port allocation |
-| `lab/apache-oci.conf` | single-worker prefork policy for the official guest |
-| `lab/lab-oci.conf` | `/www` document root for the official guest |
-| `lab/php-oci.ini` | official-guest laboratory php.ini (8M) |
-| `lab/php-oci-hardened.ini` | official-guest hardened control (128M) |
-| `lab/www/index.php` | allocation-inert landing page |
-| `lab/www/version.php` | version + `memory_limit` for assertions |
-| `lab/app-start-oci` | `/app/start`: flag publish + `apache2-foreground` |
-| `lab/*` (source-build files) | Apache/PHP source-build lab configuration |
-| `RESULTS.md` | dated log of what actually ran |
+| Path                         | Purpose                                                         |
+| ---------------------------- | --------------------------------------------------------------- |
+| `fetch.sh`                   | pinned downloads + git commits, SHA-256 verification, TOFU note |
+| `build-oci.sh`               | official-image guest build (default; no docker/root)            |
+| `oci.sh`                     | digest-addressed registry fetch, verification, layer extraction |
+| `oci-pins.sh`                | pinned index/manifest/config/layer digests and sizes            |
+| `build.sh`                   | optional source build (Ubuntu chroot)                           |
+| `run.sh`                     | full vmtest VM end-to-end run with controls                     |
+| `leaks.py`                   | stage-1/2 leak assertions with machine-readable exit codes      |
+| `chain.py`                   | full chain with an explicit `--htdata-offset`                   |
+| `amd64.py`                   | narrows the toolkit's wide pointer filters to amd64 userspace   |
+| `calibration/`               | the measured profile and its provenance                         |
+| `selftest.sh`                | unprivileged fail-closed self-test                              |
+| `lib.sh`                     | pinned constants, offsets/proof helpers, port allocation        |
+| `lab/apache-oci.conf`        | single-worker prefork policy for the official guest             |
+| `lab/lab-oci.conf`           | `/www` document root for the official guest                     |
+| `lab/php-oci.ini`            | official-guest laboratory php.ini (8M)                          |
+| `lab/php-oci-hardened.ini`   | official-guest hardened control (128M)                          |
+| `lab/www/index.php`          | allocation-inert landing page                                   |
+| `lab/www/version.php`        | version + `memory_limit` for assertions                         |
+| `lab/app-start-oci`          | `/app/start`: flag publish + `apache2-foreground`               |
+| `lab/*` (source-build files) | Apache/PHP source-build lab configuration                       |
+| `RESULTS.md`                 | dated log of what actually ran                                  |
 
 ## Not done
 

