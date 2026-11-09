@@ -78,7 +78,10 @@ def main() -> int:
     ]
     print(f"[*] chain.py: {' '.join(cmd[:2])} ... htdata={hex(args.htdata_offset)} "
           f"huge_mb={args.huge_mb}", flush=True)
-    return subprocess.call(cmd)
+    # The upstream exploit prints its verdict markers (HEAP_LEAK_FAILED,
+    # LIBPHP_LEAK_FAILED, PROOF:) to stderr; merge them into stdout so the
+    # runner's captured transcript records the semantic verdict.
+    return subprocess.call(cmd, stderr=subprocess.STDOUT)
 
 
 if __name__ == "__main__":
