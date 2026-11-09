@@ -294,3 +294,29 @@ deploy/firecracker/labs/php2shell/selftest.sh
 The calibration logs and the winning profile are committed under
 `calibration/`; the per-run VM transcripts live under
 `~/.cache/rctf-p2s-lab/logs/` (host-specific paths, not committed).
+
+## Final-tree green run (2026-11-09, commits 0d18cac3 + 4a6edf0d)
+
+After the convergence-review fixes, two flakiness sources in the runner were
+measured and closed: the leak machinery needs a warmed session state (the
+runner now primes the target with one small PHPSESSID +
+PHP_SESSION_UPLOAD_PROGRESS POST before every leak and chain assertion —
+README "Calibration and honest status" fact 4), and the upstream chain
+prints its leak-absent verdict to stderr (chain.py now merges it into
+stdout). The full lab then passed end to end on the final integrated tree:
+
+```text
+PASS: vulnerable PHP 8.4.26 reproduces the stage-1 stale-id OOM leak and the stage-2 libphp leak
+PASS: vulnerable PHP 8.4.26 executes id as uid=33(www-data) gid=33(www-data) groups=33(www-data)
+PASS: patched PHP 8.4.27: both leak primitives are absent
+PASS: patched PHP 8.4.27: leak absent (chain verdict) and /p answers 404 from the reachable target
+PASS: hardened php.ini: both leak primitives are absent
+PASS: hardened php.ini: leak absent (chain verdict) and /p answers 404 from the reachable target
+ALL PHP2SHELL LAB CHECKS PASSED (leaks + calibrated RCE + controls)
+```
+
+The cold-vs-warmed diagnosis is preserved above (§4 and the debug
+transcripts): the same instance missed three attempts cold and leaked on the
+first attempt after a single priming POST; the strict negative classifier
+refused transport-shaped outcomes until the verdict markers were merged into
+the captured transcript.
