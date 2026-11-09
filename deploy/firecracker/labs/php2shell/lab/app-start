@@ -1,0 +1,25 @@
+#!/bin/sh
+# PHP2Shell training-lab service (PID 1 inside the microVM).
+#
+# The guest init runs this as root after MMDS flags are on the tmpfs. Apache
+# binds :8080 as root, then its prefork child drops to www-data (uid 33) --
+# the uid the exploit proof asserts.
+set -eu
+
+mkdir -p /www /tmp
+
+# Publish the per-instance flag (tmpfs, never baked into the image) so the
+# lab has a real objective: read it through the RCE.
+if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
+  cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
+  chmod 0644 /www/flag.txt
+fi
+
+# The webroot must be writable by the worker for the out-of-band proof
+# (`id>/www/p`).
+chown -R www-data:www-data /www 2>/dev/null || true
+chmod 0755 /www
+chmod 0644 /www/index.php 2>/dev/null || true
+
+exec /opt/php2shell/apache/bin/httpd -D FOREGROUND \
+  -f /opt/php2shell/apache/conf/php2shell.conf
