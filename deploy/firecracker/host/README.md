@@ -348,13 +348,23 @@ user+network namespace, two real Firecracker v1.17.0 microVMs, direct mode):
   and removing the rules makes the same probe succeed (so the result is not a false negative);
 - the guest reaches `169.254.169.254` (MMDS) through the documented `ip=` cmdline and route.
 
-**Verified as root inside a throwaway Ubuntu 24.04 QEMU VM** (`../vmtest/`, 2026-11-08; systemd
-255.4-1ubuntu8.18, kernel 6.8, Firecracker/jailer v1.17.0, nested KVM; the host ran only
-unprivileged QEMU):
+**Verified as root inside throwaway QEMU VMs** (`../vmtest/`, 2026-11-08, nested KVM; the
+developer machine ran only unprivileged QEMU). Every combination below ran all seven check
+scripts: **222 assertions passed, 0 failed**, plus the 50 host-side pidfile self-checks.
 
-- `host-setup.sh` on a fresh distro, including parsing Firecracker 1.17's `--version`, applying only its own
-  `/etc/sysctl.d/90-rctf-firecracker.conf` (an unrelated `99-` drop-in stays unapplied; all three intended keys
-  verified) and an idempotent rerun;
+| VM image (host distro) | systemd           | nftables / conntrack | Guest kernel | Firecracker | Result   |
+| ---------------------- | ----------------- | -------------------- | ------------ | ----------- | -------- |
+| Ubuntu 24.04           | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.155      | v1.17.0     | **PASS** |
+| Debian 12              | 252.39-1~deb12u2  | 1.0.6 / 1.4.7        | 6.1.155      | v1.17.0     | **PASS** |
+| Ubuntu 24.04           | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.188      | v1.17.0     | **PASS** |
+| Ubuntu 24.04           | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.155      | v1.16.0     | **PASS** |
+
+Those runs cover:
+
+- `host-setup.sh` on a fresh distro, including parsing the selected Firecracker `--version`
+  (both releases print the extra `exit_code=0` line), applying only its own
+  `/etc/sysctl.d/90-rctf-firecracker.conf` (an unrelated `99-` drop-in stays unapplied; all three
+  intended keys verified) and an idempotent rerun;
 - jailer mode: create/delete over the real agent API, uid/gid 10000, chroot, per-VM cgroup, real
   tap with the durable alias, MMDS flag delivery, no flag on host disk;
 - the **shipped** systemd unit (byte-identical, no drop-in) actually launching the jailer
@@ -363,6 +373,14 @@ unprivileged QEMU):
 - `egress: true` masquerade, `egress: false` denial, public DNAT from an outside network
   namespace, conntrack flushing on release, and reuse quarantine;
 - team isolation measured from inside the guests, with a rules-removed positive control.
+
+**Ubuntu 22.04 (systemd 249) does not work with the shipped unit.** On systemd 249
+`ProtectClock=yes` installs a device-cgroup allowlist, so `open("/dev/kvm", O_RDWR)` fails with
+`EPERM` inside the unit even as root with `CAP_DAC_OVERRIDE`; the agent preflight then reports
+`kvm:false`. The same unit works on systemd 252 (Debian 12) and 255 (Ubuntu 24.04). The harness
+selection exists (`VM_IMAGE=ubuntu-22.04`) and is recorded as a known failure in
+`../vmtest/RESULTS.md`, but treat systemd 249 hosts as unsupported until the unit drops that
+property (it is defence-in-depth only; KVM access is required for every launch).
 
 **Verified with the real Traefik and the real controller** (unprivileged, `../edge/`, `../e2e/`; Traefik
 v3.7.15 with the repository's file-provider config over plain HTTP): two teams routed by Host header with
@@ -378,6 +396,7 @@ pinning, capacity races, drain, host loss, partition, clock skew and token misma
 
 - TLS and certificate loading (the harnesses use plain HTTP);
 - physical networks and real multi-host failure modes (the two hosts are QEMU VMs on one machine);
-- your specific distro/systemd/kernel/Firecracker combination (capability and namespace
-  requirements can change between releases) — the harness results are for the versions recorded in
-  each `RESULTS.md`.
+- distro/systemd/kernel/Firecracker combinations beyond those in the matrix above (Ubuntu 24.04
+  and Debian 12, systemd 252/255, guest kernels 6.1.155/6.1.188, Firecracker v1.17.0/v1.16.0) —
+  capability, cgroup and device-policy behaviour can change between releases. In particular,
+  Ubuntu 22.04/systemd 249 is a known failure (see above), and other distros are unverified.

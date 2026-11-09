@@ -11,6 +11,10 @@ DROPIN=/etc/systemd/system/rctf-firecracker-agent.service.d
 
 section "b) systemd unit + jailer-mode preflight"
 
+# Informational: the preflight below requires /dev/kvm to be a character
+# device readable/writable by the agent. Record what the host view is.
+echo "  /dev/kvm: $(stat -c '%F %a %U:%G' /dev/kvm 2>&1) access=$(python3 -c 'import os; print(os.access("/dev/kvm", os.R_OK | os.W_OK))' 2>&1)"
+
 # Test from the shipped unit only: remove workarounds from a previous run.
 rm -rf /etc/systemd/system/rctf-firecracker-agent.service.d
 install -m 0644 "$UNIT_SRC" "$UNIT_DST"

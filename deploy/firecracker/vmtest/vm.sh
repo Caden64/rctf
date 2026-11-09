@@ -14,20 +14,31 @@
 #   ./vm.sh status
 #   ./vm.sh stop     # kill qemu + seed http server, keep the disk
 #   ./vm.sh destroy  # stop and remove the overlay (base image is kept)
+#   ./vm.sh user     # print the ssh user for the selected image
 #   ./vm.sh selftest # unprivileged check of the pidfile authentication
 #
 # Environment:
 #   VM_DIR          default $HOME/.cache/rctf-vmtest
+#   VM_IMAGE_DIR    directory holding the shared, verified base images
+#                   (default $HOME/.cache/rctf-vmtest, so a per-run VM_DIR
+#                   reuses the downloaded image instead of fetching it again)
+#   VM_IMAGE        ubuntu-24.04 (default) | ubuntu-22.04 | debian-12
 #   VM_SSH_PORT     default 2422
 #   VM_SEED_PORT    default 8201
 #   VM_MEM          default 4096 (MiB)
 #   VM_SMP          default 4
 #   VM_DISK         default 40G
-#   UBUNTU_SERIES   default noble
-#   UBUNTU_RELEASE  default 20261017 (dated cloud-image directory, not current/)
+#   VM_RUN_TOKEN    optional identity of the run that owns this VM_DIR. When
+#                   set, an already-running VM is adopted only if its recorded
+#                   owner token matches; otherwise create fails hard.
+#   FORCE_ADOPT_VM  set to 1 to adopt a running VM with a different/missing
+#                   owner token (documented escape hatch for debugging only)
+#   UBUNTU_SERIES   default noble (ubuntu-24.04) / jammy (ubuntu-22.04)
+#   UBUNTU_RELEASE  default 20261017 (noble) / 20261106 (jammy); dated
+#                   cloud-image directories, never current/
 #
 # The cloud-init seed is served over the QEMU user-network gateway
-# (10.0.2.2) and selected with the SMBIOS serial `ds=nocloud;s=...` trick, so
+# (10.0.2.2) and selected with the SMBIOS serial `ds=nocloud-net;s=...` trick, so
 # no ISO, xorriso, cloud-localds or root are needed.
 #
 # Boot refuses to start when VM_SSH_PORT / VM_SEED_PORT are already bound by a
@@ -36,26 +47,87 @@
 set -euo pipefail
 
 VM_DIR=${VM_DIR:-$HOME/.cache/rctf-vmtest}
+VM_IMAGE_DIR=${VM_IMAGE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-vmtest}
+VM_IMAGE=${VM_IMAGE:-ubuntu-24.04}
+VM_RUN_TOKEN=${VM_RUN_TOKEN:-}
+FORCE_ADOPT_VM=${FORCE_ADOPT_VM:-0}
 VM_SSH_PORT=${VM_SSH_PORT:-2422}
 VM_SEED_PORT=${VM_SEED_PORT:-8201}
 VM_MEM=${VM_MEM:-4096}
 VM_SMP=${VM_SMP:-4}
 VM_DISK=${VM_DISK:-40G}
 
-UBUNTU_SERIES=${UBUNTU_SERIES:-noble}
-UBUNTU_RELEASE=${UBUNTU_RELEASE:-20261017}
-UBUNTU_IMAGE=${UBUNTU_IMAGE:-noble-server-cloudimg-amd64.img}
-# Digest published in noble/20261017/SHA256SUMS (2026-10-17). Pinned here as
-# well as cross-checked against the published SHA256SUMS on every fresh fetch.
-UBUNTU_IMAGE_SHA256=${UBUNTU_IMAGE_SHA256:-04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}
-UBUNTU_GPG_FINGERPRINT=${UBUNTU_GPG_FINGERPRINT:-D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81}
-UBUNTU_BASE_URL=${UBUNTU_BASE_URL:-https://cloud-images.ubuntu.com/$UBUNTU_SERIES/$UBUNTU_RELEASE}
-BASE_IMAGE_URL=${BASE_IMAGE_URL:-$UBUNTU_BASE_URL/$UBUNTU_IMAGE}
-SHA256SUMS_URL=${SHA256SUMS_URL:-$UBUNTU_BASE_URL/SHA256SUMS}
-SHA256SUMS_GPG_URL=${SHA256SUMS_GPG_URL:-$UBUNTU_BASE_URL/SHA256SUMS.gpg}
-UBUNTU_GPG_KEY_URL=${UBUNTU_GPG_KEY_URL:-https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$UBUNTU_GPG_FINGERPRINT}
+# ---------------------------------------------------------------------------
+# Pinned cloud images
+# ---------------------------------------------------------------------------
+# Each entry is a dated directory plus the published digest of the exact image
+# file. The cached base image is re-hashed against IMAGE_SHA256 before every
+# boot; on first fetch the digest is cross-checked against the publisher's
+# sums (and, for Ubuntu, their GPG signature with the pinned key).
+#
+# Debian publishes only SHA512SUMS in the dated cloud directory and does not
+# sign that file, so the pinned SHA256 below is trust-on-first-use (computed
+# from the fetched bytes on 2026-11-08) and the download is additionally
+# checked against the published SHA512. Ubuntu publishes SHA256SUMS and
+# SHA256SUMS.gpg, so both are verified.
+case "$VM_IMAGE" in
+  ubuntu-24.04)
+    : "${UBUNTU_SERIES:=noble}"
+    : "${UBUNTU_RELEASE:=20261017}"
+    : "${UBUNTU_IMAGE:=noble-server-cloudimg-amd64.img}"
+    : "${UBUNTU_IMAGE_SHA256:=04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94}"
+    BASE_IMAGE_NAME=noble-base.img
+    IMAGE_KIND=ubuntu
+    VM_USER=ubuntu
+    IMAGE_LABEL="Ubuntu 24.04 ($UBUNTU_SERIES/$UBUNTU_RELEASE)"
+    ;;
+  ubuntu-22.04)
+    : "${UBUNTU_SERIES:=jammy}"
+    : "${UBUNTU_RELEASE:=20261106}"
+    : "${UBUNTU_IMAGE:=jammy-server-cloudimg-amd64.img}"
+    : "${UBUNTU_IMAGE_SHA256:=f77bc6d59cb8deaa9657095736b5f5003f7705b47055f01823459715c967de6a}"
+    BASE_IMAGE_NAME=jammy-base.img
+    IMAGE_KIND=ubuntu
+    VM_USER=ubuntu
+    IMAGE_LABEL="Ubuntu 22.04 ($UBUNTU_SERIES/$UBUNTU_RELEASE)"
+    ;;
+  debian-12)
+    : "${DEBIAN_RELEASE:=20261026-2643}"
+    : "${DEBIAN_BASE_URL:=https://cloud.debian.org/images/cloud/bookworm}"
+    DEBIAN_IMAGE_NAME=debian-12-generic-amd64-$DEBIAN_RELEASE.qcow2
+    : "${DEBIAN_IMAGE_SHA256:=b242aca2f6dd2fba72c856edf1d9b0df72a9cd093560535142f1e9c9c8128f80}"
+    # Digest published in bookworm/20261026-2643/SHA512SUMS.
+    : "${DEBIAN_IMAGE_SHA512:=ba6073af9f789c0f7d6b73ec1b23bb207f07f06f2d31bfd3ce5e550fe43eb9415ef983dc0e039014cd59797e0cbea5c32592e6900fa8f974f2e4466b88ff0d80}"
+    BASE_IMAGE_NAME=debian-12-base.img
+    IMAGE_KIND=debian
+    VM_USER=debian
+    IMAGE_LABEL="Debian 12 ($DEBIAN_RELEASE)"
+    ;;
+  *)
+    printf 'vm.sh: unknown VM_IMAGE %s (use ubuntu-24.04, ubuntu-22.04 or debian-12)\n' "$VM_IMAGE" >&2
+    exit 2
+    ;;
+esac
 
-BASE_IMAGE=$VM_DIR/noble-base.img
+if [ "$IMAGE_KIND" = ubuntu ]; then
+  : "${UBUNTU_GPG_FINGERPRINT:=D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81}"
+  : "${UBUNTU_BASE_URL:=https://cloud-images.ubuntu.com/$UBUNTU_SERIES/$UBUNTU_RELEASE}"
+  : "${BASE_IMAGE_URL:=$UBUNTU_BASE_URL/$UBUNTU_IMAGE}"
+  : "${SHA256SUMS_URL:=$UBUNTU_BASE_URL/SHA256SUMS}"
+  : "${SHA256SUMS_GPG_URL:=$UBUNTU_BASE_URL/SHA256SUMS.gpg}"
+  : "${UBUNTU_GPG_KEY_URL:=https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$UBUNTU_GPG_FINGERPRINT}"
+  IMAGE_NAME=$UBUNTU_IMAGE
+  IMAGE_SHA256=$UBUNTU_IMAGE_SHA256
+else
+  : "${SHA512SUMS_URL:=$DEBIAN_BASE_URL/$DEBIAN_RELEASE/SHA512SUMS}"
+  IMAGE_NAME=$DEBIAN_IMAGE_NAME
+  IMAGE_SHA256=$DEBIAN_IMAGE_SHA256
+  BASE_IMAGE_URL=$DEBIAN_BASE_URL/$DEBIAN_RELEASE/$DEBIAN_IMAGE_NAME
+fi
+
+# The base image is shared between run directories (and versions); the overlay,
+# pidfiles, seed and console stay in VM_DIR so runs cannot interfere.
+BASE_IMAGE=$VM_IMAGE_DIR/$BASE_IMAGE_NAME
 OVERLAY=$VM_DIR/overlay.qcow2
 SSH_KEY=$VM_DIR/id_ed25519
 SEED_DIR=$VM_DIR/seed
@@ -344,12 +416,23 @@ check_boot_ports() {
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
-# Verify the pinned image digest and Ubuntu's SHA256SUMS / SHA256SUMS.gpg.
-# Returns 0 with a verified digest; dies on a mismatch. GPG failure caused by
-# unavailable key infrastructure is reported honestly and does not block the
-# pinned SHA256, which is the authoritative check.
-verify_ubuntu_sums() {
+# Verify the pinned image digest against the publisher's published sums.
+# Returns 0 with a verified digest; dies on a mismatch. Ubuntu sums are also
+# checked against a pinned GPG key; Debian publishes no signed sums file in the
+# dated directory, so its download is checked against the published SHA512 in
+# addition to the pinned SHA256 (documented in README.md).
+verify_image_sums() {
   local dir=$1 pub got rc
+  if [ "$IMAGE_KIND" = debian ]; then
+    curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA512SUMS" "$SHA512SUMS_URL" ||
+      die "could not download $SHA512SUMS_URL"
+    pub=$(awk -v f="$IMAGE_NAME" '$2 == f || $2 == "*" f { print $1; exit }' "$dir/SHA512SUMS")
+    [ -n "$pub" ] || die "published SHA512SUMS has no entry for $IMAGE_NAME"
+    [ "$pub" = "$DEBIAN_IMAGE_SHA512" ] ||
+      die "pinned SHA512 $DEBIAN_IMAGE_SHA512 does not match published $pub for $IMAGE_NAME (refusing to use it)"
+    return 0
+  fi
+
   curl -fsSL --retry 3 --connect-timeout 20 -o "$dir/SHA256SUMS" "$SHA256SUMS_URL" ||
     die "could not download $SHA256SUMS_URL"
   pub=$(awk -v f="$UBUNTU_IMAGE" '$2 == f || $2 == "*" f { print $1; exit }' "$dir/SHA256SUMS")
@@ -388,38 +471,39 @@ verify_ubuntu_sums() {
 }
 
 ensure_base_image() {
-  mkdir -p "$VM_DIR"
+  mkdir -p "$VM_DIR" "$VM_IMAGE_DIR"
   if [ -f "$BASE_IMAGE" ]; then
-    log "re-hashing cached Ubuntu image $BASE_IMAGE"
+    log "re-hashing cached $IMAGE_LABEL image $BASE_IMAGE"
     local got
     got=$(sha256_of "$BASE_IMAGE")
-    if [ "$got" = "$UBUNTU_IMAGE_SHA256" ]; then
+    if [ "$got" = "$IMAGE_SHA256" ]; then
       printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
       return 0
     fi
-    log "cached image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256); discarding"
+    log "cached image digest mismatch (got $got, want $IMAGE_SHA256); discarding"
     rm -f "$BASE_IMAGE" "$BASE_IMAGE.sha256"
   fi
   command -v curl >/dev/null || die "curl is required"
   local tmp=$BASE_IMAGE.part dir
   dir=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vm-image.XXXXXX")
   rm -f "$tmp"
-  verify_ubuntu_sums "$dir"
-  log "downloading Ubuntu $UBUNTU_SERIES/$UBUNTU_RELEASE image (~600 MiB) to $BASE_IMAGE"
+  verify_image_sums "$dir"
+  log "downloading $IMAGE_LABEL image (~600 MiB) to $BASE_IMAGE"
   curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$BASE_IMAGE_URL"
   local got
   got=$(sha256_of "$tmp")
-  if [ "$got" != "$UBUNTU_IMAGE_SHA256" ]; then
+  if [ "$got" != "$IMAGE_SHA256" ]; then
     rm -f "$tmp"
     rm -rf "$dir"
-    die "downloaded image digest mismatch (got $got, want $UBUNTU_IMAGE_SHA256)"
+    die "downloaded image digest mismatch (got $got, want $IMAGE_SHA256)"
   fi
   mv "$tmp" "$BASE_IMAGE"
   printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
-  printf 'url=%s\ndigest=%s\ngpg_fingerprint=%s\ndate=%s\n' \
-    "$BASE_IMAGE_URL" "$got" "$UBUNTU_GPG_FINGERPRINT" "$(date -Is)" >"$BASE_IMAGE.meta"
+  printf 'image=%s\nurl=%s\ndigest=%s\nsums_url=%s\ndate=%s\n' \
+    "$VM_IMAGE" "$BASE_IMAGE_URL" "$got" \
+    "${SHA512SUMS_URL:-$SHA256SUMS_URL}" "$(date -Is)" >"$BASE_IMAGE.meta"
   rm -rf "$dir"
-  log "Ubuntu image verified ($got)"
+  log "$IMAGE_LABEL image verified ($got)"
 }
 
 ensure_ssh_key() {
@@ -439,11 +523,14 @@ instance-id: rctf-vmtest-01
 local-hostname: rctf-vmtest
 EOF
   # The management sshd is bound to the QEMU user-network address only, so a
-  # scan of the "public" test interface cannot see port 22 (check h).
-  cat >"$SEED_DIR/user-data" <<EOF
+  # scan of the "public" test interface cannot see port 22 (check h). Ubuntu
+  # 24.04 socket-activates ssh while Ubuntu 22.04 and Debian 12 run
+  # ssh.service, so runcmd restarts whichever unit the image actually enables.
+  if [ "$IMAGE_KIND" = ubuntu ]; then
+    cat >"$SEED_DIR/user-data" <<EOF
 #cloud-config
 users:
-  - name: ubuntu
+  - name: $VM_USER
     sudo: ALL=(ALL) NOPASSWD:ALL
     groups: [sudo]
     shell: /bin/bash
@@ -482,10 +569,52 @@ write_files:
       ListenStream=10.0.2.15:22
 runcmd:
   - [ systemctl, daemon-reload ]
-  - [ systemctl, restart, ssh.socket ]
+  - [ sh, -c, "if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then systemctl restart ssh.socket; else systemctl restart ssh; fi" ]
   - [ sh, -c, "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null 2>&1 || true" ]
   - [ touch, /etc/rctf-vmtest-ready ]
 EOF
+  else
+    cat >"$SEED_DIR/user-data" <<EOF
+#cloud-config
+users:
+  - name: $VM_USER
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: [sudo]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - $pub
+ssh_pwauth: false
+disable_root: true
+package_update: true
+package_upgrade: false
+packages:
+  - nftables
+  - conntrack
+  - jq
+  - netcat-openbsd
+  - curl
+  - iproute2
+  - e2fsprogs
+  - unzip
+  - tar
+  - ca-certificates
+  - psmisc
+  - procps
+  - nmap
+  - python3
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-vmtest.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+      ListenAddress 10.0.2.15
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ sh, -c, "if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then systemctl restart ssh.socket; else systemctl restart ssh; fi" ]
+  - [ touch, /etc/rctf-vmtest-ready ]
+EOF
+  fi
 }
 
 start_seed_server() {
@@ -513,7 +642,7 @@ start_seed_server() {
 wait_ssh() {
   local deadline=$((SECONDS + 240))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 true >/dev/null 2>&1; then return 0; fi
+    if ssh "${ssh_opts[@]}" "$VM_USER@127.0.0.1" true >/dev/null 2>&1; then return 0; fi
     sleep 3
   done
   return 1
@@ -521,14 +650,49 @@ wait_ssh() {
 
 wait_cloud_init() {
   log "waiting for cloud-init (packages) - first boot can take a few minutes"
-  if ! timeout 1200 ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 \
-    'sudo cloud-init status --wait >/dev/null 2>&1; sudo cloud-init status'; then
-    tail -40 "$CONSOLE" >&2 || true
-    die "cloud-init did not finish"
+  local status rc=0
+  status=$(timeout 1200 ssh "${ssh_opts[@]}" "$VM_USER@127.0.0.1" \
+    'sudo cloud-init status --wait >/dev/null 2>&1; sudo cloud-init status' 2>&1) || rc=$?
+  printf '%s\n' "$status" | sed 's/^/  cloud-init: /' >&2
+  if [ "$rc" -ne 0 ] || ! printf '%s\n' "$status" | grep -q 'status: done'; then
+    # A degraded cloud-init can be a transient package-mirror failure. The
+    # readiness marker is written as the last runcmd of OUR seed, so it is the
+    # authoritative "the seed was applied" signal; provisioning re-installs
+    # every package anyway. Keep the status visible instead of hiding it.
+    if ssh "${ssh_opts[@]}" "$VM_USER@127.0.0.1" 'test -f /etc/rctf-vmtest-ready'; then
+      log "WARNING: cloud-init reported a non-clean status (rc=$rc); continuing because /etc/rctf-vmtest-ready exists"
+    else
+      tail -40 "$CONSOLE" >&2 || true
+      die "cloud-init did not finish"
+    fi
   fi
-  if ! ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 'test -f /etc/rctf-vmtest-ready'; then
+  if ! ssh "${ssh_opts[@]}" "$VM_USER@127.0.0.1" 'test -f /etc/rctf-vmtest-ready'; then
     die "VM did not finish provisioning (/etc/rctf-vmtest-ready missing)"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Run ownership: boot must never adopt (and therefore later stop) a VM another
+# run started. The run that boots writes a token into VM_DIR; an already-running
+# authenticated VM is adopted only when the token matches (or when the caller
+# opts in with FORCE_ADOPT_VM=1). Direct vm.sh usage without VM_RUN_TOKEN keeps
+# the historical idempotent create behaviour.
+# ---------------------------------------------------------------------------
+OWNER_TOKEN_FILE=$VM_DIR/owner-token
+
+write_run_token() {
+  [ -n "$VM_RUN_TOKEN" ] || return 0
+  local tmp=$VM_DIR/.owner-token.$$
+  printf '%s\n' "$VM_RUN_TOKEN" >"$tmp" && mv -f "$tmp" "$OWNER_TOKEN_FILE"
+}
+
+run_owns_vm() {
+  [ -n "$VM_RUN_TOKEN" ] || return 0
+  local current=
+  if [ -f "$OWNER_TOKEN_FILE" ]; then
+    current=$(cat "$OWNER_TOKEN_FILE" 2>/dev/null) || current=
+  fi
+  [ "$current" = "$VM_RUN_TOKEN" ]
 }
 
 boot() {
@@ -539,6 +703,14 @@ boot() {
   check_boot_ports
   local qpid
   if pidfile_observe "$QEMU_PID" qemu; then
+    if ! run_owns_vm; then
+      if [ "$FORCE_ADOPT_VM" = 1 ]; then
+        log "WARNING: FORCE_ADOPT_VM=1: adopting VM pid $PIDFILE_PID, which this run did not start"
+        write_run_token || die "could not record the owner token in $VM_DIR"
+      else
+        die "an authenticated VM this run did not start is already running in $VM_DIR (pid $PIDFILE_PID); refusing to adopt it (set FORCE_ADOPT_VM=1 to override)"
+      fi
+    fi
     log "VM already running (pid $PIDFILE_PID)"
     return 0
   fi
@@ -554,6 +726,9 @@ boot() {
     log "creating qcow2 overlay (${VM_DISK})"
     qemu-img create -q -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$OVERLAY" "$VM_DISK"
   fi
+  # Record ownership before QEMU starts, so a boot that fails part-way is still
+  # stopped by the run that started it (and never by an unrelated run).
+  write_run_token || die "could not record the run owner token in $VM_DIR"
   log "booting VM (ssh 127.0.0.1:$VM_SSH_PORT)"
   qemu-system-x86_64 \
     -enable-kvm -cpu host -m "$VM_MEM" -smp "$VM_SMP" \
@@ -562,7 +737,7 @@ boot() {
     -drive "if=virtio,file=$OVERLAY,cache=writeback,discard=unmap" \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22" \
     -device virtio-net-pci,netdev=n0 \
-    -smbios "type=1,serial=ds=nocloud;s=http://10.0.2.2:${VM_SEED_PORT}/" 9>&-
+    -smbios "type=1,serial=ds=nocloud-net;s=http://10.0.2.2:${VM_SEED_PORT}/" 9>&-
   qpid=$(cat "$QEMU_RAW_PID" 2>/dev/null) || qpid=
   [ -n "$qpid" ] || die "qemu did not write $QEMU_RAW_PID"
   pidfile_record "$QEMU_PID" qemu "$qpid" -pidfile "$QEMU_RAW_PID" ||
@@ -600,7 +775,7 @@ destroy_vm() {
     return "$rc"
   fi
   log "removing overlay $OVERLAY"
-  rm -f "$OVERLAY" "$CONSOLE"
+  rm -f "$OVERLAY" "$CONSOLE" "$OWNER_TOKEN_FILE"
   rm -rf "$SEED_DIR"
   return 0
 }
@@ -890,6 +1065,38 @@ PYGUARD
   st_alive "$decoy" "stale seed pidfile"
   st_removed "stale seed pidfile"
 
+  # 15. Run ownership: an already-running VM is adopted only by the run whose
+  # token it records, so a concurrent/foreign run can never stop it.
+  local save_token=$VM_RUN_TOKEN save_force=$FORCE_ADOPT_VM
+  VM_RUN_TOKEN=run-a
+  FORCE_ADOPT_VM=0
+  write_run_token || st_bad "could not record the run owner token"
+  if [ "$(cat "$OWNER_TOKEN_FILE" 2>/dev/null)" = run-a ]; then
+    st_ok "the run token is recorded in the VM directory"
+  else
+    st_bad "the run token was not recorded"
+  fi
+  if run_owns_vm; then st_ok "the run that recorded the token owns the VM"; else
+    st_bad "the run that recorded the token was not recognised"
+  fi
+  VM_RUN_TOKEN=run-b
+  if run_owns_vm; then st_bad "another run's token was accepted (the VM would be adopted)"; else
+    st_ok "a different run token is foreign and is refused"
+  fi
+  FORCE_ADOPT_VM=1
+  write_run_token || st_bad "FORCE_ADOPT_VM did not record the new token"
+  if run_owns_vm; then st_ok "FORCE_ADOPT_VM=1 takes ownership explicitly"; else
+    st_bad "FORCE_ADOPT_VM=1 did not take ownership"
+  fi
+  rm -f "$OWNER_TOKEN_FILE"
+  VM_RUN_TOKEN=run-c
+  FORCE_ADOPT_VM=0
+  if run_owns_vm; then st_bad "a VM with no owner token was adopted without FORCE_ADOPT_VM=1"; else
+    st_ok "a VM with no owner token is foreign and is refused"
+  fi
+  VM_RUN_TOKEN=$save_token
+  FORCE_ADOPT_VM=$save_force
+
   VM_DIR=$save_vm_dir
   QEMU_PID=$save_qpid
   QEMU_RAW_PID=$save_raw
@@ -912,7 +1119,10 @@ case "$cmd" in
     ;;
   ssh)
     shift
-    exec ssh "${ssh_opts[@]}" ubuntu@127.0.0.1 "$@"
+    exec ssh "${ssh_opts[@]}" "$VM_USER@127.0.0.1" "$@"
+    ;;
+  user | image)
+    printf '%s\n' "$VM_USER"
     ;;
   status)
     if pidfile_observe "$QEMU_PID" qemu; then

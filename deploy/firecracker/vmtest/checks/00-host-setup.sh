@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Check a) host-setup.sh on a fresh distro (Ubuntu 24.04 cloud image).
+# Check a) host-setup.sh on a fresh distro (the VM_IMAGE under test).
 #
 # Expects a FRESH host: no /var/lib/rctf-firecracker, no /srv/jailer. The
 # harness runs the shipped script unmodified (no version wrapper, no drop-in)
-# and asserts its real behaviour, including the Firecracker 1.17 version parse.
+# and asserts its real behaviour, including the Firecracker version parse.
 . "$(dirname "$0")/lib.sh"
 
 HOSTDIR=$REPO/deploy/firecracker/host
 SETUP_LOG=/tmp/vmtest-host-setup.log
+FC_VERSION_NUM=${FC_VERSION#v}
 
-section "a) host-setup.sh on a fresh Ubuntu 24.04 host"
+section "a) host-setup.sh on a fresh $VM_IMAGE host"
 
 # --- clean slate (the VM was created for this run) --------------------------
 systemctl stop rctf-firecracker-agent >/dev/null 2>&1 || true
@@ -37,16 +38,21 @@ else
   bad "host-setup.sh fails on a fresh host as shipped (exit $SHIPPED_CODE): $(grep -m1 'ERROR' "$SETUP_LOG" || true)"
 fi
 
-# --- 2. version parsing, FC 1.17.0 ----------------------------------------
-# Firecracker 1.17.0 prints an extra stdout line after the banner; the parser
-# must keep only the first x.y.z token. The rootless hook exercises exactly the
+# --- 2. version parsing, the selected Firecracker version -------------------
+# Firecracker prints an extra stdout line after the banner; the parser must
+# keep only the first x.y.z token. The rootless hook exercises exactly the
 # shipped parser/comparison (the fake-binary unit test lives in
 # apps/firecracker-instancer/test/host-setup-version.test.ts).
 RAW_VERSION=$(/usr/local/bin/firecracker --version 2>/dev/null)
 if printf '%s\n' "$RAW_VERSION" | grep -q 'exiting successfully'; then
-  ok "Firecracker 1.17.0 still prints an extra stdout line on --version"
+  ok "Firecracker $FC_VERSION_NUM prints an extra stdout line on --version"
 else
   bad "Firecracker --version output did not show the expected extra line"
+fi
+if printf '%s\n' "$RAW_VERSION" | grep -qF "Firecracker v$FC_VERSION_NUM"; then
+  ok "the installed firecracker is the selected $FC_VERSION"
+else
+  bad "the installed firecracker is not $FC_VERSION (got: $(printf '%s' "$RAW_VERSION" | head -1))"
 fi
 set +e
 VPROBE=$(cd "$HOSTDIR" && ./host-setup.sh --check-version-only 2>&1)
@@ -55,9 +61,9 @@ set +e
 echo "  (--check-version-only: exit $VPROBE_CODE)"
 printf '%s\n' "$VPROBE" | sed 's/^/  | /'
 expect_eq "$VPROBE_CODE" 0 "--check-version-only succeeds as shipped"
-expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '1p')" "firecracker 1.17.0" \
+expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '1p')" "firecracker $FC_VERSION_NUM" \
   "the extra exit_code log line is not part of the parsed version"
-expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '2p')" "jailer 1.17.0" \
+expect_eq "$(printf '%s\n' "$VPROBE" | sed -n '2p')" "jailer $FC_VERSION_NUM" \
   "the jailer version is parsed the same way"
 
 # --- 4. installed state ----------------------------------------------------
