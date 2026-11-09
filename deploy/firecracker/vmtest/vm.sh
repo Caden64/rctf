@@ -472,21 +472,28 @@ verify_image_sums() {
 
 ensure_base_image() {
   mkdir -p "$VM_DIR" "$VM_IMAGE_DIR"
+  local got sum
   if [ -f "$BASE_IMAGE" ]; then
     log "re-hashing cached $IMAGE_LABEL image $BASE_IMAGE"
-    local got
     got=$(sha256_of "$BASE_IMAGE")
     if [ "$got" = "$IMAGE_SHA256" ]; then
-      printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+      # Same temp+rename pattern as the download path: a concurrent run
+      # never reads a half-written sidecar.
+      sum=$(mktemp "$(dirname -- "$BASE_IMAGE")/.sha256.XXXXXX")
+      printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$sum"
+      mv "$sum" "$BASE_IMAGE.sha256"
       return 0
     fi
     log "cached image digest mismatch (got $got, want $IMAGE_SHA256); discarding"
     rm -f "$BASE_IMAGE" "$BASE_IMAGE.sha256"
   fi
   command -v curl >/dev/null || die "curl is required"
-  local tmp=$BASE_IMAGE.part dir
+  local dir tmp sum
   dir=$(mktemp -d "${TMPDIR:-/tmp}/rctf-vm-image.XXXXXX")
-  rm -f "$tmp"
+  # Private staging in the image directory: two concurrent runs must never
+  # truncate or delete each other's download (a shared $BASE_IMAGE.part did),
+  # and the final publish must be an atomic same-directory rename.
+  tmp=$(mktemp "$(dirname -- "$BASE_IMAGE")/.download.XXXXXX")
   verify_image_sums "$dir"
   log "downloading $IMAGE_LABEL image (~600 MiB) to $BASE_IMAGE"
   curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$BASE_IMAGE_URL"
@@ -498,10 +505,14 @@ ensure_base_image() {
     die "downloaded image digest mismatch (got $got, want $IMAGE_SHA256)"
   fi
   mv "$tmp" "$BASE_IMAGE"
-  printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$BASE_IMAGE.sha256"
+  sum=$(mktemp "$(dirname -- "$BASE_IMAGE")/.sha256.XXXXXX")
+  printf '%s  %s\n' "$got" "$(basename "$BASE_IMAGE")" >"$sum"
+  mv "$sum" "$BASE_IMAGE.sha256"
+  sum=$(mktemp "$(dirname -- "$BASE_IMAGE")/.sha256.XXXXXX")
   printf 'image=%s\nurl=%s\ndigest=%s\nsums_url=%s\ndate=%s\n' \
     "$VM_IMAGE" "$BASE_IMAGE_URL" "$got" \
-    "${SHA512SUMS_URL:-$SHA256SUMS_URL}" "$(date -Is)" >"$BASE_IMAGE.meta"
+    "${SHA512SUMS_URL:-$SHA256SUMS_URL}" "$(date -Is)" >"$sum"
+  mv "$sum" "$BASE_IMAGE.meta"
   rm -rf "$dir"
   log "$IMAGE_LABEL image verified ($got)"
 }

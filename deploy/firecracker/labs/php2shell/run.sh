@@ -230,10 +230,16 @@ vm_ssh 'rm -rf /tmp/p2s-repo && mkdir -p /tmp/p2s-repo && tar xzf - -C /tmp/p2s-
 
 STAGE=$WORK_TMP/artifacts
 mkdir -p "$STAGE"
-cp "$SMOKE_ARTIFACTS/firecracker" "$STAGE/firecracker"
-cp "$SMOKE_ARTIFACTS/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
-cp -a "$SMOKE_ARTIFACTS/dl/rootdir" "$STAGE/rootdir"
-cp "$SMOKE_ARTIFACTS/dl/jq" "$STAGE/jq"
+# Shared cache lock while snapshotting: a concurrent fetch-artifacts.sh run
+# holds this lock exclusively and rebuilds fc-extract/rootdir in place.
+: >>"$SMOKE_ARTIFACTS/.fetch.lock"
+(
+  flock -s 9
+  cp "$SMOKE_ARTIFACTS/firecracker" "$STAGE/firecracker"
+  cp "$SMOKE_ARTIFACTS/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
+  cp -a "$SMOKE_ARTIFACTS/dl/rootdir" "$STAGE/rootdir"
+  cp "$SMOKE_ARTIFACTS/dl/jq" "$STAGE/jq"
+) 9<"$SMOKE_ARTIFACTS/.fetch.lock" || fail "artifact staging failed"
 chmod 0755 "$STAGE/firecracker" "$STAGE/jailer" "$STAGE/jq"
 tar czf "$WORK_TMP/artifacts.tgz" -C "$STAGE" .
 vm_ssh 'rm -rf /tmp/fc-vmtest/artifacts && mkdir -p /tmp/fc-vmtest/artifacts && tar xzf - -C /tmp/fc-vmtest/artifacts' \
@@ -514,6 +520,10 @@ proof_body() {
   vm_ssh "curl -fsS --max-time 10 http://127.0.0.1:$FWD_PORT/p"
 }
 
+proof_http_code() {
+  vm_ssh "curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:$FWD_PORT/p"
+}
+
 assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
   local image=$1 label=$2 out rc body
   out=$(run_chain "$image")
@@ -540,7 +550,7 @@ assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
 }
 
 assert_chain_negative() { # <image> <label> [huge-mb]
-  local image=$1 label=$2 huge=${3:-12} out rc
+  local image=$1 label=$2 huge=${3:-12} out rc code
   out=$(run_chain "$image" "$huge")
   rc=$?
   say "$out"
@@ -548,12 +558,19 @@ assert_chain_negative() { # <image> <label> [huge-mb]
   if printf '%s' "$out" | grep -q '^PROOF:'; then
     fail "$label: chain printed a PROOF line"
   fi
-  printf '%s' "$out" | grep -q 'stage 1' ||
-    fail "$label: chain did not reach stage 1 (transport/setup failure, not a negative)"
-  if proof_body >/dev/null 2>&1; then
-    fail "$label: a proof file is served, so the negative is not real"
-  fi
-  say "PASS: $label failed closed (no proof)"
+  # Semantic negative only: the upstream exploit must report that the LEAK
+  # ITSELF did not reproduce against the reachable target. A transport
+  # error, timeout or crash after any stage log line is a TEST FAILURE,
+  # never a negative (final-review finding).
+  printf '%s' "$out" | grep -qE '^(HEAP_LEAK_FAILED|LIBPHP_LEAK_FAILED)' ||
+    fail "$label: no leak-absent verdict in the chain output; refusing to treat a transport/setup/crash outcome as a negative"
+  # Proof absence must be an HTTP-level answer from the reachable target:
+  # the forwarded webroot answers 404 for /p. 000 (tunnel failure), a
+  # timeout, or any other code is a failure, not proof of absence.
+  code=$(proof_http_code) || fail "$label: could not probe /p over the forward"
+  [ "$code" -eq 404 ] ||
+    fail "$label: /p answered HTTP $code (expected 404: a genuinely absent proof on a reachable target)"
+  say "PASS: $label: leak absent (chain verdict) and /p answers 404 from the reachable target"
 }
 
 # ---------------------------------------------------------------------------

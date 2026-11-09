@@ -494,6 +494,30 @@ describe('HttpAgentClient TLS options', () => {
     expect(spy.seen()?.tls).toEqual({ rejectUnauthorized: true })
   })
 
+  test('scheme casing cannot bypass forced verification', async () => {
+    // HTTPS://Host is https to the fetch implementation; the scheme check
+    // must see it the same way (URL normalization), or the env override
+    // could disable verification for a mixed-case URL.
+    const spy = capture()
+    const client = new HttpAgentClient(
+      baseConfig({ url: 'HTTPS://127.0.0.1:7001' }),
+      {
+        fetch: spy.fetch,
+      }
+    )
+    await client.info()
+    expect(spy.seen()?.tls).toEqual({ rejectUnauthorized: true })
+    expect(new URL('HTTPS://127.0.0.1:7001').protocol).toBe('https:')
+
+    const plain = capture()
+    const plainClient = new HttpAgentClient(
+      baseConfig({ url: 'HTTP://127.0.0.1:7001' }),
+      { fetch: plain.fetch }
+    )
+    await plainClient.info()
+    expect(plain.seen()?.tls).toBeUndefined()
+  })
+
   test('fails closed when both CA forms are set on a direct config', () => {
     const dir = testDir()
     dirs.push(dir)

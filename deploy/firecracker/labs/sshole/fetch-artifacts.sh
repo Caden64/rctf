@@ -121,14 +121,13 @@ ensure_smoke_artifacts() {
     [ -f "$SMOKE/dl/fc.tgz" ] && [ -x "$fc/jailer-$FC_VERSION-x86_64" ]; then
     return 0
   fi
-  lab_log "shared Firecracker artifacts missing; fetching (serialised with flock)"
+  lab_log "shared Firecracker artifacts missing; fetching (the fetcher serialises on its own cache lock)"
   mkdir -p "$SMOKE"
   command -v flock >/dev/null ||
-    die "flock is required to serialise the shared artifact download"
-  (
-    flock 9
-    "$LABS/firecracker/smoke/fetch-artifacts.sh"
-  ) 9>"$SMOKE/.fetch.lock" || die "could not obtain the shared smoke artifacts"
+    die "flock is required by the shared smoke fetcher"
+  # The fetcher takes its own exclusive lock on the cache (see
+  # smoke/fetch-artifacts.sh); wrapping it here would deadlock.
+  "$LABS/firecracker/smoke/fetch-artifacts.sh" || die "could not obtain the shared smoke artifacts"
 }
 
 arch=$(uname -m)

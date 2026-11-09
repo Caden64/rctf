@@ -138,13 +138,10 @@ fi
 if [ ! -x "$SMOKE/firecracker" ] || [ ! -f "$SMOKE/images/smoke/rootfs.ext4" ] ||
   [ ! -x "$SMOKE/dl/rootdir/bin/busybox" ] || [ ! -x "$SMOKE/dl/jq" ] ||
   [ ! -x "$SMOKE/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" ]; then
-  say '==> shared Firecracker artifacts missing; fetching under flock'
-  command -v flock >/dev/null || die 'flock is required to serialise the shared download'
+  say '==> shared Firecracker artifacts missing; fetching (the fetcher serialises on its own cache lock)'
   mkdir -p "$SMOKE"
-  (
-    flock 9
-    "$REPO/deploy/firecracker/smoke/fetch-artifacts.sh"
-  ) 9>"$SMOKE/.fetch.lock" >>"$LOG" 2>&1 || die 'could not fetch the shared artifacts'
+  "$REPO/deploy/firecracker/smoke/fetch-artifacts.sh" >>"$LOG" 2>&1 ||
+    die 'could not fetch the shared artifacts'
 fi
 
 # --- VM ----------------------------------------------------------------------
@@ -174,12 +171,18 @@ rm -f "$WORK/repo.tgz"
 STAGE=$WORK/stage
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$SMOKE/firecracker" "$STAGE/firecracker"
-cp "$SMOKE/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
-cp "$SMOKE/images/smoke/vmlinux" "$STAGE/vmlinux"
-cp "$SMOKE/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
-cp -a "$SMOKE/dl/rootdir" "$STAGE/rootdir"
-cp "$SMOKE/dl/jq" "$STAGE/jq"
+# Shared cache lock while snapshotting: a concurrent fetch-artifacts.sh run
+# holds this lock exclusively and rebuilds fc-extract/rootdir in place.
+: >>"$SMOKE/.fetch.lock"
+(
+  flock -s 9
+  cp "$SMOKE/firecracker" "$STAGE/firecracker"
+  cp "$SMOKE/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
+  cp "$SMOKE/images/smoke/vmlinux" "$STAGE/vmlinux"
+  cp "$SMOKE/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
+  cp -a "$SMOKE/dl/rootdir" "$STAGE/rootdir"
+  cp "$SMOKE/dl/jq" "$STAGE/jq"
+) 9<"$SMOKE/.fetch.lock" || die 'artifact staging failed'
 chmod 0755 "$STAGE/firecracker" "$STAGE/jailer" "$STAGE/jq"
 tar czf "$WORK/artifacts.tgz" -C "$STAGE" . || die 'could not archive the artifacts'
 vm_ssh 'rm -rf /tmp/fc-vmtest/artifacts && mkdir -p /tmp/fc-vmtest/artifacts && tar xzf - -C /tmp/fc-vmtest/artifacts' \

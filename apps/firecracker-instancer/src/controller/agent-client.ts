@@ -128,13 +128,24 @@ export class HttpAgentClient implements AgentClient {
     // loadControllerConfig already resolved and validated this; resolving a
     // directly-constructed config keeps the same fail-closed behaviour.
     const material = config.tls ?? resolveHostTls(config)
+    let scheme: string | undefined
+    try {
+      // URL() normalizes the scheme, so HTTPS://Host and Https://Host are
+      // recognized as https just like the fetch implementation does.
+      scheme = new URL(this.baseUrl).protocol
+    } catch {
+      // An unparseable URL fails at fetch below; TLS options are decided
+      // only when the scheme is actually known.
+      scheme = undefined
+    }
     this.tls =
       material === undefined
-        ? this.baseUrl.startsWith('https://')
+        ? scheme === 'https:'
           ? // No custom trust material, but verification is still forced:
-            // every https agent must reject an untrusted server even when
-            // the process environment sets NODE_TLS_REJECT_UNAUTHORIZED=0,
-            // or the bearer token could be sent to an impostor.
+            // EVERY https agent — scheme casing included — must reject an
+            // untrusted server even when the process environment sets
+            // NODE_TLS_REJECT_UNAUTHORIZED=0, or the bearer token could be
+            // sent to an impostor.
             { rejectUnauthorized: true }
           : undefined
         : // Verify the server certificate even if the process environment sets

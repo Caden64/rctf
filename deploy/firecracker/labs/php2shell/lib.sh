@@ -115,10 +115,9 @@ ensure_smoke_artifacts() {
   fi
   log "shared Firecracker artifacts missing; fetching with the smoke harness"
   mkdir -p "$SMOKE_ARTIFACTS"
-  (
-    flock 9
-    "$SMOKE_DIR/fetch-artifacts.sh"
-  ) 9>"$SMOKE_ARTIFACTS/.fetch.lock" || return 1
+  # The fetcher takes its own exclusive cache lock (see
+  # smoke/fetch-artifacts.sh); wrapping it here would deadlock.
+  "$SMOKE_DIR/fetch-artifacts.sh" || return 1
 }
 
 # read_offsets <image-dir>: sets ZIF_OFFSET and DTOR_OFFSET; returns 1 on error.
