@@ -1,4 +1,151 @@
-# vmtest results — 2026-11-08 (three-outcome pidfiles, non-mutating observers, fail-closed teardown)
+# vmtest results — 2026-11-08 (real-root matrix: host distro × guest kernel × Firecracker)
+
+Real execution as root inside throwaway QEMU VMs. **Nothing privileged was run
+on the developer machine.** The host only ran `qemu-system-x86_64` as the login
+user; every root operation happened inside each VM.
+
+- Host: Linux 7.2.14-arch1-1, AMD Ryzen 7 7840HS, nested KVM enabled,
+  `/dev/kvm` 0666, 16 vCPU / 54 GiB RAM.
+- Driver: `deploy/firecracker/vmtest/matrix.sh` (sequential; every run gets a
+  private `VM_DIR` and its own ssh/seed ports, the verified base images are
+  shared in `~/.cache/rctf-vmtest`).
+- Matrix root: `~/.cache/rctf-vmtest/matrix-20261108-171629-1091070`
+  (`matrix.tsv` / `matrix.md`).
+- Guest/userland inside each VM: Bun 1.4.4 (verified against `SHASUMS256.txt`
+  and the pinned digest), busybox 1.35.0 guest rootfs.
+
+## Matrix (all four combinations PASS)
+
+Each combination ran the seven check scripts in order, plus the 50 host-side
+pidfile/ownership self-checks before boot. Every combination:
+**222 assertions passed, 0 failed** (`00` 23, `10` 35, `20` 45, `30` 57,
+`40` 12, `50` 26, `60` 24).
+
+| #   | VM image (host distro)               | systemd           | nftables / conntrack | Guest kernel | Firecracker | Result   |
+| --- | ------------------------------------ | ----------------- | -------------------- | ------------ | ----------- | -------- |
+| 1   | ubuntu-24.04 (`noble/20261017`)      | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.155      | v1.17.0     | **PASS** |
+| 2   | debian-12 (`bookworm/20261026-2643`) | 252.39-1~deb12u2  | 1.0.6 / 1.4.7        | 6.1.155      | v1.17.0     | **PASS** |
+| 3   | ubuntu-24.04 (`noble/20261017`)      | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.188      | v1.17.0     | **PASS** |
+| 4   | ubuntu-24.04 (`noble/20261017`)      | 255.4-1ubuntu8.18 | 1.0.9 / 1.4.8        | 6.1.155      | v1.16.0     | **PASS** |
+
+Baseline (row 1) was also run once on its own before the matrix
+(`run-20261108-161706-674974.log`) with the same 222/222 result.
+
+## Harness defects fixed in this pass
+
+1. **A second run could stop another run's VM.** The default `VM_DIR` used to
+   be shared, `run.sh` installed its cleanup trap before the prerequisite
+   checks, cleanup stopped the VM unconditionally (unless `KEEP_VM=1`), and
+   `vm.sh create` returned success for any authenticated already-running VM.
+   Fixes:
+   - `run.sh` creates a fresh `VM_DIR` per invocation by default
+     (`$VM_ROOT/runs/run-<stamp>-<pid>.XXXXXX`); base images stay shared in
+     `$VM_IMAGE_DIR`. An explicit `VM_DIR` keeps the old fixed location.
+   - `run.sh` installs `trap cleanup EXIT` only after prerequisites, the
+     artifact fetch and the self-test have passed.
+   - the run writes a random `VM_RUN_TOKEN` into its `VM_DIR/owner-token`
+     before QEMU starts; `vm.sh create` refuses to adopt a running VM whose
+     token differs or is missing (exit 1) unless `FORCE_ADOPT_VM=1`, and
+     `run.sh` cleanup stops only a VM carrying this run's token.
+   - `KEEP_VM=1` still leaves a VM this run started (and its directory) in
+     place; a foreign VM is never touched.
+   - Verified with a real VM:
+     `repros/shared-vm-dir-adoption.sh` → run A boots, run B with a different
+     token is refused (exit 1) and run A's VM is still running, run B with
+     `FORCE_ADOPT_VM=1` adopts it explicitly, and the adopting run stops only
+     that VM. **4/4 repro checks passed, 0 failures.**
+   - The unprivileged self-test grew five ownership checks (same token owns,
+     different token refused, `FORCE_ADOPT_VM=1` takes ownership, missing token
+     refused): **50 checks, 0 failures**.
+2. **Check output used fixed `/tmp/vmtest-check-<name>.log` paths** shared by
+   concurrent runs. Each run now writes to its private scratch directory
+   (`$WORK/check-logs/<name>.log`); only the summary is appended to the
+   transcript.
+
+## Parameterization (defaults preserve the original run)
+
+`run.sh` / `matrix.sh` / `vm.sh` now select three independent axes; unknown
+values are refused rather than fetched unpinned.
+
+| Axis         | Values                                                | Pins                                                                                                                                                                                |
+| ------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VM_IMAGE`   | `ubuntu-24.04` (default), `ubuntu-22.04`, `debian-12` | exact dated image + SHA256; Ubuntu `SHA256SUMS` + `SHA256SUMS.gpg` (key `D2EB…7C81`); Debian published `SHA512SUMS` cross-check plus TUFU SHA256                                    |
+| `KERNEL`     | `vmlinux-6.1.155` (default), `vmlinux-6.1.188`        | per-kernel URL + SHA256 (TUFU; the S3 objects have no published checksum), stored under `images/smoke/kernels/<name>`; `KERNEL_URL`+`KERNEL_SHA256` must be set together for others |
+| `FC_VERSION` | `v1.17.0` (default), `v1.16.0`                        | release tarball from the official `.sha256.txt`; firecracker/jailer binaries checked against the publisher `SHA256SUMS` inside that tarball **and** independent pins                |
+
+- Firecracker tarballs/binaries: `v1.17.0` tarball
+  `06094a…ade558`, binary `99ad0f…5de7a5`, jailer `65ef22…c8434f`;
+  `v1.16.0` tarball `bd04e2…2e92d6`, binary `9b15fc…8efa61`, jailer
+  `86314f…d8fc33`.
+- Kernels: `vmlinux-6.1.155` from `firecracker-ci/v1.15/x86_64/`
+  (`e20e46…d4f2`), `vmlinux-6.1.188` from
+  `firecracker-ci/20261105-6ea6634994fa-0/x86_64/` (`31fe88…27f032`).
+  The same dated directory also carries `vmlinux-6.18.56`
+  (`af3482…9817bf`), selectable via `KERNEL_URL`/`KERNEL_SHA256`.
+- Per-image ssh users and distro handling: `ubuntu` (Ubuntu 24.04/22.04,
+  socket-activated ssh) and `debian` (`ssh.service`); the AppArmor
+  unprivileged-userns knob is only written where the sysctl exists.
+- Cloud-init seed selection changed from the SMBIOS serial
+  `ds=nocloud;s=…` to the canonical network form `ds=nocloud-net;s=…`:
+  Ubuntu accepted both, but Debian 12's cloud-init 22.4 selected
+  `DataSourceNone` with the old form and never applied the user/key. The first
+  Debian attempt failed at boot for exactly that reason; after the fix the
+  running VM reports `Datasource DataSourceNoCloudNet [seed=dmi,http://…]`.
+
+## What the matrix found (per-distro deltas)
+
+- **Debian 12 exposes LLMNR on TCP/UDP 5355** because its systemd-resolved has
+  `LLMNR=yes`, while the Ubuntu images do not. That unrelated host listener
+  appeared in check 60's nmap scan of the "public" test interface (only
+  `5355`, no extra port), so check 60 failed once on Debian with
+  `got '5355 30004 30005'`. The test VM now writes
+  `/etc/systemd/resolved.conf.d/99-rctf-vmtest-no-llmnr.conf` (`LLMNR=no`)
+  during provisioning; the nmap assertion stays strict and Debian passes.
+  Operators should likewise keep unrelated listeners off the production
+  `network.externalInterface`.
+- **Ubuntu 22.04 / systemd 249 is not supported by the shipped unit.**
+  `VM_IMAGE=ubuntu-22.04 ./run.sh` boots (systemd 249.11-0ubuntu3.23, kernel
+  5.15.0-203-generic) and check 00 passes, but check 10 fails with
+  `preflight check 'kvm' is not true` and the agent reports `kvm:false`,
+  cascading through 20–60. Bisection inside the kept VM:
+  - host view in the unit context: `/dev/kvm` is a character device 660
+    root:kvm and `os.access(..., R_OK|W_OK)` is true outside systemd;
+  - inside a transient unit with `ProtectClock=yes`: `access` is false and
+    `open("/dev/kvm", O_RDWR)` fails `EPERM`, even as root with
+    `CapEff=0x82c31eb` (CAP_DAC_OVERRIDE present);
+  - the same probe passes with the unit's other properties
+    (`NoNewPrivileges`, capability set, `ProtectSystem=strict`,
+    `ProtectHome`, `PrivateTmp`, `ProtectKernelModules`,
+    `RestrictAddressFamilies`) and fails with `ProtectClock=yes` alone;
+  - systemd 252 (Debian 12) and 255 (Ubuntu 24.04) do not show the effect.
+    On systemd 249 `ProtectClock=yes` installs a device-cgroup allowlist, which
+    blocks every device the unit does not re-allow. Treat systemd 249 hosts as
+    unsupported until the unit drops that property (it is defence-in-depth
+    only); the shipped unit and its comment were not changed here.
+- **No cgroup or nftables behavioural delta** was observed between systemd
+  252/255 and nftables 1.0.6/1.0.9: jailer per-VM cgroups, `pids.max`, tap
+  creation, conntrack flushing, DNAT and nmap exposure all behaved identically.
+- **Ubuntu 22.04 apparmor userns knob**: the sysctl does not exist there (nor
+  on Debian 12), and the namespace suite passes without it; only Ubuntu 24.04
+  needs the test-VM `kernel.apparmor_restrict_unprivileged_userns=0`.
+
+## Honest notes
+
+- The Debian pinned SHA256 is trust-on-first-use (no publisher checksum for
+  the qcow2 and no signed sums file in the dated directory); the download is
+  additionally checked against the published SHA512 and the cached image is
+  re-hashed before every boot. Ubuntu images keep the full SHA256+GPG path.
+- `vmlinux-6.1.188` came from the dated CI directory
+  `20261105-6ea6634994fa-0` (the current tip on 2026-11-05); dated CI
+  directories are not a stable "latest" API, so the URL+digest are pinned.
+- `ubuntu-22.04` remains selectable to reproduce the systemd 249 finding, but
+  it is not part of the default matrix and is not a supported host.
+- Every matrix run provisions from scratch, including `bun install` and the
+  guest rootfs build; the runs above were sequential to avoid resource
+  contention. A pre-existing `rctf-p2s-lab` QEMU VM from another worker was
+  running during part of this pass and was never touched.
+
+# Previous run — three-outcome pidfiles, non-mutating observers, fail-closed teardown (2026-11-08; superseded)
 
 Real execution as root inside a throwaway QEMU VM. **Nothing privileged was
 run on the developer machine.** The host only ran `qemu-system-x86_64` as the
@@ -25,15 +172,15 @@ All checks pass: **221 assertions, 0 failed**. The pidfile self-test adds
 check assertions (45 selftest + 221 check `PASS` lines = the 266 `PASS` lines
 in the transcript).
 
-| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                  |
-| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `00-host-setup.sh` (a)              | 22 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies **only its own** sysctl file (an unrelated 99- drop-in stays unapplied) and all three intended keys, idempotent rerun.                                                      |
-| `10-agent-systemd.sh` (b)           | 35 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent; `AmbientCapabilities=CAP_SETUID` only; measured `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`; `CAP_SETGID` still effective; preflight `accepting:true`.                            |
-| `20-jailer-instance.sh` (c)         | 45 pass / 0 fail | **PASS** — real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown with live tap/nft calibrations and fail-closed post-delete probes, fencing; live Firecracker has zero caps and `NoNewPrivs=1`. |
+| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                           |
+| ----------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh` (a)              | 22 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies **only its own** sysctl file (an unrelated 99- drop-in stays unapplied) and all three intended keys, idempotent rerun.                                                              |
+| `10-agent-systemd.sh` (b)           | 35 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent; `AmbientCapabilities=CAP_SETUID` only; measured `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`; `CAP_SETGID` still effective; preflight `accepting:true`.                                 |
+| `20-jailer-instance.sh` (c)         | 45 pass / 0 fail | **PASS** — real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown with live tap/nft calibrations and fail-closed post-delete probes, fencing; live Firecracker has zero caps and `NoNewPrivs=1`.        |
 | `30-restart-survival.sh` (d)        | 57 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` unchanged, `vm-identity.json` matches live `/proc`; zero-capability/`NoNewPrivs` after each re-adoption; CAP_SYS_PTRACE safe-failure outcome asserted; cleanup tap/process probes calibrated and fail-closed. |
-| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: 105 tests, 0 fail; the namespace suite also passes as `ubuntu`.                                                                                                                                                         |
-| `50-conntrack-quarantine.sh` (f)    | 26 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; tap/nft teardown probes calibrated while live and fail-closed after release; quarantine holds.                                                           |
-| `60-egress-dnat-isolation.sh` (g,h) | 24 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed; Firecracker enumeration calibrated before teardown and fail-closed after it.                                  |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: 105 tests, 0 fail; the namespace suite also passes as `ubuntu`.                                                                                                                                                                 |
+| `50-conntrack-quarantine.sh` (f)    | 26 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; tap/nft teardown probes calibrated while live and fail-closed after release; quarantine holds.                                                                  |
+| `60-egress-dnat-isolation.sh` (g,h) | 24 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed; Firecracker enumeration calibrated before teardown and fail-closed after it.                                           |
 
 Total: **221 passed, 0 failed**; selftest **45 passed, 0 failed**.
 
@@ -88,15 +235,13 @@ Total: **221 passed, 0 failed**; selftest **45 passed, 0 failed**.
   microsecond window cannot authenticate later because the record also pins
   this VM_DIR's `-pidfile` argument, the PID namespace, exe and argv.
 
-
 # Previous run — pidfd signalling + fail-closed observation rerun (2026-11-08 14:23; superseded)
 
 Real execution as root inside a throwaway QEMU VM. **Nothing privileged was run
 on the developer machine.** The host only ran `qemu-system-x86_64` as the login
 user; every root operation happened inside the VM.
 
-- Host: Linux 7.2.14-arch1-1, AMD Ryzen 7 7840HS, nested KVM enabled, `/dev/kvm`
-  0666. This run used `VM_DIR=~/.cache/rctf-vmtest`, `VM_SSH_PORT=2422`,
+- Host: Linux 7.2.14-arch1-1, AMD Ryzen 7 7840HS, nested KVM enabled, `/dev/kvm` 0666. This run used `VM_DIR=~/.cache/rctf-vmtest`, `VM_SSH_PORT=2422`,
   `VM_SEED_PORT=8201`; the host had no other QEMU running before or after
   (`pgrep -x qemu-system-x86` empty; the multihost suite was run afterwards,
   never concurrently).
@@ -118,15 +263,15 @@ All checks pass: **211 assertions, 0 failed** (same check set as the previous
 run). The pidfile self-test adds **23 passing checks** before boot (was 16) and
 is not part of the 211 numbered check assertions.
 
-| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                  |
-| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                                                                                                         |
+| Check                               | Assertions       | Verdict                                                                                                                                                                                                                                                                      |
+| ----------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                                                                                                            |
 | `10-agent-systemd.sh` (b)           | 35 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent; `AmbientCapabilities=CAP_SETUID` only; measured `CapBnd=CapPrm=CapEff=0x82c31eb`, `CapAmb=0x80`, `NoNewPrivs=1`; `CAP_SETGID` still effective; preflight `accepting:true`.                            |
 | `20-jailer-instance.sh` (c)         | 43 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown, fencing; live Firecracker process has `CapPrm=CapEff=CapAmb=0` and `NoNewPrivs=1` after launch. |
-| `30-restart-survival.sh` (d)        | 56 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` unchanged, `vm-identity.json` matches live `/proc`; the zero-capability/`NoNewPrivs` assertion also passes after restart and after `kill -9`; CAP_SYS_PTRACE safe-failure outcome asserted.          |
-| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: 105 tests, 0 fail; the namespace suite also passes as `ubuntu`.                                                                                                                                                         |
-| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                                                                                                       |
-| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed.                                                                                                                  |
+| `30-restart-survival.sh` (d)        | 56 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` unchanged, `vm-identity.json` matches live `/proc`; the zero-capability/`NoNewPrivs` assertion also passes after restart and after `kill -9`; CAP_SYS_PTRACE safe-failure outcome asserted.              |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: 105 tests, 0 fail; the namespace suite also passes as `ubuntu`.                                                                                                                                                            |
+| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                                                                                                          |
+| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports; 22/7001 closed.                                                                                                                   |
 
 Total: **211 passed, 0 failed**.
 
@@ -156,9 +301,9 @@ Total: **211 passed, 0 failed**.
      re-resolving the pidfile after validation: the authenticated target is
      stopped through the already-open pidfd and the second ("recycled") decoy is
      **never** signalled.
-   The existing bare-PID, command-line, boot-id, start-time, other-run argv and
-   seed-pidfile cases still pass.
-4. **Residual races (honest).** The pidfile *record* itself is still sampled
+     The existing bare-PID, command-line, boot-id, start-time, other-run argv and
+     seed-pidfile cases still pass.
+4. **Residual races (honest).** The pidfile _record_ itself is still sampled
    without a pidfd after `qemu -daemonize` writes its pidfile. A PID reuse in
    that microsecond window could record a different process, but that record
    cannot authenticate later: verification also requires this VM_DIR's
@@ -245,15 +390,15 @@ harness exposed three harness bugs (not product bugs); they were fixed and the
 full run was repeated (see "What changed in this pass"). No new product bug was
 found.
 
-| Check                               | Assertions       | Verdict                                                                                                                                                                                                 |
-| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                                        |
-| `10-agent-systemd.sh` (b)           | 31 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent, `KillMode=process`, preflight `accepting:true`, `CAP_SETUID`+`CAP_SETGID` effective and ambient.                                  |
-| `20-jailer-instance.sh` (c)         | 39 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown, fencing.                     |
-| `30-restart-survival.sh` (d)        | 33 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` stays the original PID, `vm-identity.json` matches live `/proc`; CAP_SYS_PTRACE safe-failure outcome asserted.                       |
-| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                                                    |
-| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                                       |
-| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports, plus explicit 22/7001 probes.                                   |
+| Check                               | Assertions       | Verdict                                                                                                                                                                               |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `00-host-setup.sh` (a)              | 18 pass / 0 fail | **PASS** — `host-setup.sh` as shipped accepts Firecracker 1.17.0, creates dirs/modes, applies sysctl, idempotent.                                                                     |
+| `10-agent-systemd.sh` (b)           | 31 pass / 0 fail | **PASS** — shipped unit (byte-identical, no drop-in) starts the agent, `KillMode=process`, preflight `accepting:true`, `CAP_SETUID`+`CAP_SETGID` effective and ambient.               |
+| `20-jailer-instance.sh` (c)         | 39 pass / 0 fail | **PASS** — unit byte-identical/no drop-in; real jailer create, uid/chroot/cgroup/tap, MMDS flag, fail-closed flag-absence scans with planted-canary controls, full teardown, fencing. |
+| `30-restart-survival.sh` (d)        | 33 pass / 0 fail | **PASS** — VM survives `systemctl restart` and `kill -9`, `.vm.pid` stays the original PID, `vm-identity.json` matches live `/proc`; CAP_SYS_PTRACE safe-failure outcome asserted.    |
+| `40-net-tests.sh` (e)               | 12 pass / 0 fail | **PASS** — `FC_REAL=1 bun test test/net` as root: **105 tests, 0 fail**; the namespace suite also passes as `ubuntu`.                                                                 |
+| `50-conntrack-quarantine.sh` (f)    | 24 pass / 0 fail | **PASS** — `conntrack -L` must exit 0; DNAT reply and masqueraded egress original tuples both seeded and flushed; quarantine holds.                                                   |
+| `60-egress-dnat-isolation.sh` (g,h) | 23 pass / 0 fail | **PASS** — egress masquerade/deny, public DNAT, team isolation with control; nmap over 1-10000 + `tcpPortRange` sees only published ports, plus explicit 22/7001 probes.              |
 
 Total: **180 passed, 0 failed**.
 
@@ -288,9 +433,9 @@ Total: **180 passed, 0 failed**.
    `kill -0` failed.
 6. **Re-adoption is asserted, not implied.** `30-restart-survival.sh` checks
    agent-reported `.vm.pid` equals the original PID after both `systemctl
-   restart` and `kill -9`, and compares `vm-identity.json` (`jailRoot` device+
+restart` and `kill -9`, and compares `vm-identity.json` (`jailRoot` device+
    inode, `exePath`, exe dev+inode, uid) against live `/proc/<pid>/{exe,root,
-   status}`.
+status}`.
 7. **CAP_SYS_PTRACE outcome is a hard assertion.** The check records the live
    PID starttime and requires the documented safe outcome when the capability
    is removed: process alive and unsignalled (same starttime) with `errored`
@@ -320,7 +465,6 @@ The earlier full run reported **151 passed, 0 failed** and documented two
 product fixes (B1 version parsing, B2 systemd capabilities) plus a harness-only
 Bun-stdin finding. Those fixes are still in the tree; the detailed sections
 below are updated with this run's counts and evidence.
-
 
 ## a) host-setup.sh on a fresh Ubuntu 24.04 (18 assertions)
 
