@@ -9,24 +9,24 @@ cross-guest probe control, a published-port control, a full-scan nmap proof, fai
 probe/listener parsing, repo-pinned Traefik hashes, and a mutation selftest). The check
 counts therefore differ from the earlier 55-check log.
 
-A later revision (also 2026-11-08) additionally makes the *negative* probes fail closed: a
+A later revision (also 2026-11-08) additionally makes the _negative_ probes fail closed: a
 timed-out/incomplete guest nmap is no longer read as "no open ports", and a failed
 `conntrack -L` is no longer read as "no inherited state". Its run is recorded in the last
 section.
 
 ## Environment / pinned programs
 
-| Program | Version | Provenance |
-| --- | --- | --- |
-| Kernel (host) | `7.2.14-arch1-1` | `uname -r` |
-| nftables | `v1.1.7 (Commodore Bullmoose #8)` | distro |
-| conntrack-tools | `v1.4.9` | distro |
-| nmap | `7.993` | distro |
-| Bun | `1.4.4` | `~/.local/bin/bun` |
-| Traefik | `3.7.15` (`built 2026-10-15T14:33:48Z`, Go `1.26.9`) | release binary, `~/.cache/rctf-edge/traefik-v3.7.15` |
-| Firecracker | `v1.17.0` | `SMOKE_ARTIFACTS` (read-only) |
-| Guest kernel | `6.1.155` (Firecracker CI) | `SMOKE_ARTIFACTS` (read-only) |
-| Guest userland | busybox `1.35.0` static + `jq` | `SMOKE_ARTIFACTS` (read-only) |
+| Program         | Version                                              | Provenance                                           |
+| --------------- | ---------------------------------------------------- | ---------------------------------------------------- |
+| Kernel (host)   | `7.2.14-arch1-1`                                     | `uname -r`                                           |
+| nftables        | `v1.1.7 (Commodore Bullmoose #8)`                    | distro                                               |
+| conntrack-tools | `v1.4.9`                                             | distro                                               |
+| nmap            | `7.993`                                              | distro                                               |
+| Bun             | `1.4.4`                                              | `~/.local/bin/bun`                                   |
+| Traefik         | `3.7.15` (`built 2026-10-15T14:33:48Z`, Go `1.26.9`) | release binary, `~/.cache/rctf-edge/traefik-v3.7.15` |
+| Firecracker     | `v1.17.0`                                            | `SMOKE_ARTIFACTS` (read-only)                        |
+| Guest kernel    | `6.1.155` (Firecracker CI)                           | `SMOKE_ARTIFACTS` (read-only)                        |
+| Guest userland  | busybox `1.35.0` static + `jq`                       | `SMOKE_ARTIFACTS` (read-only)                        |
 
 Traefik pin: **v3.7.15**, published **2026-10-15**. The expected hashes are embedded in
 `fetch-traefik.sh`, not taken from the download origin:
@@ -61,11 +61,11 @@ repository's `build-rootfs.sh`, ran the mutation selftest in its own network nam
 ran the three phases, each in a fresh nested network namespace. Three consecutive full runs
 were made:
 
-| Run | Started (local) | selftest | phase agent | phase veth | phase lifecycle | Total | Exit |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 2026-11-08 12:30:30 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0 |
-| 2 | 2026-11-08 12:31:34 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0 |
-| 3 | 2026-11-08 12:32:47 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0 |
+| Run | Started (local)     | selftest        | phase agent      | phase veth       | phase lifecycle | Total                | Exit |
+| --- | ------------------- | --------------- | ---------------- | ---------------- | --------------- | -------------------- | ---- |
+| 1   | 2026-11-08 12:30:30 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0    |
+| 2   | 2026-11-08 12:31:34 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0    |
+| 3   | 2026-11-08 12:32:47 | 6 pass / 0 fail | 30 pass / 0 fail | 19 pass / 0 fail | 9 pass / 0 fail | **58 pass / 0 fail** | 0    |
 
 Run 3 is quoted below; runs 1 and 2 produced the same check texts. There were **no FAIL
 lines** in any phase or selftest log.
@@ -247,17 +247,17 @@ succeeded), `nmap_report_complete` (exit 0, `Status: Up`, a `Ports:` line and ev
 port present) and `nmap_scan_blocked`. The selftest grew from 6 to 16 mutation checks
 (5 nmap, 5 conntrack). Full run after the change:
 
-| | |
-| --- | --- |
-| Date | 2026-11-08 (America/Denver) |
-| Command | `SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
-| Run dir | `/run/user/1000/fce1794169078239579` |
-| phase agent | **30 pass / 0 fail**, exit 0 |
-| phase veth | **19 pass / 0 fail**, exit 0 |
-| phase lifecycle | **9 pass / 0 fail**, exit 0 |
-| CHECK total | **58 passed, 0 failed** |
-| SELFTEST | **16 passed, 0 failed** |
-| Exit code | **0** |
+|                 |                                                                                        |
+| --------------- | -------------------------------------------------------------------------------------- |
+| Date            | 2026-11-08 (America/Denver)                                                            |
+| Command         | `SMOKE_ARTIFACTS=$HOME/.cache/rctf-fc-smoke KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
+| Run dir         | `/run/user/1000/fce1794169078239579`                                                   |
+| phase agent     | **30 pass / 0 fail**, exit 0                                                           |
+| phase veth      | **19 pass / 0 fail**, exit 0                                                           |
+| phase lifecycle | **9 pass / 0 fail**, exit 0                                                            |
+| CHECK total     | **58 passed, 0 failed**                                                                |
+| SELFTEST        | **16 passed, 0 failed**                                                                |
+| Exit code       | **0**                                                                                  |
 
 ```
  CHECK 7.2 PASS nmap from guest A shows no open ports on guest B (exit 0, all 3 ports reported; cross-tap forwarding dropped)
@@ -299,24 +299,24 @@ The harness now:
   (**6.3a/6.3b**);
 - simulates 8.9 in a **fresh bun process** whose constructor loads the quarantine file, then
   `restore([])` and allocate (**8.9**), and adds **8.10** where the same fresh process pointed
-  at a nonexistent quarantine file *does* reuse a released index/port, proving 8.9 is
+  at a nonexistent quarantine file _does_ reuse a released index/port, proving 8.9 is
   sensitive to the persisted state;
 - reuses the exact old tuple: the replacement guest serves a distinguishable identity on the
   same mapped guest port, the client binds source port 55555, and the exact original/reply
   tuples are asserted before the flush (**5.6b/5.6a**) and again as a fresh entry after reuse
   (**5.11**).
 
-| | |
-| --- | --- |
-| Date | 2026-11-08 15:15 (America/Denver, MST) |
-| Command | `KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
-| Run dir | `/run/user/1000/fce1794176189383796` |
-| selftest | **20 passed / 0 failed**, exit 0 |
-| phase agent | **30 passed / 0 failed**, exit 0 |
-| phase veth | **26 passed / 0 failed**, exit 0 |
-| phase lifecycle | **10 passed / 0 failed**, exit 0 |
-| CHECK total | **66 passed, 0 failed** |
-| Exit code | **0** |
+|                 |                                             |
+| --------------- | ------------------------------------------- |
+| Date            | 2026-11-08 15:15 (America/Denver, MST)      |
+| Command         | `KEEP_RUN=1 deploy/firecracker/edge/run.sh` |
+| Run dir         | `/run/user/1000/fce1794176189383796`        |
+| selftest        | **20 passed / 0 failed**, exit 0            |
+| phase agent     | **30 passed / 0 failed**, exit 0            |
+| phase veth      | **26 passed / 0 failed**, exit 0            |
+| phase lifecycle | **10 passed / 0 failed**, exit 0            |
+| CHECK total     | **66 passed, 0 failed**                     |
+| Exit code       | **0**                                       |
 
 There were no `FAIL` lines. After the run, no agent, Traefik, Firecracker, `unshare` or helper
 process referencing the run dir remained (`ps` sweep empty), and the run dir was inspected and
@@ -342,3 +342,12 @@ new guest was contacted. All 20 mutation selftests (including the new `kill_veri
 cases 6/6b/6c/6d) passed in the same run.
 
 This is one post-change run; the earlier runs above are kept as historical evidence.
+
+## Re-run on the integrated branch (2026-11-08)
+
+After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
+retries, schema validation before the service starts) and the edge Traefik
+fetch / multihost port allocation fixes, the full harness was re-run from the
+integrated tree: RESULT: 0 failed (see the counts in the run log for this
+date). The stricter init changed no check outcome; every failure mode it adds
+fails the boot instead, which these suites never relied on.

@@ -17,7 +17,9 @@ import { bunCommandRunner } from '../../../../apps/firecracker-instancer/src/uti
 
 const [configPath, instanceId, quarantineOverride] = process.argv.slice(2)
 if (!configPath || !instanceId) {
-  throw new Error('usage: lifecycle-restart.ts CONFIG_JSON INSTANCE_ID [QUARANTINE_FILE]')
+  throw new Error(
+    'usage: lifecycle-restart.ts CONFIG_JSON INSTANCE_ID [QUARANTINE_FILE]'
+  )
 }
 
 const config = JSON.parse(readFileSync(configPath, 'utf8')) as {

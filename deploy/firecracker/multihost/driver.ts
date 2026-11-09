@@ -1138,7 +1138,10 @@ const globalCleanup = async (): Promise<void> => {
       try {
         await del(row.team_id, row.challenge_integration_id)
       } catch (error) {
-        note(`delete controller row ${row.team_id}/${row.challenge_integration_id}`, error)
+        note(
+          `delete controller row ${row.team_id}/${row.challenge_integration_id}`,
+          error
+        )
       }
     }
   } catch (error) {
@@ -2319,14 +2322,7 @@ const scenarioHostLoss = async (): Promise<void> => {
       // calling process.kill() afterwards had a window in which the PID could
       // be reused, killing an unrelated process.
       const crash = shell(
-        [
-          VMCTL,
-          '--name',
-          B,
-          '--ssh-port',
-          String(B_SSH),
-          'kill',
-        ],
+        [VMCTL, '--name', B, '--ssh-port', String(B_SSH), 'kill'],
         30_000
       )
       if (crash.code !== 0) {

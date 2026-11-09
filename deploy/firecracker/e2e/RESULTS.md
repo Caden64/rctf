@@ -469,3 +469,12 @@ The rest of the run (groups 2–12 and the leftovers) was unchanged from the 128
 baseline above; the full log is `/tmp/opencode/e2e-run.log` on the run host. This is one
 post-change run, not four: it is reported as such rather than as a repetition of the earlier
 four-run result.
+
+## Re-run on the integrated branch (2026-11-08)
+
+After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
+retries, schema validation before the service starts) and the edge Traefik
+fetch / multihost port allocation fixes, the full harness was re-run from the
+integrated tree: RESULT: 0 failed (see the counts in the run log for this
+date). The stricter init changed no check outcome; every failure mode it adds
+fails the boot instead, which these suites never relied on.

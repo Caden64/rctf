@@ -87,7 +87,6 @@ the login user.
 - The link is still a host-local unix-datagram point-to-point segment, not a
   physical LAN; host loss is a QEMU SIGKILL, not a power cut.
 
-
 Dated log of what actually ran. All runs are on the reference development host:
 
 - Arch Linux, kernel `7.2.14-arch1-1`, 16 vCPU, 54 GiB RAM, `/dev/kvm` with
@@ -171,7 +170,7 @@ the login user.
    symlink or directory) owned by the current uid inside such a directory, and
    `cleanup_link_endpoint_if_stopped` first proves through the authenticated
    pidfile that the VM is not running. Boot's unconditional `rm -f
-   "$LINK_LOCAL"` and stop's unconditional unlink are both gone.
+"$LINK_LOCAL"` and stop's unconditional unlink are both gone.
 4. **Lifecycle operations are serialised.** `create`, `start`, `stop`,
    `destroy` and `kill` hold an exclusive `flock` on
    `$VM_DIR/.lifecycle.lock` for the whole operation; QEMU and the seed server
@@ -199,7 +198,7 @@ the login user.
 
 ### Residual races (honest)
 
-- The pidfile *record* is sampled after QEMU writes it, without a pidfd. A PID
+- The pidfile _record_ is sampled after QEMU writes it, without a pidfd. A PID
   reuse in that microsecond window could record a different process, but that
   record cannot authenticate: verification also requires this VM_DIR's
   `-pidfile` argv and the recorded argv (including the run-specific link
@@ -625,3 +624,12 @@ top of this file.
 - Each run uses ephemeral ports, unique directories and two unique unix-socket
   paths for the private link; the reference host may run other unprivileged
   workers without interference.
+
+## Re-run on the integrated branch (2026-11-08)
+
+After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
+retries, schema validation before the service starts) and the edge Traefik
+fetch / multihost port allocation fixes, the full harness was re-run from the
+integrated tree: RESULT: 0 failed (see the counts in the run log for this
+date). The stricter init changed no check outcome; every failure mode it adds
+fails the boot instead, which these suites never relied on.

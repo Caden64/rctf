@@ -170,11 +170,15 @@ const tcpCount = requests.reduce(
   (sum, req) => sum + req.expose.filter(e => e.kind === 'tcp').length,
   0
 )
-const dnatLines = inet.out.split('\n').filter(line => line.includes('dnat ip to'))
+const dnatLines = inet.out
+  .split('\n')
+  .filter(line => line.includes('dnat ip to'))
 const allGuests = leases.every(lease =>
   inet.out.includes(`ip saddr != ${lease.guestIp} drop`)
 )
-const allArp = leases.every(lease => arp.out.includes(`iifname "${lease.tapName}"`))
+const allArp = leases.every(lease =>
+  arp.out.includes(`iifname "${lease.tapName}"`)
+)
 const allPorts = leases.every(lease =>
   Object.values(lease.publicPorts).every(port =>
     dnatLines.some(line => line.includes(`tcp dport ${port} dnat`))
@@ -268,9 +272,7 @@ const leftovers =
   leases.some(lease => arpAfter.out.includes(lease.tapName))
 const tableDetail = `inet=${
   inetAfter.code === 0 ? 'present' : 'absent (expected after teardown)'
-} arp=${
-  arpAfter.code === 0 ? 'present' : 'absent (expected after teardown)'
-}`
+} arp=${arpAfter.code === 0 ? 'present' : 'absent (expected after teardown)'}`
 const traefikAfter = (() => {
   try {
     return readdirSync(traefikDir)
@@ -356,7 +358,9 @@ const runFreshManager = async (
   ])
   const text = `${stdout.trim()}\n${stderr.trim()}`.trim()
   try {
-    const parsed = JSON.parse(stdout.trim().split('\n').pop() ?? '') as FreshLease
+    const parsed = JSON.parse(
+      stdout.trim().split('\n').pop() ?? ''
+    ) as FreshLease
     if (typeof parsed.tapName !== 'string') throw new Error('bad shape')
     return { code, lease: parsed, text }
   } catch {
@@ -374,9 +378,7 @@ check(
   normal.code === 0 &&
     normal.lease !== undefined &&
     normalPort !== undefined &&
-    !releasedIndexes.has(
-      Number(normal.lease.tapName.slice('fctap'.length))
-    ) &&
+    !releasedIndexes.has(Number(normal.lease.tapName.slice('fctap'.length))) &&
     !releasedPorts.has(normalPort),
   normal.lease === undefined
     ? `fresh-process restart simulation failed (exit ${normal.code}): ${normal.text}`
@@ -400,9 +402,7 @@ const mutationPort =
 const mutationReused =
   mutation.lease !== undefined &&
   mutationPort !== undefined &&
-  (releasedIndexes.has(
-    Number(mutation.lease.tapName.slice('fctap'.length))
-  ) ||
+  (releasedIndexes.has(Number(mutation.lease.tapName.slice('fctap'.length))) ||
     releasedPorts.has(mutationPort))
 check(
   '8.10',

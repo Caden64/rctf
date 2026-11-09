@@ -114,7 +114,7 @@ acts as the player; the upstream netns is the egress destination.
   deliberately prevents reuse here.
 - **7.1** `nmap -sT -p-` from outside against the host address sees **only** the published
   ports; nmap must exit 0 and its XML `scaninfo` must report `numservices="65535"
-  services="1-65535"`, so a timed-out partial scan cannot pass. **7.2** a busybox `nc`
+services="1-65535"`, so a timed-out partial scan cannot pass. **7.2** a busybox `nc`
   connect from inside real guest A to guest B's address is blocked; the 4.6 control shows the
   same probe reports `scan=REACHED` when the rules are flushed, so a dead probe cannot pass.
 
@@ -146,7 +146,7 @@ still crosses the real kernel forwarding hooks with the real rules. Checks:
 - **6.8/6.9** an ARP request whose sender claims guest B's address is dropped (no host ARP
   reply into guest A); with the ARP table flushed the host answers (control). For the control
   only, `10.200.0.0/24` is temporarily added to `fctap0`, because Linux ignores ARP senders
-  that are off-link for the receiving interface *before* any nftables rule runs; the secondary
+  that are off-link for the receiving interface _before_ any nftables rule runs; the secondary
   prefix makes the sender on-link so an unfiltered kernel demonstrably answers.
   Every `spoof.py` injection and `sniff.py` capture in 6.x must exit 0; a failed probe fails
   the check instead of looking like a drop.
@@ -166,7 +166,7 @@ still crosses the real kernel forwarding hooks with the real rules. Checks:
   must return the new identity (**5.10**) and `conntrack -L` must show the **identical** 5-tuple
   as a fresh entry (**5.11**). Every `conntrack -L` here must exit 0 and parse as a listing —
   in particular **5.9** cannot treat a failed command as "no inherited state". The unrelated
-  flow survives, and the new guest is reached. Quarantine is 0 in this phase *on purpose* so
+  flow survives, and the new guest is reached. Quarantine is 0 in this phase _on purpose_ so
   the path that quarantine protects can be executed; the real 120 s quarantine is covered by
   phase `agent` and `lifecycle`.
 
@@ -204,7 +204,7 @@ host.
 breaks each condition and requires the **same** helper the phases use to FAIL (and the
 correct case to PASS):
 
-- **1** a `flushConntrack` of the *wrong* address exits 0 but leaves the tuple, so
+- **1** a `flushConntrack` of the _wrong_ address exits 0 but leaves the tuple, so
   "present immediately before the flush, absent after" cannot pass falsely; flushing the
   right address removes it.
 - **2** the guest probe maps `nc` success to `REACHED`, a refusal to `blocked`, and
@@ -228,16 +228,16 @@ The selftest emits `SELFTEST <id> PASS/FAIL` lines (counted separately from `CHE
 
 ## What is real vs simulated
 
-| Piece | phase `agent` | phase `veth` | phase `lifecycle` |
-| --- | --- | --- | --- |
-| Firecracker + KVM guest | **real** | simulated by netns/veth | none (no VM needed) |
-| Agent HTTP API + manager | **real** | not used (rules rendered directly) | **real** |
-| nftables renderer + `nft` | **real** | **real** | **real** |
-| Traefik + file provider | **real** binary | not used | files only |
-| DNAT / masquerade / forwarding | **real** | **real** | **real** |
-| conntrack (`-L`, `-D`) | **real** | **real** | **real** |
-| nmap | outside + real-guest `nc` | outside? no: guest→guest nmap | outside (SYN to DNAT ports) |
-| ARP/IP/MAC spoof frames | guest-level probe only | **raw frames** from a guest | none |
+| Piece                          | phase `agent`             | phase `veth`                       | phase `lifecycle`           |
+| ------------------------------ | ------------------------- | ---------------------------------- | --------------------------- |
+| Firecracker + KVM guest        | **real**                  | simulated by netns/veth            | none (no VM needed)         |
+| Agent HTTP API + manager       | **real**                  | not used (rules rendered directly) | **real**                    |
+| nftables renderer + `nft`      | **real**                  | **real**                           | **real**                    |
+| Traefik + file provider        | **real** binary           | not used                           | files only                  |
+| DNAT / masquerade / forwarding | **real**                  | **real**                           | **real**                    |
+| conntrack (`-L`, `-D`)         | **real**                  | **real**                           | **real**                    |
+| nmap                           | outside + real-guest `nc` | outside? no: guest→guest nmap      | outside (SYN to DNAT ports) |
+| ARP/IP/MAC spoof frames        | guest-level probe only    | **raw frames** from a guest        | none                        |
 
 The only deliberate substitutions are (a) `veth` instead of `tap`/Firecracker in
 `phase-veth` (needed to inject arbitrary frames; the host-side rules are identical and the
@@ -258,7 +258,7 @@ The real guest performs the same scan with busybox `nc` (7.2).
   joined with `nsenter -t PID -n` / `ip link set ... netns PID`.
 - **ARP off-link sender behaviour**: without nftables, Linux itself ignores ARP senders that
   are not on-link for the receiving interface. The ARP control therefore temporarily widens
-  the interface prefix (documented above) so the check proves the *rule*, not the kernel
+  the interface prefix (documented above) so the check proves the _rule_, not the kernel
   default.
 - The `phase-agent` egress/scan probe uses the guest's own `/probe.txt` loop, so results are
   sampled (bounded polling); it is not a per-packet assertion. The guest distinguishes

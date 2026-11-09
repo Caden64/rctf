@@ -171,19 +171,19 @@ and writes `results.json`. Groups:
 
 ## Files
 
-| Path                | Purpose                                                                                                                                                                 |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run.sh`            | host driver: unique ports/dirs, pidfile selftest, boots + provisions both VMs, asserts the private link, opens the ssh forward, runs `driver.ts`, always stops the VMs. |
-| `vm.sh`             | named QEMU VM helper (copy/extension of `vmtest/vm.sh`): per-VM overlay/seed/ssh port, the second unix-datagram link NIC, authenticated pidfiles + pidfd signalling, per-VM lifecycle `flock`, and `selftest`. |
+| Path                   | Purpose                                                                                                                                                                                                            |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `run.sh`               | host driver: unique ports/dirs, pidfile selftest, boots + provisions both VMs, asserts the private link, opens the ssh forward, runs `driver.ts`, always stops the VMs.                                            |
+| `vm.sh`                | named QEMU VM helper (copy/extension of `vmtest/vm.sh`): per-VM overlay/seed/ssh port, the second unix-datagram link NIC, authenticated pidfiles + pidfd signalling, per-VM lifecycle `flock`, and `selftest`.     |
 | `pidguard.py` (shared) | `../vmtest/pidguard.py`: authenticate a v3 pidfile (boot id, start ticks, exe, PID namespace, argv) and TERM/KILL it through a pidfd; exit codes preserve running / stale / identity-mismatch / observation-error. |
-| `linkguard.py`      | validates the link directory against a trusted root and unlinks an endpoint relative to an opened directory fd (no path-based `rm`).                                      |
-| `provision-host.sh` | runs as root in each VM: packages, bun, checkout, host-setup.sh, images, shipped agent unit + jailer config, controller config on host-a.                               |
-| `hoststats.sh`      | read-only per-host observation (agent list, Firecracker/tap/state/nft counts) used by the driver; every failed enumeration reports -1 + `observationErrors`, which the driver rejects. |
-| `faultproxy.ts`     | runs inside host-a: wraps `../e2e/proxy.ts` around host-b's agent for the ambiguous-create scenario (hold a request or swallow the response).                           |
-| `dbdump.ts`         | read-only controller SQLite snapshot (instances + hosts incl. `accepting` and clock state).                                                                             |
-| `driver.ts`         | real provider + scenarios/assertions + cleanup.                                                                                                                         |
-| `RESULTS.md`        | dated log of what actually ran, with excerpts.                                                                                                                          |
-| `repros/`           | minimal reproductions if a product bug is found (none committed unless found).                                                                                          |
+| `linkguard.py`         | validates the link directory against a trusted root and unlinks an endpoint relative to an opened directory fd (no path-based `rm`).                                                                               |
+| `provision-host.sh`    | runs as root in each VM: packages, bun, checkout, host-setup.sh, images, shipped agent unit + jailer config, controller config on host-a.                                                                          |
+| `hoststats.sh`         | read-only per-host observation (agent list, Firecracker/tap/state/nft counts) used by the driver; every failed enumeration reports -1 + `observationErrors`, which the driver rejects.                             |
+| `faultproxy.ts`        | runs inside host-a: wraps `../e2e/proxy.ts` around host-b's agent for the ambiguous-create scenario (hold a request or swallow the response).                                                                      |
+| `dbdump.ts`            | read-only controller SQLite snapshot (instances + hosts incl. `accepting` and clock state).                                                                                                                        |
+| `driver.ts`            | real provider + scenarios/assertions + cleanup.                                                                                                                                                                    |
+| `RESULTS.md`           | dated log of what actually ran, with excerpts.                                                                                                                                                                     |
+| `repros/`              | minimal reproductions if a product bug is found (none committed unless found).                                                                                                                                     |
 
 ## Safety
 
@@ -210,6 +210,7 @@ and writes `results.json`. Groups:
   processes (**72 checks**, including the PID-namespace mismatch,
   observation-error retention, destroy refusal, name/symlink validation, link
   validation, and a concurrent status/rewrite loop) and runs before every boot.
+
 - Every run uses unique directories, ssh/seed/controller ports and two unique
   unix-socket paths in a 0700 directory for the private link. The link
   directory must be a direct child of `$MH_LINK_ROOT` (the per-run directory),

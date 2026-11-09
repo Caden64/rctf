@@ -123,15 +123,15 @@ the Python listener in cleanup. This revision changes the harness (no product co
 - `selftest.sh` runs first with 10 mutation cases (nonexistent scan target, failing `ip` and
   `nft` stubs, a genuine missing table, and `kill_verified` with mismatched ticks/exe/argv).
 
-| | |
-| --- | --- |
-| Date | 2026-11-08 15:04 (America/Denver, MST) |
-| Command | `deploy/firecracker/smoke/run.sh` |
+|           |                                                                          |
+| --------- | ------------------------------------------------------------------------ |
+| Date      | 2026-11-08 15:04 (America/Denver, MST)                                   |
+| Command   | `deploy/firecracker/smoke/run.sh`                                        |
 | Artifacts | read-only `~/.cache/rctf-fc-smoke` (Firecracker v1.17.0, kernel 6.1.155) |
-| Run dir | `/run/user/1000/fcs1794175894367886` |
-| Checks | **24 passed, 0 failed** |
-| SELFTEST | **10 passed, 0 failed** |
-| Exit code | **0** |
+| Run dir   | `/run/user/1000/fcs1794175894367886`                                     |
+| Checks    | **24 passed, 0 failed**                                                  |
+| SELFTEST  | **10 passed, 0 failed**                                                  |
+| Exit code | **0**                                                                    |
 
 ```
 SELFTEST 1 PASS mutation caught: a nonexistent scan target is inconclusive (exit 2), never 'flag absent'
@@ -154,3 +154,12 @@ peer=REACHED host=REACHED`, and `state=running after 2s` for the first boot. Aft
 agent, Firecracker or Python helper referencing the run dir remained; the run dir was
 inspected and removed. This is one post-change run; the earlier run above is kept as the
 historical baseline.
+
+## Re-run on the integrated branch (2026-11-08)
+
+After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
+retries, schema validation before the service starts) and the edge Traefik
+fetch / multihost port allocation fixes, the full harness was re-run from the
+integrated tree: RESULT: 0 failed (see the counts in the run log for this
+date). The stricter init changed no check outcome; every failure mode it adds
+fails the boot instead, which these suites never relied on.

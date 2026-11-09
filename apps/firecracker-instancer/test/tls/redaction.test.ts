@@ -40,8 +40,6 @@ describe('TLS material log redaction', () => {
   })
 
   test('reports a missing openssl binary as unavailable instead of throwing', () => {
-    expect(opensslAvailable('definitely-not-a-real-openssl-binary')).toBe(
-      false
-    )
+    expect(opensslAvailable('definitely-not-a-real-openssl-binary')).toBe(false)
   })
 })

@@ -184,16 +184,23 @@ describe.skipIf(!hasOpenssl)('real TLS and mTLS handshake', () => {
       // Async spawn (not spawnSync): a synchronous spawn blocks this
       // process's event loop, the agent server above could never accept the
       // child's connection, and the two would deadlock.
-      const child = Bun.spawn(['bun', '-e', `try {
+      const child = Bun.spawn(
+        [
+          'bun',
+          '-e',
+          `try {
   ${scriptBody}
 } catch (error) {
   console.log('FETCH_FAIL', String(error))
-}`], {
-        env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' },
-        stdout: 'pipe',
-        stderr: 'pipe',
-        stdin: 'ignore',
-      })
+}`,
+        ],
+        {
+          env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '0' },
+          stdout: 'pipe',
+          stderr: 'pipe',
+          stdin: 'ignore',
+        }
+      )
       const out = await new Response(child.stdout).text()
       expect(await child.exited).toBe(0)
       return out
@@ -218,7 +225,9 @@ describe.skipIf(!hasOpenssl)('real TLS and mTLS handshake', () => {
 
     // And the same no-material client fails in-process too (default
     // verification of an untrusted certificate).
-    const error = await clientFor(url).info().catch(error => error)
+    const error = await clientFor(url)
+      .info()
+      .catch(error => error)
     expect(error).toBeInstanceOf(AgentUnreachableError)
   })
 })
