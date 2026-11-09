@@ -1,0 +1,62 @@
+# PHP2Shell training-lab Apache configuration.
+#
+# This is a LABORATORY configuration, not a production one. It intentionally
+# reproduces the conditions the publicly disclosed session.upload_progress
+# chain needs:
+#   * Apache prefork + mod_php (php_module DSO),
+#   * exactly ONE request worker (the chain assumes one child),
+#   * display_errors=On and memory_limit=8M from lab/php.ini.
+#
+# It is served only inside a disposable Firecracker microVM. See ../README.md.
+
+ServerRoot /opt/php2shell/apache
+ServerName php2shell-lab
+ServerTokens Full
+ServerSignature Off
+
+Listen 8080
+
+# All mutable runtime state goes to /tmp so the tree under /opt can be
+# read-only in the image.
+DefaultRuntimeDir /tmp
+PidFile /tmp/httpd.pid
+ErrorLog /tmp/httpd-error.log
+CustomLog /tmp/httpd-access.log common
+LogLevel warn
+
+User www-data
+Group www-data
+
+# Apache is configured with --with-mpm=prefork, so the prefork MPM is built
+# into the binary (there is no modules/mod_mpm_prefork.so to load).
+LoadModule unixd_module modules/mod_unixd.so
+LoadModule authz_core_module modules/mod_authz_core.so
+LoadModule authz_host_module modules/mod_authz_host.so
+LoadModule dir_module modules/mod_dir.so
+LoadModule mime_module modules/mod_mime.so
+LoadModule log_config_module modules/mod_log_config.so
+LoadModule php_module modules/libphp.so
+
+DocumentRoot /www
+DirectoryIndex index.php
+KeepAlive Off
+
+<FilesMatch \.php$>
+    SetHandler application/x-httpd-php
+</FilesMatch>
+
+<Directory /www>
+    Options -Indexes
+    AllowOverride None
+    Require all granted
+</Directory>
+
+# One worker, as required by the verified chain profile (lab/rce/apache.conf).
+<IfModule mpm_prefork_module>
+    StartServers           1
+    MinSpareServers        1
+    MaxSpareServers        1
+    MaxRequestWorkers      1
+    ServerLimit            1
+    MaxConnectionsPerChild 0
+</IfModule>
