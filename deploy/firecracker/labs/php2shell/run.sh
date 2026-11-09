@@ -456,14 +456,31 @@ stage_toolkit() {
     fail "could not stage the amd64 pointer-filter patch"
 }
 
+# Prime the leak machinery: the stage-1/2 forges read the session/upload-
+# progress structures left stale by a PREVIOUS session-carrying request. A
+# fresh guest that has only served session-neutral GETs (/version.php) has
+# none, so every forge returns an empty cookie (measured: the same instance
+# missed 3x cold and leaked on the first attempt after ONE priming POST).
+# This is part of the lab's methodology — the toolkit's calibrator assumes a
+# warmed target — not an attack helper: the patched control's session
+# machinery works the same way and still produces no stale-pointer leak.
+prime_target() { # prime_target <label>
+  local label=${1:-target}
+  vm_ssh "curl -s -o /dev/null --max-time 10 \
+    -F PHPSESSID=aaaaaaaaaaaaaaaaaaa \
+    -F PHP_SESSION_UPLOAD_PROGRESS=xx \
+    -F 'f=@/etc/hostname;filename=prime.bin' \
+    http://127.0.0.1:$FWD_PORT/index.php" ||
+    fail "$label: the priming POST failed (target or forward broken)"
+}
+
 # LEAK_OUT/LEAK_RC are set by run_leaks; its output is also printed so the
 # transcript records the exact stage-1/stage-2 results.
 run_leaks() { # run_leaks <image>
   local image=$1 zif dtor
   read_offsets "$IMAGES/$image" || fail "no usable offsets for $image"
   zif=$ZIF_OFFSET
-  dtor=$DTOR_OFFSET
-  LEAK_OUT=$(vm_ssh "timeout 300 python3 /tmp/p2s/lab/leaks.py \
+  dtor=$DTOR_OFFSET  LEAK_OUT=$(vm_ssh "timeout 300 python3 /tmp/p2s/lab/leaks.py \
     -u http://127.0.0.1:$FWD_PORT/index.php \
     --toolkit /tmp/p2s/toolkit --repo-dir /tmp/p2s/upstream-legacy \
     --zif-offset $zif --dtor-offset $dtor \
@@ -476,6 +493,7 @@ run_leaks() { # run_leaks <image>
 }
 
 assert_leaks_present() { # <image> <label>
+  prime_target "$2 leak"
   run_leaks "$1"
   [ "$LEAK_RC" -eq 0 ] ||
     fail "$2: the stage-1/2 leaks did not both reproduce (rc=$LEAK_RC)"
@@ -485,6 +503,7 @@ assert_leaks_present() { # <image> <label>
 }
 
 assert_leaks_absent() { # <image> <label>
+  prime_target "$2 negative"
   run_leaks "$1"
   case "$LEAK_RC" in
     2) ;;
@@ -526,6 +545,7 @@ proof_http_code() {
 
 assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
   local image=$1 label=$2 out rc body
+  prime_target "$label chain"
   out=$(run_chain "$image")
   rc=$?
   say "$out"
@@ -551,6 +571,7 @@ assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
 
 assert_chain_negative() { # <image> <label> [huge-mb]
   local image=$1 label=$2 huge=${3:-12} out rc code
+  prime_target "$label chain negative"
   out=$(run_chain "$image" "$huge")
   rc=$?
   say "$out"
@@ -641,6 +662,7 @@ assert_chain_negative php2shell-hardened "hardened php.ini"
 # state whether this control is a configuration control or a mitigation.
 if [ "${P2S_HARDENED_LIMIT_PROBE:-0}" = 1 ]; then
   say "==> control B informational probe: same image, huge_mb=140 (limit + 12M)"
+  prime_target "hardened informational probe"
   probe_out=$(run_chain php2shell-hardened 140)
   probe_rc=$?
   say "$probe_out"

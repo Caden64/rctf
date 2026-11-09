@@ -224,7 +224,7 @@ The stage-3 geometry is the toolkit's own `8.4.26-bookworm` carrier layout
 (`zif=0x465370`, `dtor=0x65eb60`, `libphp sha256 51663cf8…`) are exactly the
 ones that profile records, and the 0x690d8 carrier lands as documented.
 
-Two measured environment facts were required to get there and are enforced by
+Four measured environment facts were required to get there and are enforced by
 the build and self-test:
 
 1. **No `php.ini`.** With `output_buffering=4096` the stage-1 startup warning
@@ -237,6 +237,18 @@ the build and self-test:
 3. **An allocation-inert landing page.** `session_start()` on the POST path
    (even behind a `REQUEST_METHOD` check) moves the allocator's free list and
    makes the 4096-byte leak miss. The page is `<?php echo "OK\n";`.
+4. **A warmed session state.** The stage-1/2 forges read the
+   session/upload-progress structures left stale by a PREVIOUS
+   session-carrying request. A guest that has only served session-neutral
+   GETs (readiness probes, `/version.php`) has none, and every forge returns
+   an empty cookie until one session-shaped POST has run (measured: the same
+   instance missed 3x cold and leaked on the first attempt after a single
+   priming POST; the toolkit's calibrator assumes a warmed target the same
+   way). The runner therefore primes the target with one small
+   `PHPSESSID`+`PHP_SESSION_UPLOAD_PROGRESS` POST before every leak and chain
+   assertion. This is methodology, not an attack helper: the patched control
+   is primed identically and still produces no stale-pointer leak — which is
+   exactly what the CVE fixes.
 
 Stage 3 was also tried with the explicit deb13 "lab" layout
 (`htdata=0x6e0d8`, five `(4,4)` + six `(31,31)` pads, 31-byte fake refs) and
