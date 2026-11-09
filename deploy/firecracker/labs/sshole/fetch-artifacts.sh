@@ -127,7 +127,7 @@ ensure_smoke_artifacts() {
     die "flock is required by the shared smoke fetcher"
   # The fetcher takes its own exclusive lock on the cache (see
   # smoke/fetch-artifacts.sh); wrapping it here would deadlock.
-  "$LABS/firecracker/smoke/fetch-artifacts.sh" || die "could not obtain the shared smoke artifacts"
+  "$LABS/smoke/fetch-artifacts.sh" || die "could not obtain the shared smoke artifacts"
 }
 
 arch=$(uname -m)
