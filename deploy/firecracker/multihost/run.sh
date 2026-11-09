@@ -183,13 +183,19 @@ say "per-run secrets generated (not logged)"
 # ---------------------------------------------------------------------------
 STAGE=$RUN/stage
 mkdir -p "$STAGE"
-cp "$ARTIFACTS/firecracker" "$STAGE/firecracker"
-cp "$ARTIFACTS/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
-cp "$ARTIFACTS/images/smoke/vmlinux" "$STAGE/vmlinux"
-cp "$ARTIFACTS/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
-cp "$(readlink -f "$(command -v bun)")" "$STAGE/bun"
+# Shared cache lock while snapshotting: a concurrent fetch-artifacts.sh run
+# holds this lock exclusively and rebuilds fc-extract/rootdir in place.
+: >>"$ARTIFACTS/.fetch.lock"
+(
+  flock -s 9
+  cp "$ARTIFACTS/firecracker" "$STAGE/firecracker"
+  cp "$ARTIFACTS/dl/fc-extract/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$STAGE/jailer"
+  cp "$ARTIFACTS/images/smoke/vmlinux" "$STAGE/vmlinux"
+  cp "$ARTIFACTS/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
+  cp "$(readlink -f "$(command -v bun)")" "$STAGE/bun"
+  cp "$ARTIFACTS/dl/jq" "$STAGE/jq"
+) 9<"$ARTIFACTS/.fetch.lock" || die "artifact staging failed"
 chmod 0755 "$STAGE/firecracker" "$STAGE/jailer" "$STAGE/bun"
-cp "$ARTIFACTS/dl/jq" "$STAGE/jq"
 chmod 0755 "$STAGE/jq"
 
 say "==> packing checkout and artifacts"

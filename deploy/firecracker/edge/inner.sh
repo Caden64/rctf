@@ -69,18 +69,25 @@ build_guest_image() {
   say "=== building guest image (mkfs.ext4 -d, no root) ==="
   local stage=$RUN/guestroot
   rm -rf "$stage"
-  cp -a "$ARTIFACTS/dl/rootdir" "$stage"
-  cp "$EDGE/lib/guest-start" "$stage/app/start"
-  chmod 0755 "$stage/app/start"
-  cp "$ARTIFACTS/images/smoke/vmlinux" "$RUN/images/edge/vmlinux"
-  sh "$REPO/deploy/firecracker/guest/build-rootfs.sh" \
-    --dir "$stage" --size 64M \
-    --jq "$ARTIFACTS/dl/jq" \
-    --init "$REPO/deploy/firecracker/guest/init" \
-    --out "$RUN/images/edge/rootfs.ext4" >>"$SUMMARY" 2>&1 || {
-    fail 0.log "guest image build failed"
-    exit 1
-  }
+  # Shared cache lock while snapshotting and building: a concurrent
+  # fetch-artifacts.sh run holds this lock exclusively and rebuilds
+  # fc-extract/rootdir in place, and build-rootfs.sh reads the cached jq.
+  : >>"$ARTIFACTS/.fetch.lock"
+  (
+    flock -s 9
+    cp -a "$ARTIFACTS/dl/rootdir" "$stage"
+    cp "$EDGE/lib/guest-start" "$stage/app/start"
+    chmod 0755 "$stage/app/start"
+    cp "$ARTIFACTS/images/smoke/vmlinux" "$RUN/images/edge/vmlinux"
+    sh "$REPO/deploy/firecracker/guest/build-rootfs.sh" \
+      --dir "$stage" --size 64M \
+      --jq "$ARTIFACTS/dl/jq" \
+      --init "$REPO/deploy/firecracker/guest/init" \
+      --out "$RUN/images/edge/rootfs.ext4" >>"$SUMMARY" 2>&1 || {
+      fail 0.log "guest image build failed"
+      exit 1
+    }
+  ) 9<"$ARTIFACTS/.fetch.lock" || exit 1
   say "guest image ready: $RUN/images/edge/rootfs.ext4"
 }
 

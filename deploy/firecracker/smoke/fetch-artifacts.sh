@@ -16,6 +16,20 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ARTIFACTS=${SMOKE_ARTIFACTS:-${XDG_CACHE_HOME:-$HOME/.cache}/rctf-fc-smoke}
 
+# Exclusive cache lock for the whole run: this script rebuilds shared cache
+# state in place (fc-extract is deleted and re-extracted, the installed
+# firecracker binary is overwritten, rootdir and the smoke rootfs are
+# rebuilt), so a concurrent reader must never see the cache mid-rebuild.
+# Readers (vmtest/multihost/edge staging) take this same lock SHARED while
+# they snapshot artifacts. Callers must NOT wrap this script in their own
+# lock on the same file: the nested acquire would deadlock.
+command -v flock >/dev/null ||
+  { echo "fetch-artifacts: flock is required to serialise cache access" >&2; exit 1; }
+mkdir -p "$ARTIFACTS"
+exec 9>"$ARTIFACTS/.fetch.lock"
+flock 9 ||
+  { echo "fetch-artifacts: could not lock $ARTIFACTS/.fetch.lock" >&2; exit 1; }
+
 # --- pinned versions and digests -------------------------------------------
 FC_VERSION=${FC_VERSION:-v1.17.0}
 case "$FC_VERSION" in

@@ -77,14 +77,10 @@ ensure_artifacts() {
     [ -x "$CACHE/dl/rootdir/bin/busybox" ] && [ -x "$CACHE/dl/jq" ]; then
     return 0
   fi
-  say "==> shared Firecracker artifacts missing ($FC_VERSION, $KERNEL); fetching (serialised with flock)"
+  say "==> shared Firecracker artifacts missing ($FC_VERSION, $KERNEL); fetching (the fetcher serialises on its own cache lock)"
   mkdir -p "$CACHE"
-  command -v flock >/dev/null || { say "flock is required to serialise downloads"; return 1; }
-  (
-    flock 9
-    FC_VERSION="$FC_VERSION" KERNEL="$KERNEL" \
-      "$REPO/deploy/firecracker/smoke/fetch-artifacts.sh"
-  ) 9>"$CACHE/.fetch.lock" || return 1
+  FC_VERSION="$FC_VERSION" KERNEL="$KERNEL" \
+    "$REPO/deploy/firecracker/smoke/fetch-artifacts.sh" || return 1
 }
 
 # Stop only a VM this run started, then remove this run's private VM directory
@@ -194,12 +190,18 @@ rm -f "$WORK/repo.tgz"
 STAGE=$WORK/stage
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
-cp "$(fc_binary)" "$STAGE/firecracker"
-cp "$(fc_jailer)" "$STAGE/jailer"
-cp "$(kernel_file)" "$STAGE/vmlinux"
-cp "$CACHE/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
-cp -a "$CACHE/dl/rootdir" "$STAGE/rootdir"
-cp "$CACHE/dl/jq" "$STAGE/jq"
+# Shared cache lock while snapshotting: a concurrent fetch-artifacts.sh run
+# holds this lock exclusively and rebuilds fc-extract/rootdir in place.
+: >>"$CACHE/.fetch.lock"
+(
+  flock -s 9
+  cp "$(fc_binary)" "$STAGE/firecracker"
+  cp "$(fc_jailer)" "$STAGE/jailer"
+  cp "$(kernel_file)" "$STAGE/vmlinux"
+  cp "$CACHE/images/smoke/rootfs.ext4" "$STAGE/rootfs-smoke.ext4"
+  cp -a "$CACHE/dl/rootdir" "$STAGE/rootdir"
+  cp "$CACHE/dl/jq" "$STAGE/jq"
+) 9<"$CACHE/.fetch.lock" || { say "artifact staging failed"; exit 2; }
 chmod 0755 "$STAGE/firecracker" "$STAGE/jailer" "$STAGE/jq"
 tar czf "$WORK/artifacts.tgz" -C "$STAGE" .
 vm_ssh 'rm -rf /tmp/fc-vmtest/artifacts && mkdir -p /tmp/fc-vmtest/artifacts && tar xzf - -C /tmp/fc-vmtest/artifacts' \
