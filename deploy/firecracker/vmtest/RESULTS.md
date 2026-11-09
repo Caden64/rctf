@@ -914,3 +914,12 @@ sudo bash /opt/rctf-firecracker/deploy/firecracker/vmtest/repros/host-setup-vers
 sudo bash /opt/rctf-firecracker/deploy/firecracker/vmtest/repros/systemd-unit-setuid.sh
 bash /opt/rctf-firecracker/deploy/firecracker/vmtest/repros/bun-spawn-nft-stdin.sh
 ```
+
+## Integrated-branch baseline re-run (2026-11-08)
+
+After merging the fail-closed guest boot contract, the edge/multihost port
+fixes and the shared smoke-cache locking, the baseline combination
+(Ubuntu 24.04, kernel 6.1.155, Firecracker v1.17.0) was re-run from the
+integrated tree, including the new shared-lock artifact staging: all seven
+check scripts pass again — 222 assertions, 0 failed, exit 0 — matching the
+recorded matrix results.
