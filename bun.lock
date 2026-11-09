@@ -40,6 +40,7 @@
         "@kubernetes/client-node": "2.0.0",
         "@rctf/config": "workspace:*",
         "@rctf/db": "workspace:*",
+        "@rctf/firecracker-protocol": "workspace:*",
         "@rctf/scoring": "workspace:*",
         "@rctf/types": "workspace:*",
         "@rctf/util": "workspace:*",
@@ -116,6 +117,22 @@
         "@types/mdast": "4.0.4",
         "mdast-util-to-hast": "13.2.1",
         "pagefind": "1.5.2",
+      },
+    },
+    "apps/firecracker-instancer": {
+      "name": "@rctf/firecracker-instancer",
+      "version": "0.0.0",
+      "dependencies": {
+        "@rctf/firecracker-protocol": "workspace:*",
+        "pino": "catalog:",
+        "yaml": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
+      },
+      "peerDependencies": {
+        "typescript": "catalog:",
       },
     },
     "apps/web": {
@@ -195,6 +212,19 @@
         "drizzle-kit": "0.31.10",
         "drizzle-orm": "catalog:",
         "postgres": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@types/bun": "catalog:",
+      },
+      "peerDependencies": {
+        "typescript": "catalog:",
+      },
+    },
+    "packages/firecracker": {
+      "name": "@rctf/firecracker-protocol",
+      "version": "0.0.0",
+      "dependencies": {
         "zod": "catalog:",
       },
       "devDependencies": {
@@ -748,6 +778,10 @@
     "@rctf/db": ["@rctf/db@workspace:packages/db"],
 
     "@rctf/docs": ["@rctf/docs@workspace:apps/docs"],
+
+    "@rctf/firecracker-instancer": ["@rctf/firecracker-instancer@workspace:apps/firecracker-instancer"],
+
+    "@rctf/firecracker-protocol": ["@rctf/firecracker-protocol@workspace:packages/firecracker"],
 
     "@rctf/scoring": ["@rctf/scoring@workspace:packages/scoring"],
 

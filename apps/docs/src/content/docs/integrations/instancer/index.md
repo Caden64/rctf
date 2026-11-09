@@ -1,10 +1,10 @@
 ---
 title: Instancer
-description: Configure per-team challenge instances with Docker or Kubernetes.
+description: Configure per-team challenge instances with Docker, Kubernetes, or Firecracker microVMs.
 order: 2
 ---
 
-The instancer gives each team an isolated copy of a challenge service running on Docker or Kubernetes. Participants can start, inspect, extend, and stop their instance through rCTF.
+The instancer gives each team an isolated copy of a challenge service running on Docker, Kubernetes, or in a Firecracker microVM. Participants can start, inspect, extend, and stop their instance through rCTF.
 
 Instanced challenges work well when teams need private mutable state, a dedicated service process, or a target that should disappear after a timeout.
 
@@ -14,16 +14,17 @@ Treat challenge images as hostile. Set resource limits, keep containers or pods 
 
 ## Pick a backend
 
-Both providers give participants the same controls and use the same shared challenge fields, but each backend has its own deployment guide.
+All providers give participants the same controls and use the same shared challenge fields, but each backend has its own deployment guide.
 
 - [Docker instancer](/integrations/instancer/docker) is a bundled Python FastAPI service driving Docker, Traefik, and Redis.
 - [Kubernetes instancer](/integrations/instancer/kubernetes) is a Go operator driving GKE, Traefik, and Terraform.
+- [Firecracker instancer](/integrations/instancer/firecracker) boots one microVM per team on your own KVM hosts, with a scheduler, multi-host capacity management, and crash recovery.
 
 ## How it works
 
 Each challenge uses `<red>instancerConfig</red>` to select a named instancer and set its ID, timeout, public endpoints, and provider-specific settings. If the challenge does not select one, rCTF uses `<red>defaultInstancer</red>` or the only configured instancer.
 
-When a participant starts an instance, rCTF validates the challenge configuration and sends the request to Docker or Kubernetes. The challenge page shows the instance status and the endpoints in the order listed under `<red>expose</red>`, along with controls to extend or stop it.
+When a participant starts an instance, rCTF validates the challenge configuration and sends the request to Docker, Kubernetes, or the Firecracker controller. The challenge page shows the instance status and the endpoints in the order listed under `<red>expose</red>`, along with controls to extend or stop it.
 
 ## Provider configuration
 
@@ -60,10 +61,11 @@ Each provider documents its `<red>options</red>` fields and environment override
 
 - [Docker instancer provider options](/integrations/instancer/docker#provider-options)
 - [Kubernetes instancer provider options](/integrations/instancer/kubernetes#provider-options)
+- [Firecracker instancer provider options](/integrations/instancer/firecracker#5-point-rctf-at-the-controller)
 
 ## Challenge configuration
 
-Each instanced challenge needs `<red>instancerConfig</red>`. Its ID, timeout, extension setting, and exposed endpoints work the same with either provider. The contents of `<red>config</red>` depend on whether the challenge uses Docker or Kubernetes.
+Each instanced challenge needs `<red>instancerConfig</red>`. Its ID, timeout, extension setting, and exposed endpoints work the same with every provider. The contents of `<red>config</red>` depend on the provider the challenge uses.
 
 ```yaml title="challenge.yaml"
 instancerConfig:
@@ -106,12 +108,12 @@ The `<red>expose</red>` entries map public endpoints to a service container or p
 
 Endpoint support is provider-specific:
 
-| Kind | Docker behavior | Kubernetes behavior |
-| --- | --- | --- |
-| `<green>http</green>` | Traefik HTTP router on the configured HTTP port. The default is `80{:ts}`. | Traefik `IngressRoute` on the `web` entrypoint. The public port is `80{:ts}`. |
-| `<green>https</green>` | Traefik HTTPS router on the configured HTTPS port. The default is `443{:ts}`. | Traefik `IngressRoute` on the `websecure` entrypoint plus an HTTP redirect route. The public port is `443{:ts}`. |
-| `<green>tcp</green>` | Rewritten to `<green>tcp-ssl</green>` because Traefik needs SNI routing. | Returned as `unsupported-by-instancer` with port `0{:ts}`. Kubernetes configs should use `<green>tcp-ssl</green>`. |
-| `<green>tcp-ssl</green>` | Traefik TCP router with TLS and HostSNI on the configured TCP port. The default is `1337{:ts}`. | Traefik `IngressRouteTCP` with TLS and HostSNI on port `1337{:ts}`. |
+| Kind | Docker behavior | Kubernetes behavior | Firecracker behavior |
+| --- | --- | --- | --- |
+| `<green>http</green>` | Traefik HTTP router on the configured HTTP port. The default is `80{:ts}`. | Traefik `IngressRoute` on the `web` entrypoint. The public port is `80{:ts}`. | Traefik HTTP router on the host's `<red>httpPort</red>` (default `80{:ts}`). |
+| `<green>https</green>` | Traefik HTTPS router on the configured HTTPS port. The default is `443{:ts}`. | Traefik `IngressRoute` on the `websecure` entrypoint plus an HTTP redirect route. The public port is `443{:ts}`. | Traefik HTTPS router on the host's `<red>httpsPort</red>` (default `443{:ts}`). |
+| `<green>tcp</green>` | Rewritten to `<green>tcp-ssl</green>` because Traefik needs SNI routing. | Returned as `unsupported-by-instancer` with port `0{:ts}`. Kubernetes configs should use `<green>tcp-ssl</green>`. | Public port from the host's `<red>tcpPortRange</red>` through DNAT. |
+| `<green>tcp-ssl</green>` | Traefik TCP router with TLS and HostSNI on the configured TCP port. The default is `1337{:ts}`. | Traefik `IngressRouteTCP` with TLS and HostSNI on port `1337{:ts}`. | Traefik TCP router with TLS and HostSNI on the host's `<red>tcpSslPort</red>`. |
 
 ## Participant actions and API routes
 
@@ -137,7 +139,7 @@ captcha:
 
 ## Provider schemas and the admin UI
 
-The fields shared by both providers remain the same. Only `<red>config</red>` differs. Docker accepts a Compose-like service definition, while Kubernetes accepts `<red>pods[]</red>`. Each provider publishes a JSON Schema that describes and validates its version of `<red>config</red>`.
+The fields shared by all providers remain the same. Only `<red>config</red>` differs. Docker accepts a Compose-like service definition, Kubernetes accepts `<red>pods[]</red>`, and Firecracker accepts an image name plus VM sizing. Each provider publishes a JSON Schema that describes and validates its version of `<red>config</red>`.
 
 The schema endpoint returns the schema for each configured instancer and identifies the default. Deployment tools can use the same endpoint to validate a challenge before sending it to rCTF.
 

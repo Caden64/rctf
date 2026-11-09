@@ -1,0 +1,109 @@
+[Unit]
+Description=rCTF Firecracker host agent
+Documentation=https://github.com/redpwn/rctf
+After=network-online.target
+Wants=network-online.target
+# A KVM-less host cannot run Firecracker; fail clearly instead of looping.
+ConditionPathExists=/dev/kvm
+
+[Service]
+Type=simple
+# Adjust the interpreter and checkout path to your installation. The agent is a
+# Bun program (package @rctf/firecracker-instancer).
+EnvironmentFile=-/etc/rctf-firecracker/agent.env
+WorkingDirectory=/opt/rctf-firecracker
+ExecStart=/usr/local/bin/bun /opt/rctf-firecracker/apps/firecracker-instancer/src/agent/index.ts /etc/rctf-firecracker/agent.yaml
+Restart=on-failure
+RestartSec=2
+# VMs must survive an agent restart (the agent re-adopts them), so only the agent
+# process itself is signalled. With the default `mixed`/`control-group` modes
+# systemd would SIGKILL every remaining process in the unit's cgroup (all VMs)
+# when the agent stops or restarts, because VMs are children of this service's
+# cgroup unless vm.cgroupLimits makes the jailer create a per-VM cgroup.
+# Consequence: `systemctl stop` leaves running VMs behind on purpose; drain the
+# host first (POST /v1/hosts/<id>/drain) and delete instances to remove them.
+# Verified in a throwaway Ubuntu 24.04 VM (systemd 255.4-1ubuntu8.18, kernel
+# 6.8, Firecracker/jailer v1.17.0) on 2026-11-08: `systemctl restart` and
+# `kill -9` of the agent both leave the VMs running, and the restarted agent
+# re-adopts them with strict process identity. Still test it before an event.
+KillMode=process
+
+# ---------------------------------------------------------------------------
+# Why root?
+# ---------------------------------------------------------------------------
+# The agent must: own the `inet rctf_fc` nftables table (CAP_NET_ADMIN), create
+# and delete tap devices and add addresses (CAP_NET_ADMIN/CAP_NET_RAW), and run
+# the jailer, which chroots, mounts, setuid/setgids into a per-VM uid and writes
+# cgroups (CAP_SYS_ADMIN, CAP_SYS_CHROOT, CAP_SETUID/SETGID, CAP_CHOWN,
+# CAP_FOWNER, CAP_KILL, CAP_MKNOD). CAP_SYS_PTRACE is required to read
+# /proc/<pid>/exe and /proc/<pid>/root of the jailed Firecracker processes, which
+# run as a different uid: the agent authenticates a VM process by executable
+# inode, uid and jail root before it adopts or signals it, and Linux gates those
+# /proc links behind ptrace access checks. It also needs /dev/kvm.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_PTRACE CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_MKNOD
+NoNewPrivileges=yes
+# ---------------------------------------------------------------------------
+# Why AmbientCapabilities is required for CAP_SETUID
+# ---------------------------------------------------------------------------
+# The jailer forks, setgid/setuid()s to jailUid/jailGid (10000), and only then
+# execs Firecracker. Without CAP_SETUID it fails with
+#   Failed to exec into Firecracker: Operation not permitted (os error 1)
+# and every create returns state "errored" / "launch failed".
+#
+# On systemd 255 (Ubuntu 24.04) the combination above loses that capability:
+# `NoNewPrivileges=yes` together with a seccomp filter (RestrictAddressFamilies=
+# installs one) makes systemd start root services with CapPrm/CapEff one bit
+# short of CapBnd. Verified in the VM with otherwise identical transient units:
+#  - NoNewPrivileges=yes alone:          CapPrm=CapEff=CapBnd=0x82c31eb
+#  - RestrictAddressFamilies= alone:     CapPrm=CapEff=CapBnd=0x82c31eb
+#  - both together:                      CapPrm=CapEff=0x82c316b, CapBnd=0x82c31eb
+# The two measured sets differ by exactly 0x80 = CAP_SETUID. CAP_SETGID (0x40)
+# is still present in CapPrm/CapEff, so only CAP_SETUID is missing; the drop is
+# not caused by the jailer or by Firecracker. (`SystemCallFilter=@system-service`
+# instead of RestrictAddressFamilies= does the same, i.e. any seccomp filter +
+# NNP.)
+#
+# AmbientCapabilities re-adds exactly the one missing capability instead of
+# weakening the sandbox: with it, CapAmb=CAP_SETUID (0x80) and
+# CapEff=CapBnd=0x82c31eb, the jailer launches, and the address-family filter
+# stays in force. Dropping RestrictAddressFamilies= would also work but would
+# allow socket families the agent and jailer never need (and would be a larger
+# change than restoring the bit the jailer actually requires). CAP_SETGID stays
+# in CapabilityBoundingSet (the jailer needs it and it is already effective).
+# Verified: the full vmtest (jailer create/delete, restart, kill -9, conntrack,
+# egress NAT, public DNAT) passes with this shipped unit and no drop-in.
+AmbientCapabilities=CAP_SETUID
+
+# ---------------------------------------------------------------------------
+# Filesystem / kernel hardening that is compatible with the above.
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectClock=yes
+# ReadWritePaths keeps exactly the agent-owned state + Traefik output writable.
+# /srv/jailer is the jailer's --chroot-base-dir (vm.chrootBase default); without
+# it ProtectSystem=strict makes the jail root read-only and every launch fails.
+# The jails themselves live below /var/lib/rctf-firecracker/run.
+ReadWritePaths=/var/lib/rctf-firecracker /srv/jailer /etc/traefik/dynamic/rctf-firecracker /run
+# NOT set on purpose:
+#  - PrivateDevices: /dev/kvm must stay available.
+#  - ProtectHostname: the jailer may set the hostname inside its UTS namespace.
+#  - ProtectControlGroups: the jailer creates/writes per-VM cgroups.
+#  - ProtectKernelTunables: the jailer also writes cgroup files below
+#    /sys/fs/cgroup (vm.cgroupRoot), which ProtectKernelTunables=yes would make
+#    read-only.
+#  - MemoryDenyWriteExecute: Bun/JSC JIT requires writable-executable memory.
+#  - RestrictNamespaces: the jailer creates mount/pid/... namespaces.
+#  - SystemCallFilter: Firecracker + jailer need a broad, version-dependent set.
+
+# Keep only the address families the agent and its children use.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -16,6 +16,7 @@
     "@kubernetes/client-node": "2.0.0",
     "@rctf/config": "workspace:*",
     "@rctf/db": "workspace:*",
+    "@rctf/firecracker-protocol": "workspace:*",
     "@rctf/scoring": "workspace:*",
     "@rctf/types": "workspace:*",
     "@rctf/util": "workspace:*",

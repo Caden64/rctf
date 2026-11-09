@@ -1,0 +1,58 @@
+#!/bin/sh
+# Guest service used by the edge test (installed as /app/start by the harness).
+# Reads the env the real guest init exported from MMDS. Serves the team identity
+# over HTTP :8080, holds raw TCP connections on :9000, and probes:
+#   PROBE_PEER  an URL (upstream HTTP for the egress test)
+#   PROBE_HOST  an URL on the host side of its own tap
+#   SCAN_PEER   another guest's address (busybox nc connect, port SCAN_PORT)
+#
+# `scan` distinguishes a real refusal/timeout (blocked) from a probe that could
+# not run (error: nc missing, usage error, unexpected exit status). The harness
+# only accepts `scan=blocked` as a blocked result, so a dead probe can never
+# masquerade as a firewall drop.
+#
+# EDGE_PROBE_ONCE=1 runs one scan probe, prints "scan=<value>" and exits; the
+# host-side selftest uses that to exercise the probe logic without booting a VM.
+set -u
+
+probe_scan() {
+  s=blocked
+  [ -n "${SCAN_PEER:-}" ] || { printf '%s' "$s"; return; }
+  if ! command -v nc >/dev/null 2>&1; then
+    printf 'error'
+    return
+  fi
+  printf '' | nc -w 1 "$SCAN_PEER" "${SCAN_PORT:-8080}" >/dev/null 2>&1
+  rc=$?
+  case $rc in
+    0) printf 'REACHED' ;;
+    1) printf 'blocked' ;;
+    *) printf 'error' ;;
+  esac
+}
+
+if [ "${EDGE_PROBE_ONCE:-0}" = 1 ]; then
+  printf 'scan=%s\n' "$(probe_scan)"
+  exit 0
+fi
+
+mkdir -p /www
+printf '%s\n' "${GUEST_NAME:-unknown}" >/www/id.txt
+echo ok >/www/index.html
+
+httpd -f -p 8080 -h /www >/dev/null 2>&1 &
+# One long-lived raw TCP listener: a client that connects and stays connected
+# creates a conntrack entry through this guest's DNAT mapping. tcpsvd keeps the
+# listening socket open while each connection is handled by `cat`.
+busybox tcpsvd 0.0.0.0 9000 busybox cat >/dev/null 2>&1 &
+
+while :; do
+  p=blocked
+  h=blocked
+  [ -n "${PROBE_PEER:-}" ] && wget -T 2 -qO- "$PROBE_PEER" >/dev/null 2>&1 && p=REACHED
+  [ -n "${PROBE_HOST:-}" ] && wget -T 2 -qO- "$PROBE_HOST" >/dev/null 2>&1 && h=REACHED
+  s=$(probe_scan)
+  printf 'peer=%s host=%s scan=%s\n' "$p" "$h" "$s" >/www/probe.tmp
+  mv /www/probe.tmp /www/probe.txt
+  sleep 1
+done

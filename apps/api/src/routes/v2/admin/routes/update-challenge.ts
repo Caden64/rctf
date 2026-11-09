@@ -92,6 +92,14 @@ adminGroup.route(UpdateChallengeRouteV2, async ({ res, ctx, params, body }) => {
     }
 
     body.data.instancerConfig.config = configResult.data
+
+    const wholeConfigError = provider.validateInstancerConfig?.({
+      config: body.data.instancerConfig.config,
+      expose: body.data.instancerConfig.expose,
+    })
+    if (wholeConfigError !== undefined) {
+      return res.badInstancerConfig({ error: wholeConfigError })
+    }
   }
 
   let resolvedAdminBotConfig: AdminBotConfig | null | undefined

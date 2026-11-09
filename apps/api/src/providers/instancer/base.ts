@@ -75,6 +75,16 @@ export abstract class InstancerProvider extends BaseProvider {
 
   abstract getDefaults: () => ProviderConfig
 
+  /**
+   * Optional provider-specific validation of the WHOLE instancer config
+   * (`config` plus `expose`), run when an admin saves a challenge so a config
+   * that can never launch is rejected up front instead of at the first player
+   * start. Return an error message, or undefined when valid.
+   */
+  validateInstancerConfig?: (
+    instancerConfig: Pick<InstancerConfig, 'config' | 'expose'>
+  ) => string | undefined
+
   abstract createInstance: (
     options: CreateInstanceOptions
   ) => Promise<instanceDetailsOrError>

@@ -1,0 +1,31 @@
+#!/bin/sh
+# PHP2Shell training-lab service (PID 1 inside the microVM) for the OFFICIAL
+# image guest.
+#
+# The guest init runs this as root after the MMDS flags are on the tmpfs.
+# Apache binds :8080 as root, then its prefork child drops to www-data
+# (uid 33) -- the uid the exploit proof asserts.
+#
+# This is the image's own apache2 (2.4.69 / PHP 8.4.26 on the pinned trixie
+# image) started by the image's own apache2-foreground wrapper, so envvars,
+# mods-enabled and the docker-php.conf handler are byte-identical to the OCI
+# image. The only additions are conf-enabled/zz-*.conf and conf.d/zz-*.ini.
+set -eu
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /www /tmp
+
+# Publish the per-instance flag (tmpfs, never baked into the image) so the
+# lab has a real objective: read it through the RCE.
+if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
+  cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
+  chmod 0644 /www/flag.txt
+fi
+
+# The webroot must be writable by the worker for the out-of-band proof
+# (`id>/www/p`). The page files stay world-readable.
+chown -R www-data:www-data /www 2>/dev/null || true
+chmod 0755 /www
+chmod 0644 /www/index.php /www/version.php 2>/dev/null || true
+
+exec /usr/local/bin/apache2-foreground

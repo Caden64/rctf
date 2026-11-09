@@ -1,0 +1,5 @@
+export { createVmDriver } from './driver'
+export type { SpawnedVm, VmDeps, VmSpawn } from './driver'
+export { buildBootArgs } from './driver'
+export { VmApiError } from './api'
+export { VmValidationError } from './paths'
