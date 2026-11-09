@@ -163,7 +163,7 @@ fetch / multihost port allocation fixes, the full harness was re-run from the
 integrated tree:
 
 ```text
-RESULT: 24 passed, 0 failed        (run log: /tmp/opencode/smoke-rerun.log)
+RESULT: 24 passed, 0 failed
 RESULT selftest: 10 passed, 0 failed
 ```
 

@@ -353,7 +353,7 @@ integrated tree:
 ```text
 phase veth exit=0      (26 pass, 0 fail)
 phase lifecycle exit=0 (10 pass, 0 fail)
-RESULT: 66 passed, 0 failed        (run log: /tmp/opencode/edge-rerun.log)
+RESULT: 66 passed, 0 failed
 SELFTEST RESULT: 20 passed, 0 failed
 ```
 

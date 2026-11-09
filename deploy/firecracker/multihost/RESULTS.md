@@ -634,7 +634,7 @@ the edge Traefik fetch serialisation, the full harness was re-run from the
 integrated tree:
 
 ```text
-pidfile selftest passed (72 checks)          (run log: /tmp/opencode/multihost-rerun.log)
+pidfile selftest passed (72 checks)
 private-link checks: 24 passed, 0 failed
 RESULT: 138 passed, 0 failed, 138 assertions
 driver exit code: 0
