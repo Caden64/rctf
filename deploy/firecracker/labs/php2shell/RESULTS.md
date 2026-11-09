@@ -5,231 +5,292 @@ third-party infrastructure was contacted. Dates are 2026-11-08/09 (UTC).
 
 ## Environment
 
-| Component                 | Value                                                                         |
-| ------------------------- | ----------------------------------------------------------------------------- |
-| Host                      | Arch Linux, 16 cores, 54 GiB RAM, AMD-V with nested SVM (`/dev/kvm` readable) |
-| Bubblewrap                | `/usr/bin/bwrap` (rootless user + mount namespaces)                           |
-| e2fsprogs                 | 1.47.4                                                                        |
-| GCC (Ubuntu 24.04 chroot) | 13.3.0                                                                        |
-| PHP                       | 8.4.26 (vulnerable), 8.4.27 (fixed)                                           |
-| Apache                    | 2.4.69 (source build, prefork + DSO)                                          |
-| Base rootfs               | Ubuntu 24.04.5 (`ubuntu-base-24.04.5-base-amd64.tar.gz`)                      |
+| Component          | Value                                                                          |
+| ------------------ | ------------------------------------------------------------------------------ |
+| Host               | Arch Linux, 16 cores, 54 GiB RAM, AMD-V with nested SVM (`/dev/kvm` readable)  |
+| Guest base         | official `php:8.4.26-apache` amd64 OCI image (Debian 13 trixie), digest-pinned |
+| Fixed control base | official `php:8.4.27-apache` amd64 OCI image (Debian 13 trixie), digest-pinned |
+| Apache             | 2.4.69 (image's own `/usr/sbin/apache2`, prefork, one worker)                  |
+| PHP                | 8.4.26 (vulnerable) / 8.4.27 (fixed control)                                   |
+| Calibration chroot | rootless user+mount namespace (`unshare` + `bwrap`)                            |
+| VM harness         | `../vmtest/vm.sh` (unchanged), nested KVM Firecracker 1.17                     |
 
-## 1. Host-side build — PASS
+## 1. Official-image guest build — PASS
 
 Command:
 
 ```sh
-deploy/firecracker/labs/php2shell/build.sh
+deploy/firecracker/labs/php2shell/build-oci.sh --force
 ```
 
-The build ran unprivileged on the host inside a rootless Ubuntu 24.04 chroot
-(`bwrap --unshare-user`). No sudo, docker or podman was used.
+No root, docker or podman. The build fetched the amd64 manifest by **digest**
+with `curl`, verified its sha256, verified every config and layer descriptor
+against the pins in `oci-pins.sh`, downloaded each layer blob and verified its
+sha256 before extracting it with OCI whiteout handling. It then assembled the
+rootfs with `guest/build-rootfs.sh` under `fakeroot`.
 
-| Image                | PHP    | php.ini                   | `rootfs.ext4` | `zif_system` | `zval_ptr_dtor` |
-| -------------------- | ------ | ------------------------- | ------------- | ------------ | --------------- |
-| `php2shell-vuln`     | 8.4.26 | 8M, `display_errors=On`   | 768 MiB       | `0x467af0`   | `0x65f060`      |
-| `php2shell-patched`  | 8.4.27 | 8M, `display_errors=On`   | 768 MiB       | `0x46e380`   | `0x66baf0`      |
-| `php2shell-hardened` | 8.4.26 | 128M, `display_errors=On` | 768 MiB       | `0x467af0`   | `0x65f060`      |
+| Image                | Base                | PHP ini                        | `rootfs.ext4` | `zif_system` | `zval_ptr_dtor` |
+| -------------------- | ------------------- | ------------------------------ | ------------- | ------------ | --------------- |
+| `php2shell-vuln`     | `php:8.4.26-apache` | 8M, errors on, no `log_errors` | 768 MiB       | `0x465370`   | `0x65eb60`      |
+| `php2shell-patched`  | `php:8.4.27-apache` | same                           | 768 MiB       | `0x46ad70`   | `0x66a620`      |
+| `php2shell-hardened` | `php:8.4.26-apache` | 128M                           | 768 MiB       | `0x465370`   | `0x65eb60`      |
 
-Offsets were extracted from **our** built `libphp.so` with
-`nm libphp.so | awk '$3=="zif_system"'` (and `zval_ptr_dtor`) and recorded in
-each image's `offsets.env`. The images are root-owned inside ext4 (the build
-ran `build-rootfs.sh` under `fakeroot`), contain `/rctf/init`, `/rctf/jq`,
-`/app/start`, `/www/index.php`, `/opt/php2shell/apache/bin/httpd` and the
-matching `libphp.so`, and boot with the shared smoke `vmlinux`.
+Pinned and verified on every build:
 
-Pinned digests were re-checked on every fetch (PHP 8.4.26
-`c248abae…`, PHP 8.4.27 `5bafed99…`, httpd 2.4.69 `c551b986…`, Ubuntu base
-`e77b6f10…`; toolkit `2479e2d`, upstream `d6f888e`).
+| Image  | Manifest digest                                                           | `libphp.so` sha256                                                 |
+| ------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| 8.4.26 | `sha256:b0ae0e0d4a3b7f0e800017482752b94f58ab049f2d7fcd108e5452afce3f50d1` | `51663cf883b1223436d4c99f31dd0225735ea5573665e4242621eee7f4ee679c` |
+| 8.4.27 | `sha256:7c3d8b9e579e29cdf2fbce05649f8427840798800d4d7c1528e0bf17dec7354c` | (recorded in `meta.env`)                                           |
 
-## 2. Unprivileged self-test — PASS (35/35)
+The extracted roots are Debian trixie with the image's own Apache, `libphp.so`,
+modules, `docker-php.conf`, opcache and sodium configuration. The only added
+paths are the lab overlay (`ports.conf` 8080, `conf-enabled/zz-php2shell.conf`
+single worker + `KeepAlive Off`, `conf-enabled/zz-lab.conf` `/www` document
+root, `conf.d/zz-php2shell.ini`, `/www/{index,version}.php`, `/app/start`, a
+sha256-verified static busybox at `/usr/local/bin/{busybox,ip,nc}`) and
+`/rctf/{init,jq}`. `debugfs` confirms the image files are root-owned, `/www` is
+`33:33`, and `ports.conf` is exactly `Listen 8080`.
 
-```sh
-deploy/firecracker/labs/php2shell/selftest.sh
-# RESULT: 33 passed, 0 failed
-```
+`build-oci.sh` refuses to reuse an image unless `meta.env` records the same
+pinned manifest and `APACHE=official-image`, so the previous source-built
+images cannot be mistaken for these.
 
-Covers digest verification (accept/reject/missing), offset parsing (valid,
-non-hex, missing), proof assertion (only `uid=33(www-data)`), stable free-port
-selection, `bash -n` for every script, and the laboratory invariants
-(single prefork worker, `KeepAlive Off`, 8M vs 128M, GET-only session start).
+## 2. Chain calibration against the official image — ALL STAGES PASS
 
-## 3. Chain calibration against the official image — stages 1–2 PASS, stage 3 NOT GREEN
+The toolkit's documented methodology was used unchanged:
+`php2shell_calibrate.py`'s stage-1 probe, stage-2 sweep and stage-3 layout
+list, run over HTTP against the official image in a rootless chroot with the
+guest's exact Apache config, php.ini and `/www` document root. Every attempt is
+logged in `calibration/8.4.26-calibration.log` and
+`calibration/stage3-sweep.log`; the winning profile is
+`calibration/php-8.4.26-apache-trixie.json`.
 
-The toolkit's calibrator was run over HTTP against the official
-`php:8.4.26-apache` image tags, extracted from the OCI registry and run in a
-rootless chroot with the toolkit's `lab/rce/apache.conf` + `lab/rce/php.ini`
-and the image's own Apache/PHP. This is the environment the toolkit documents.
-
-### 3.1 `php:8.4.26-apache-bookworm` (Debian 12, Apache 2.4.68, PHP 8.4.26)
-
-`libphp.so` sha256 `ff3ea77f…`, offsets `zif=0x45a3b0 dtor=0x64eb60`.
+Measured result:
 
 ```text
 [*] stage1 probe: stale block taken by v0841
-    N=841 len=63 -> cookie=4096 chunk=0x7f14d0400000
-[*] stage2 T=406 -> libphp=0x7f14cea00000
+    N=841 len=63 -> cookie=4096 chunk=0x7f6095000000
+[*] stage2 T=406 -> libphp=0x7f6096c00000
+[+] stage3 0x690d8/bookworm try 1/5: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-Stages 1 and 2 reproduced exactly with `N=841`, forge length **63**, `T=406`,
-`V=16`. The toolkit's shipped profile says forge length 79; the current image
-yields 63, which is why the runner defaults to 63.
+This is the toolkit's own `8.4.26-bookworm` **carrier** layout
+(`htdata=0x690d8`, six `(31,31)` pads, 15-byte carrier, 15×167-byte fake
+HashTables). The image's `libphp` offsets (`zif=0x465370`, `dtor=0x65eb60`)
+match that profile exactly, and the carrier lands where the toolkit documents.
+The full chain then reproduced **5/5** times on a fresh worker set, proof on
+attempt 1 each time.
 
-Stage 3 was attempted with:
+### 2.1 Stage-3 sweep (bounded, 12 attempts)
 
-- the bookworm carrier layout (`htdata=0x690d8`, six `31:31` pads, 3 attempts);
-- the explicit “lab” layout (`htdata=0x6e0d8`, five `4:4` + six `31:31` pads,
-  `fake_len=31`, `fakes=12`, `b_name_len=3`, `wfields=5`, cookie, 8 attempts).
+Each attempt starts from a fresh prefork worker; `/www/p` is removed inside
+the chroot before the attempt; “hit” means `/p` served `uid=33(www-data)`
+after that attempt.
 
-No proof. The exploit never executed `id>p`; the target's `system()` path is
-known-good (a benign `<?php system("id > /var/www/html/sysok")` page wrote
-`uid=33(www-data)` in the same chroot).
+| Layout / parameters                                                                                      | Result  |
+| -------------------------------------------------------------------------------------------------------- | ------- |
+| carrier, `htdata=0x690d8`, 6×(31,31) (calibrated)                                                        | **hit** |
+| carrier, `htdata=0x690d0` (−8)                                                                           | miss    |
+| carrier, `htdata=0x690e0` (+8)                                                                           | miss    |
+| carrier, `htdata=0x690d8`, 5×(31,31)                                                                     | **hit** |
+| carrier, `htdata=0x690d8`, 7×(31,31)                                                                     | **hit** |
+| carrier, `htdata=0x6e0d8` (deb13 profile)                                                                | miss    |
+| carrier, `htdata=0x680d8` (−0x1000)                                                                      | miss    |
+| lab, `htdata=0x6e0d8`, 5×(4,4)+6×(31,31), `fake_len=31`, `fakes=12`, `b_name_len=3`, `wfields=5`, cookie | miss    |
+| lab, toolkit pads `8:7 + 5×(7,7)`, `htdata=0x6e0d8`                                                      | miss    |
+| lab, toolkit pads, `htdata=0x690d8`                                                                      | miss    |
+| vessel, defaults, `htdata=0x690d8`                                                                       | miss    |
+| vessel, defaults, `htdata=0x680d8`                                                                       | miss    |
 
-### 3.2 `php:8.4.26-apache` (Debian 13/trixie, Apache 2.4.69, PHP 8.4.26)
+What this rules out: the deb13 “lab” composition, the toolkit's lab pads and
+the vessel technique do not fit this heap. The exact carrier `htdata` is
+load-bearing (a single 8-byte shift misses), while the number of `(31,31)`
+pads has tolerance (5, 6 and 7 all hit) — the profile keeps the toolkit's six.
+The sweep stopped at a hit for the calibrated layout; the remaining known
+layouts were still measured above so the ruling-out is recorded, not assumed.
+The sweep budget (`P2S_SWEEP_BUDGET_MIN`, default 90) was not approached.
 
-`libphp.so` sha256 `51663cf8…`, offsets `zif=0x465370 dtor=0x65eb60` (the
-toolkit's `8.4.26-bookworm` offsets).
+### 2.2 Environment facts that were required (and are now enforced)
 
-With the toolkit's bookworm profile the runner reached:
+The previous round’s stage-3 failures were **environment**, not parameter,
+problems. Each was measured on the pinned image:
 
-```text
-[+] chunk base = 0x7fac33800000
-[+] libphp base = 0x7fac35600000
-[*] stage 3: HTDATA=0x7fac338690d8 ZIF=0x7fac35a65370
-```
+1. **A `php.ini` with `output_buffering=4096` kills stage 1.** The official
+   image ships no `php.ini`; the stage-1 startup warning must be flushed so
+   `SG(headers_sent)` becomes 1. Adding the stock `php.ini-production` gives a
+   normal 32-byte session cookie instead of the 4096-byte leak. `build-oci.sh`
+   fails if a future pinned image starts shipping a `php.ini`.
+2. **`log_errors=On` also kills stage 1**, even with `display_errors=On`.
+   Adding just those two lines to the otherwise identical ini produced a
+   normal 32-byte cookie. The guest ini leaves logging off.
+3. **The landing page must be allocation-inert on POST.** A GET-only
+   `session_start()` (even the minimal `REQUEST_METHOD` form) moves the
+   allocator's free list and the 4096-byte reclaim misses. The page is the
+   toolkit's `<?php echo "OK\n";`.
+4. **The proof path must be writable by the worker.** Several early stage-3
+   runs executed `system()` but could not write `/www/p` because `/www` was
+   not owned by uid 33. The guest `/app/start` performs the chown; the
+   calibration harness was corrected to match, after which the same layout
+   proofed on the first attempt.
+5. **The toolkit's widened pointer filter is unsafe on amd64.** The toolkit
+   relaxes the upstream exploit's range to `0x10000..2^48` for aarch64
+   profiles. On this image a byte-for-byte valid leak parsed as
+   `chunk=0x600000` (63 occurrences of a low value beat 62 real heap
+   pointers). `amd64.py` narrows both filters back to canonical amd64
+   userspace after the toolkit's own patch, and the correct chunk base is
+   recovered. Without it every stage-3 address is wrong.
 
-and then failed all five stage-3 attempts (and the explicit deb13 layout with
-a fresh Apache master). No proof.
+None of these are chain-parameter changes; they are the laboratory
+configuration the toolkit's own verified profile assumes.
 
-### 3.3 Source-built Ubuntu image (this lab's default)
+## 3. VM end-to-end run — PASS (positive + both controls)
 
-The Ubuntu 24.04 build's stage 1 did **not** reproduce the toolkit's 48-byte
-value reclaim with `N=841/892`. A request with the forge length the image
-needs produced a garbage forged length
-(`55102866029003747`) and the worker aborted with `zend_mm_heap corrupted`:
-the stale `PS(id)` block lands at a different Zend MM size class on this
-toolchain, so the upstream request shape does not align it. This is a
-build-specific heap-calibration difference, not a claim that the CVE is
-absent. It is the reason the source-built image's positive chain is **NOT
-RUN** in the VM (see §4).
-
-**Conclusion for §3:** the leak stages are real and reproducible on the
-official image; stage 3 was not reproduced here. The lab runner reports a
-failure rather than a proof, and the two controls are only meaningful once the
-positive chain is green.
-
-## 4. VM end-to-end run — plumbing PASS, positive chain NOT GREEN
-
-Command:
+Command (shipped defaults; only the informational control-B probe enabled):
 
 ```sh
-P2S_SKIP_BUILD=1 P2S_CHAIN_RETRIES=1 \
+P2S_SKIP_BUILD=1 P2S_HARDENED_LIMIT_PROBE=1 \
   deploy/firecracker/labs/php2shell/run.sh
 ```
 
-The runner uses its own `VM_DIR` and free ssh/seed ports (`2402`/`8202` in
-the reuse run), provisions the vmtest VM with `provision.sh`, installs the
-shipped agent unit in jailer mode, stages the three images, creates an
-instance through the real agent API with one TCP expose, starts an `ssh -L`
-forward inside the VM and runs the fetched toolkit. Every assertion is
-fail-closed.
+The runner booted its own vmtest VM with ports from **one simultaneous bind**
+(`ssh 38709`, `seed 59225`; neither is vmtest's 2422/8201), provisioned it,
+installed the shipped agent unit in **jailer mode**, staged the three images,
+created each instance through the real agent API with one TCP expose, started
+an `ssh -L` forward inside the VM, and ran the fetched toolkit from inside the
+VM. Every assertion is fail-closed.
 
-What actually ran (2026-11-08/09):
-
-- the pinned Ubuntu cloud image was fetched and its GPG signature verified;
-- the VM booted and cloud-init provisioning completed;
-- `host-setup.sh` ran on a fresh host and the shipped systemd unit started
-  the agent in **jailer mode**;
-- the agent reported `accepting:true` and every preflight check true
-  (`kvm`, `firecrackerBin`, `jailerBin`, `imagesDir`, `imagesTrusted`,
-  `runDir`, `cgroupRoot`, `chrootBase`, `nft`, `ip`, `conntrackBin`,
-  `ipForward`, `traefikDirWritable`, `quarantineWritable`, `tcpPortRange`,
-  `subnetPool`);
-- the three images were staged into the agent's `imagesDir` (root-owned,
-  0755/0644, `imagesTrusted:true`);
-- an instance was created through `PUT /v1/instances/<id>` with one TCP
-  expose and reached `running` after the agent's TCP readiness probe;
-- the `ssh -L 127.0.0.1:<fwd>:<guestIp>:8080` forward was established inside
-  the VM and the toolkit was executed against
-  `http://127.0.0.1:<fwd>/index.php` with the image's explicit offsets.
-
-The first runs found and fixed real harness bugs (all fail-closed, none
-silent):
-
-1. the agent API was called from the host instead of the VM's loopback; the
-   helpers now execute `curl` through `vm_ssh` and read the body/code back;
-2. a temp directory used for the agent YAML was removed before use (the
-   agent-config step now has its own temp dir);
-3. the image-staging tarball used the same removed temp dir (now its own);
-4. the `nm | awk` offset extraction exited `awk` early and made `nm` die
-   with SIGPIPE under `pipefail` (now consumes all output);
-5. the runtime rootfs was missing the guest boot-contract tools (`ip`,
-   `curl`/`nc`); the guest init could not fetch MMDS or add the metadata
-   route, so the service never became reachable. The images now install
-   `iproute2`, `curl` and `netcat-openbsd`;
-6. the tunnel cleanup used `pkill -f 'ssh -N -L 127.0.0.1:<port>'`, whose
-   pattern also matched the outer `vm.sh ssh` command line (the remote
-   command is part of its argv) and killed the session before the forward
-   existed. It now kills the recorded PID from `/tmp/p2s-tunnel.pid`.
-
-The positive chain on the source-built Ubuntu image stopped at stage 1: the
-stale `PS(id)` block is not reclaimed by the upstream 48-byte value shape on
-this toolchain (the same calibration difference as §3.3), so the runner
-reported a chain failure and did **not** fabricate a proof. The exact
-transcript is in `~/.cache/rctf-p2s-lab/logs/run-<stamp>.log` (host-specific
-paths, not committed).
-
-The last run (2026-11-08 17:38 UTC, instance `p2s202611081738431468514v`,
-guest `10.201.0.2:8080`) exercised the complete path and then failed closed:
+### 3.1 Vulnerable image (`php:8.4.26-apache` guest)
 
 ```text
-vulnerable instance: p2s202611081738431468514v
-guest endpoint: 10.201.0.2:8080 (forwarded on 127.0.0.1:18000 inside the VM)
-target serves PHP 8.4.26
-==> running the PHP2Shell chain
-chain attempt 1/1 (stage-3 profile: bookworm)
-[*] target http://127.0.0.1:18000/index.php (cmd='id>/www/p')
-[*] offsets: zif=0x467af0 dtor=0x65f060 htdata=0x6e0d8
-[*] stage 1: heap leak (attempt 1/3)
-[-] heap leak missed
-...
-FAIL: the chain did not produce the web-uid proof
+target serves PHP 8.4.26, memory_limit=8M
+PASS: vulnerable PHP 8.4.26 reproduces the stage-1 stale-id OOM leak and the stage-2 libphp leak
+chain attempt 1/1
+[+] chunk base = 0x7fdadfc00000
+[+] libphp base = 0x7fdae1800000
+[*] stage 3: HTDATA=0x7fdadfc690d8 ZIF=0x7fdae1c65370
+[+] W3 attempt 1
+PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+PASS: vulnerable PHP 8.4.26 executes id as uid=33(www-data)
 ```
 
-The same run was repeated with the toolkit's explicit “lab” stage-3 layout;
-it also failed at stage 1. No proof file was served and no PASS was recorded.
+The leak assertion is not a heuristic: `leaks.py` runs the pinned toolkit's
+stage-1 probe and stage-2 request shapes over HTTP and exits 0 only when both
+Set-Cookie leaks yield a valid chunk base and a page-aligned `zval_ptr_dtor`
+pointer. The RCE proof is the worker’s own `id` output fetched from `/p`.
 
-## 5. Negative controls — implemented, not exercised end-to-end
+### 3.2 Control A — fixed PHP 8.4.27
 
-| Control | Image                                              | Design                                                                                                    | Status                                                                       |
-| ------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| A       | `php2shell-patched` (8.4.27)                       | target reachable + serves 8.4.27, then the chain must fail without a proof                                | implemented in `run.sh`; not reached because the positive chain failed first |
-| B       | `php2shell-hardened` (8.4.26, `memory_limit=128M`) | target reachable + serves 8.4.26, then the 12 MiB OOM field must not exhaust 128M and the chain must fail | implemented in `run.sh`; not reached                                         |
+```text
+target serves PHP 8.4.27, memory_limit=8M
+PASS: patched PHP 8.4.27: both leak primitives are absent
+[*] stage 1: heap leak (attempt 1/3)  [-] heap leak missed
+... (3/3)
+PASS: patched PHP 8.4.27 failed closed (no proof)
+```
 
-Both controls use the image's own `offsets.env`, so the only intended
-difference is the PHP version or the php.ini condition. A control that cannot
-prove the target is reachable and serving the expected version is reported as
-a failure, never as a negative.
+The chain is run with the **vulnerable image's** calibrated parameters and the
+patched image's own offsets, so the only intended difference is the PHP
+version. The version and `memory_limit` are asserted before the negative, so a
+transport failure can never be reported as a control pass.
 
-## 6. Stretch goal — NOT DONE
+### 3.3 Control B — hardened php.ini (`memory_limit=128M`)
+
+```text
+target serves PHP 8.4.26, memory_limit=128M
+PASS: hardened php.ini: both leak primitives are absent
+[*] stage 1: heap leak (attempt 1/3)  [-] heap leak missed
+... (3/3)
+PASS: hardened php.ini failed closed (no proof)
+```
+
+**Honest result of the informational probe** (`P2S_HARDENED_LIMIT_PROBE=1`):
+the _same hardened image_ with the OOM body raised to `huge_mb=140`
+(`memory_limit + 12M`, exactly as the toolkit documents) does reproduce both
+leaks and the full chain on attempt 1:
+
+```text
+PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+OBSERVED: the hardened image DOES execute at huge_mb=140;
+          control B is a configuration control, not a mitigation.
+```
+
+So control B proves that the lab's **8M `memory_limit` and its 12 MiB OOM
+field are load-bearing laboratory conditions**. It does **not** show that
+raising `memory_limit` mitigates the vulnerability, and the lab does not claim
+that. `RESULTS.md` records this because the opposite claim would be false.
+
+## 4. Self-test and repository checks
+
+```text
+deploy/firecracker/labs/php2shell/selftest.sh
+# RESULT: 69 passed, 0 failed
+```
+
+Covers digest accept/reject/missing, offset parsing/normalisation, proof
+assertion (only `uid=33(www-data)`), simultaneous-bind port allocation
+(distinct, bindable, excludes 2422/8201 and caller-fixed ports), `bash -n` for
+every script, Python syntax for the helpers, the official-guest laboratory
+invariants (8M/128M, `display_errors=On`, no `log_errors`, one worker,
+`KeepAlive Off`, inert landing page), OCI pin consistency for both images, and
+the calibration profile's internal consistency and match against the built
+image's offsets.
+
+Repository checks on the same tree:
+
+```text
+bun run lint                                   # oxlint --deny-warnings: clean
+bun run typecheck                              # all packages: 0 errors
+bun run test:firecracker                       # 551 pass, 4 skip, 0 fail
+```
+
+## 5. What each invariant proves
+
+| Assertion                                     | Vulnerable 8.4.26            | Patched 8.4.27 | Hardened 128M                            |
+| --------------------------------------------- | ---------------------------- | -------------- | ---------------------------------------- |
+| target reachable, serves the expected PHP     | PASS                         | PASS           | PASS                                     |
+| configured `memory_limit` is the expected one | 8M                           | 8M             | 128M                                     |
+| stage-1 stale-`PS(id)` OOM leak               | present                      | absent         | absent at the shipped 12M OOM            |
+| stage-2 libphp `zval_ptr_dtor` leak           | present                      | absent         | absent at the shipped 12M OOM            |
+| stage-3 fake reference → `zif_system`         | executes, proof on attempt 1 | not reached    | not reached at 12M; **executes at 140M** |
+| out-of-band proof `uid=33(www-data)`          | PASS                         | none           | none (none at 12M)                       |
+
+## 6. Honest limitations
+
+- **Stage 3 is probabilistic in general.** It hit attempt 1 in every run here
+  (5/5 calibration, 1/1 in each VM run), but the toolkit documents
+  build/instance-dependent retries. The runner retries (`P2S_CHAIN_RETRIES`)
+  and the leak helper retries the worker-fork race; a miss is a retry, never a
+  fabricated proof.
+- **Control B is a configuration control only** (see §3.3).
+- **One host, nested KVM.** Timing differs from bare metal; the chain is
+  deterministic in the user-space heap but worker rotation is a race.
+- **No docker/podman.** The image is fetched from Docker Hub by digest with
+  `curl`; the registry must be reachable on the first build.
+- **The source-built Ubuntu guest is not byte-identical** to the official
+  image and does not reproduce the stage-1 alignment. It remains available via
+  `P2S_GUEST=source` for development only; the shipped lab uses the OCI guest.
+- **The chain's laboratory conditions matter.** `display_errors=On`,
+  `memory_limit=8M`, one prefork worker, `output_buffering=0`,
+  `log_errors=Off` and an inert landing page are all required on this build.
+
+## 7. Stretch goal — NOT DONE
 
 The nginx + PHP-FPM variant (the toolkit's `lab/fpm` chain) was **not
 implemented**. Only the Apache prefork + `mod_php` path exists.
 
-## 7. Honest limitations
+## 8. Reproducing
 
-- **Stage 3 is not green.** The public chain's last stage is build- and
-  instance-dependent; this environment did not reproduce it. Treat the lab as
-  a calibrated harness plus a verified leak demonstration until stage 3 is
-  calibrated for the exact image you serve.
-- **The source-built Ubuntu image does not match the official image's heap.**
-  The build is faithful to the official configure flags but uses Ubuntu
-  24.04's glibc/gcc; the stage-1 alignment differs. The runner's defaults are
-  the official image's calibrated values and are overridable.
-- **One host, nested KVM.** Firecracker runs on KVM-on-KVM; timing and ASLR
-  differ from bare metal. The chain is probabilistic even when calibrated.
-- **No docker/podman.** The build and the offset extraction are deliberately
-  rootless and docker-free; the official-image comparison in §3 was done by
-  extracting OCI layers and running them in a rootless chroot, not by running
-  containers.
+```sh
+# host, unprivileged: fetch pins, verify, build the three official-image guests
+deploy/firecracker/labs/php2shell/build-oci.sh
+
+# full VM run: leaks + calibrated RCE + both controls
+deploy/firecracker/labs/php2shell/run.sh
+
+# unprivileged self-test only
+deploy/firecracker/labs/php2shell/selftest.sh
+```
+
+The calibration logs and the winning profile are committed under
+`calibration/`; the per-run VM transcripts live under
+`~/.cache/rctf-p2s-lab/logs/` (host-specific paths, not committed).
