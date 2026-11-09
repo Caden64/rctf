@@ -1038,6 +1038,37 @@ describe('controller service', () => {
     }
   })
 
+  test('an extend with no agent client for the row host fails host_unavailable', async () => {
+    const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
+    const h = harness({ agents })
+    await h.start()
+    try {
+      await h.service.create(
+        makeCreateRequest('team-1', { timeoutMilliseconds: 10_000 })
+      )
+      h.clock.t += 1000
+      // The controller's client map is this same object: a host dropped from
+      // the configuration (e.g. a restart without it) disappears from it
+      // while the durable row is still there.
+      delete agents['host-a']
+      const error = await h.service
+        .extend({
+          teamId: 'team-1',
+          challengeIntegrationId: 'chal-1',
+          timeoutMilliseconds: 20_000,
+        })
+        .catch(error => error)
+      expect(error).toBeInstanceOf(ProtocolError)
+      expect((error as ProtocolError).code).toBe('host_unavailable')
+      // The committed desired deadline stays authoritative and unsynced;
+      // recovery is the reconciler's job.
+      expect(rowExpiry(h.path, 'team-1')).toBe(h.clock.t + 20_000)
+      expect(rowSynced(h.path, 'team-1')).toBe(0)
+    } finally {
+      await h.service.stop()
+    }
+  })
+
   test('a paused extend response reports a concurrent delete, not success', async () => {
     const agents = { 'host-a': new FakeAgent('host-a', HOST_CAPACITY) }
     const h = harness({ agents })

@@ -348,6 +348,14 @@ This is one post-change run; the earlier runs above are kept as historical evide
 After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
 retries, schema validation before the service starts) and the edge Traefik
 fetch / multihost port allocation fixes, the full harness was re-run from the
-integrated tree: RESULT: 0 failed (see the counts in the run log for this
-date). The stricter init changed no check outcome; every failure mode it adds
-fails the boot instead, which these suites never relied on.
+integrated tree:
+
+```text
+phase veth exit=0      (26 pass, 0 fail)
+phase lifecycle exit=0 (10 pass, 0 fail)
+RESULT: 66 passed, 0 failed        (run log: /tmp/opencode/edge-rerun.log)
+SELFTEST RESULT: 20 passed, 0 failed
+```
+
+The stricter init changed no check outcome; every failure mode it adds fails
+the boot instead, which these suites never relied on.

@@ -209,7 +209,8 @@ describe('reaper vs extend', () => {
       )
       const id = [...agent.instances.keys()][0]!
       // 410/expired: the agent writes its tombstone but does NOT confirm the
-      // teardown (only HTTP 2xx/404 do).
+      // teardown (only HTTP 2xx, or an instance-scoped absence 404 from an
+      // agent advertising instance-absence-v1, confirms).
       agent.deleteErrorMode = 'expired'
 
       clock.t += 1000

@@ -628,8 +628,17 @@ top of this file.
 ## Re-run on the integrated branch (2026-11-08)
 
 After merging the fail-closed guest boot contract (mandatory jq, bounded MMDS
-retries, schema validation before the service starts) and the edge Traefik
-fetch / multihost port allocation fixes, the full harness was re-run from the
-integrated tree: RESULT: 0 failed (see the counts in the run log for this
-date). The stricter init changed no check outcome; every failure mode it adds
-fails the boot instead, which these suites never relied on.
+retries, schema validation before the service starts), the multihost port
+allocation fix (all five TCP ports bound simultaneously before release) and
+the edge Traefik fetch serialisation, the full harness was re-run from the
+integrated tree:
+
+```text
+pidfile selftest passed (72 checks)          (run log: /tmp/opencode/multihost-rerun.log)
+private-link checks: 24 passed, 0 failed
+RESULT: 138 passed, 0 failed, 138 assertions
+driver exit code: 0
+```
+
+The stricter init changed no check outcome; every failure mode it adds fails
+the boot instead, which these suites never relied on.

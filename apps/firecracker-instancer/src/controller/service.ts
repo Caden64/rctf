@@ -870,8 +870,10 @@ class ControllerServiceImpl implements ControllerService {
           this.store.deleteInstanceIfState(row.id, 'lost')
         } catch {
           // Unconfirmed: keep the tombstone; the host's return cleans it up.
-          // Only a resolving `AgentClient.delete` (HTTP 2xx/404) proves the
-          // agent wrote its fence.
+          // Only a resolving `AgentClient.delete` proves the agent fenced the
+          // instance: HTTP 2xx, or the instance-scoped absence 404
+          // (agentError carrying this instance's id from an agent
+          // advertising instance-absence-v1).
         }
       }
       return stoppedDetails()

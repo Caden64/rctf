@@ -21,8 +21,10 @@ hosts:
     # (0600 or stricter); a CA bundle may be world-readable (0644) but never
     # group/other-writable.
     # caCertificateFile: /etc/rctf-firecracker/tls/agent-ca.crt
-    # caCertificate: |            # inline alternative to caCertificateFile
-    #   -----BEGIN CERTIFICATE-----
+    # caCertificate: |            # inline alternative to caCertificateFile:
+    #   -----BEGIN CERTIFICATE-----   # paste the full PEM here — the BEGIN
+    #   ...certificate body...         # line, every body line, then the END
+    #   -----END CERTIFICATE-----      # line (this excerpt is a placeholder)
     # clientCertFile: /etc/rctf-firecracker/tls/controller.crt
     # clientKeyFile: /etc/rctf-firecracker/tls/controller.key
     capacity: # must not exceed what the host can really run
