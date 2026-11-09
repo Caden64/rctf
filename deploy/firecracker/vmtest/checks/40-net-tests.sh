@@ -46,7 +46,7 @@ else
   ok "every FC_REAL test passes inside the full net suite as root"
 fi
 # The namespace tests feed nft a real temp file (not a Bun stdin socketpair),
-# so they must pass here too, as root and as ubuntu.
+# so they must pass here too, as root and as the unprivileged cloud-image user.
 if [ "$FULL_CODE" -eq 0 ] && grep -q '^ 0 fail' "$FULLLOG"; then
   ok "FC_REAL=1 bun test test/net (full suite) passes as root with 0 failures"
 else
@@ -58,7 +58,7 @@ fi
 # unprivileged user namespaces by default, which the VM provisioning disables.
 NSLOG=/tmp/vmtest-net-ns.log
 set +e
-(cd "$WORK" && su -s /bin/bash ubuntu -c "/usr/local/bin/bun test test/net/namespace.test.ts") >"$NSLOG" 2>&1
+(cd "$WORK" && su -s /bin/bash "$VM_USER" -c "/usr/local/bin/bun test test/net/namespace.test.ts") >"$NSLOG" 2>&1
 NS_CODE=$?
 set +e
 tail -15 "$NSLOG" | sed 's/^/  | /'

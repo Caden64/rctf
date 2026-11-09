@@ -6,6 +6,11 @@
 set -u
 
 REPO=${REPO:-/opt/rctf-firecracker}
+# Selected matrix axes, exported into the check environment by run.sh.
+VM_IMAGE=${VM_IMAGE:-ubuntu-24.04}
+VM_USER=${VM_USER:-ubuntu}
+FC_VERSION=${FC_VERSION:-v1.17.0}
+KERNEL=${KERNEL:-vmlinux-6.1.155}
 TOKEN=${FIRECRACKER_AGENT_TOKEN:-vmtest-token-3f8a1c9d}
 API=${AGENT_API:-http://127.0.0.1:7001}
 STATE=${STATE_DIR:-/var/lib/rctf-firecracker/state}
