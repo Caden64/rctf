@@ -156,15 +156,67 @@ proof_is_web_uid() {
   printf '%s' "$1" | grep -Eq 'uid=33\(www-data\)'
 }
 
-# free_port <start> <end>: print the first TCP port with no listener.
+# free_port <start> <end>: print the first TCP port that can be bound on
+# 127.0.0.1 right now. The probe binds and releases the socket; a race with
+# another process remains between the release and the consumer's bind, which
+# is why the runner allocates its ports with free_tcp_set (all at once) instead
+# of calling this in a check-then-use loop. Kept for the self-test.
 free_port() {
   local p=$1 end=$2
   while [ "$p" -le "$end" ]; do
-    if ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$p\$"; then
+    if python3 - "$p" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+    then
       printf '%s\n' "$p"
       return 0
     fi
     p=$((p + 1))
   done
   return 1
+}
+
+# free_tcp_set <count> [excluded-port...]: allocate <count> TCP ports on
+# 127.0.0.1 by binding every socket BEFORE releasing any, so the ports are
+# distinct from each other by construction (independent bind(0) calls can hand
+# the same ephemeral port to two sockets). Ports in the exclusion list -- the
+# vmtest defaults 2422/8201 and any port the caller already fixed -- are
+# rejected and the whole set is re-drawn. A residual window remains between the
+# release here and each consumer's bind; a lost race is a loud consumer
+# failure (QEMU hostfwd / seed bind), never a silent one. Prints the ports on
+# one line, space separated.
+free_tcp_set() {
+  local count=$1
+  shift
+  python3 - "$count" "$@" <<'PY'
+import socket, sys
+
+count = int(sys.argv[1])
+excluded = {int(p) for p in sys.argv[2:]}
+reserved = {2422, 8201}  # vmtest's fixed defaults; never auto-allocate them
+
+for _ in range(64):
+    socks = [socket.socket() for _ in range(count)]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        ports = [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+    if len(set(ports)) != count:
+        continue
+    if set(ports) & (excluded | reserved):
+        continue
+    print(" ".join(str(p) for p in ports))
+    sys.exit(0)
+sys.exit(1)
+PY
 }

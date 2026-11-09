@@ -29,12 +29,32 @@ set -uo pipefail
 RUN_ID=$(date +%Y%m%d-%H%M%S)-$$
 LOG=$LOGS/run-$RUN_ID.log
 VM_DIR=${VM_DIR:-$CACHE/vm-$RUN_ID}
-if [ -z "${VM_SSH_PORT:-}" ]; then
-  VM_SSH_PORT=$(free_port 2400 2500) || die "no free VM ssh port"
+# Allocate every port this run needs in one simultaneous bind so the ports are
+# distinct from each other by construction and never the vmtest defaults
+# (2422/8201). Ports fixed in the environment are honoured and excluded from
+# the draw. See free_tcp_set in lib.sh.
+P2S_PORTS=()
+for _pv in "${VM_SSH_PORT:-}" "${VM_SEED_PORT:-}" "${FWD_PORT:-}"; do
+  [ -n "$_pv" ] && P2S_PORTS+=("$_pv")
+done
+_p2s_need=0
+[ -z "${VM_SSH_PORT:-}" ] && _p2s_need=$((_p2s_need + 1))
+[ -z "${VM_SEED_PORT:-}" ] && _p2s_need=$((_p2s_need + 1))
+[ -z "${FWD_PORT:-}" ] && _p2s_need=$((_p2s_need + 1))
+if [ "$_p2s_need" -gt 0 ]; then
+  _p2s_drawn=$(free_tcp_set "$_p2s_need" "${P2S_PORTS[@]}") ||
+    die "could not allocate $_p2s_need free TCP ports"
+  for _pv in $_p2s_drawn; do
+    if [ -z "${VM_SSH_PORT:-}" ]; then
+      VM_SSH_PORT=$_pv
+    elif [ -z "${VM_SEED_PORT:-}" ]; then
+      VM_SEED_PORT=$_pv
+    else
+      FWD_PORT=$_pv
+    fi
+  done
 fi
-if [ -z "${VM_SEED_PORT:-}" ]; then
-  VM_SEED_PORT=$(free_port 8200 8300) || die "no free cloud-init seed port"
-fi
+unset _pv _p2s_need _p2s_drawn P2S_PORTS
 export VM_DIR VM_SSH_PORT VM_SEED_PORT
 export VM_MEM=${VM_MEM:-4096} VM_SMP=${VM_SMP:-4} VM_DISK=${VM_DISK:-40G}
 TOKEN=${FIRECRACKER_AGENT_TOKEN:-p2s-token-$RUN_ID}
@@ -45,9 +65,6 @@ OUTSIDE_IF=p2sout0
 OUTSIDE_IP=192.0.2.1
 SUBNET_POOL=10.201.0.0/16
 TCP_RANGE='{ from: 31000, to: 31100 }'
-if [ -z "${FWD_PORT:-}" ]; then
-  FWD_PORT=$(free_port 18000 18100) || die "no free forwarded port"
-fi
 VMKEY=$VM_DIR/id_ed25519
 TUNNEL_PID=
 INSTANCES=()

@@ -95,12 +95,39 @@ for wrong in 'uid=0(root) gid=0(root)' 'uid=1000(ubuntu)' '' 'uid=33(www-datax)'
 done
 
 # ---------------------------------------------------------------------------
-# 5. Port selection returns usable, non-conflicting ports.
+# 5. Port selection: one simultaneous bind yields distinct, bindable ports and
+#    never the vmtest defaults 2422/8201.
 # ---------------------------------------------------------------------------
-P1=$(free_port 24000 24100) || P1=
-P2=$(free_port 24000 24100) || P2=
-if [ -n "$P1" ] && [ "$P1" = "$P2" ]; then
-  ok "free_port is deterministic while the port stays free ($P1)"
+read -r P1 P2 P3 <<<"$(free_tcp_set 3)" || true
+if [ -n "${P1:-}" ] && [ -n "${P2:-}" ] && [ -n "${P3:-}" ] &&
+  [ "$P1" != "$P2" ] && [ "$P1" != "$P3" ] && [ "$P2" != "$P3" ]; then
+  ok "free_tcp_set returned three distinct ports ($P1/$P2/$P3)"
+else
+  bad "free_tcp_set did not return three distinct ports"
+fi
+RESERVED_SEEN=0
+for p in "${P1:-0}" "${P2:-0}" "${P3:-0}"; do
+  if [ "$p" = 2422 ] || [ "$p" = 8201 ]; then RESERVED_SEEN=1; fi
+done
+[ "$RESERVED_SEEN" = 0 ] && ok "free_tcp_set avoids the vmtest defaults 2422/8201" ||
+  bad "free_tcp_set allocated a vmtest default port"
+BIND_FAIL=0
+for p in "${P1:-0}" "${P2:-0}" "${P3:-0}"; do
+  free_port "$p" "$p" >/dev/null 2>&1 || BIND_FAIL=1
+done
+[ "$BIND_FAIL" = 0 ] && ok "every allocated port is bindable when handed back" ||
+  bad "an allocated port was not bindable"
+EXCL=$(free_tcp_set 2 "$P1") || EXCL=
+read -r E1 E2 <<<"$EXCL" || true
+if [ -n "${E1:-}" ] && [ "$E1" != "$P1" ] && [ "${E2:-}" != "$P1" ]; then
+  ok "free_tcp_set honours an excluded port"
+else
+  bad "free_tcp_set re-used an excluded port"
+fi
+SP1=$(free_port 24000 24100) || SP1=
+SP2=$(free_port 24000 24100) || SP2=
+if [ -n "$SP1" ] && [ "$SP1" = "$SP2" ]; then
+  ok "free_port is deterministic while the port stays free ($SP1)"
 else
   bad "free_port did not return a stable free port"
 fi
