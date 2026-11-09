@@ -22,16 +22,28 @@
 set -euo pipefail
 . "$(dirname -- "$0")/lib.sh"
 
+TOOLKIT_ONLY=0
+case "${1:-}" in
+  --toolkit-only) TOOLKIT_ONLY=1 ;;
+  '') ;;
+  *) die "unknown argument: $1 (only --toolkit-only is accepted)" ;;
+esac
+
 log "cache: $CACHE"
 
-download_pinned "$PHP_VULN_URL" "$DL/php-$PHP_VULN.tar.gz" "$PHP_VULN_SHA256" \
-  "PHP $PHP_VULN source tarball"
-download_pinned "$PHP_FIXED_URL" "$DL/php-$PHP_FIXED.tar.gz" "$PHP_FIXED_SHA256" \
-  "PHP $PHP_FIXED source tarball (fixed control)"
-download_pinned "$HTTPD_URL" "$DL/httpd-$HTTPD_VERSION.tar.gz" "$HTTPD_SHA256" \
-  "Apache httpd $HTTPD_VERSION source tarball"
-download_pinned "$UBUNTU_BASE_URL" "$DL/ubuntu-base-$UBUNTU_BASE-base-amd64.tar.gz" \
-  "$UBUNTU_BASE_SHA256" "Ubuntu $UBUNTU_BASE base rootfs"
+# The official-image guest build needs only the pinned toolkit/upstream
+# checkouts (it takes PHP and Apache from the OCI image). The source build
+# needs the tarballs as well.
+if [ "$TOOLKIT_ONLY" = 0 ]; then
+  download_pinned "$PHP_VULN_URL" "$DL/php-$PHP_VULN.tar.gz" "$PHP_VULN_SHA256" \
+    "PHP $PHP_VULN source tarball"
+  download_pinned "$PHP_FIXED_URL" "$DL/php-$PHP_FIXED.tar.gz" "$PHP_FIXED_SHA256" \
+    "PHP $PHP_FIXED source tarball (fixed control)"
+  download_pinned "$HTTPD_URL" "$DL/httpd-$HTTPD_VERSION.tar.gz" "$HTTPD_SHA256" \
+    "Apache httpd $HTTPD_VERSION source tarball"
+  download_pinned "$UBUNTU_BASE_URL" "$DL/ubuntu-base-$UBUNTU_BASE-base-amd64.tar.gz" \
+    "$UBUNTU_BASE_SHA256" "Ubuntu $UBUNTU_BASE base rootfs"
+fi
 
 fetch_git_pin() { # fetch_git_pin <dir> <url> <pin> <label>
   local dir=$1 url=$2 pin=$3 label=$4 head

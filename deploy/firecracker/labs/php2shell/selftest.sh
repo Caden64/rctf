@@ -135,8 +135,15 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Script syntax and lab configuration invariants.
 # ---------------------------------------------------------------------------
-for f in "$LAB_DIR"/*.sh "$LAB_DIR/lab/app-start"; do
+for f in "$LAB_DIR"/*.sh "$LAB_DIR/lab/app-start" "$LAB_DIR/lab/app-start-oci"; do
   if bash -n "$f" 2>/dev/null; then ok "bash -n $(basename "$f")"; else bad "bash -n $(basename "$f")"; fi
+done
+for f in "$LAB_DIR/leaks.py" "$LAB_DIR/chain.py" "$LAB_DIR/amd64.py"; do
+  if python3 - "$f" <<'PY'
+import sys
+compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")
+PY
+  then ok "python3 syntax $(basename "$f")"; else bad "python3 syntax $(basename "$f")"; fi
 done
 
 grep -q '^Listen 8080$' "$LAB_DIR/lab/httpd.conf.in" &&
@@ -157,11 +164,105 @@ grep -q '^display_errors = On$' "$LAB_DIR/lab/php.ini" &&
 grep -q '^memory_limit = 128M$' "$LAB_DIR/lab/php-hardened.ini" &&
   ok "hardened control raises memory_limit above the 12M OOM field" ||
   bad "hardened control does not raise memory_limit"
-if grep -q "REQUEST_METHOD.*GET" "$LAB_DIR/lab/www/index.php" &&
-  ! grep -q '^session_start();' "$LAB_DIR/lab/www/index.php"; then
-  ok "index.php starts a session only for GET (POST leak cookie survives)"
+
+# The official-image guest config is the calibrated environment.
+for ini in "$LAB_DIR/lab/php-oci.ini" "$LAB_DIR/lab/php-oci-hardened.ini"; do
+  if grep -q '^log_errors' "$ini"; then
+    bad "$(basename "$ini") sets log_errors (breaks the stage-1 Set-Cookie leak)"
+  else
+    ok "$(basename "$ini") leaves log_errors at Off (stage-1 leak invariant)"
+  fi
+  grep -q '^display_errors = On$' "$ini" &&
+    ok "$(basename "$ini") renders request-startup diagnostics" ||
+    bad "$(basename "$ini") has display_errors off"
+done
+grep -q '^memory_limit = 8M$' "$LAB_DIR/lab/php-oci.ini" &&
+  ok "official guest php.ini uses the laboratory memory_limit=8M" ||
+  bad "official guest php.ini is not 8M"
+grep -q '^memory_limit = 128M$' "$LAB_DIR/lab/php-oci-hardened.ini" &&
+  ok "official hardened guest raises memory_limit to 128M" ||
+  bad "official hardened guest does not raise memory_limit"
+grep -q 'printf .Listen 8080' "$LAB_DIR/build-oci.sh" &&
+  ok "official guest listens on 8080 via ports.conf" ||
+  bad "official guest does not configure Listen 8080"
+grep -q 'MaxRequestWorkers      1' "$LAB_DIR/lab/apache-oci.conf" &&
+  ok "official guest has exactly one prefork worker" ||
+  bad "official guest is not single-worker"
+grep -q '^KeepAlive Off' "$LAB_DIR/lab/apache-oci.conf" &&
+  ok "official guest disables KeepAlive" ||
+  bad "official guest does not disable KeepAlive"
+
+# The landing page must be allocation-inert on the POST path, or stage 1's
+# forged free-list slot is disturbed (measured; see RESULTS.md).
+if [ "$(cat "$LAB_DIR/lab/www/index.php")" = '<?php echo "OK\n";' ]; then
+  ok "index.php is the allocation-inert calibrated landing page"
 else
-  bad "index.php must start a session only for GET (unconditional session_start removes the leak cookie)"
+  bad "index.php is not the calibrated <?php echo \"OK\\n\"; page"
+fi
+grep -q 'PHP_VERSION' "$LAB_DIR/lab/www/version.php" &&
+  grep -q 'memory_limit' "$LAB_DIR/lab/www/version.php" &&
+  ok "version.php reports PHP version and memory_limit" ||
+  bad "version.php does not report the control-relevant configuration"
+
+# ---------------------------------------------------------------------------
+# 6b. OCI pins are complete and internally consistent.
+# ---------------------------------------------------------------------------
+# shellcheck disable=SC1091
+. "$LAB_DIR/oci-pins.sh"
+for ver in 8.4.26 8.4.27; do
+  if oci_pins "$ver" 2>/dev/null; then
+    ok "OCI pin set exists for PHP $ver ($OCI_TAG)"
+  else
+    bad "OCI pin set missing for PHP $ver"
+    continue
+  fi
+  case "$OCI_INDEX_DIGEST$OCI_MANIFEST_DIGEST$OCI_CONFIG_DIGEST" in
+    sha256:*sha256:*sha256:*) ok "OCI digests for $ver are sha256-formatted" ;;
+    *) bad "OCI digest format is wrong for $ver" ;;
+  esac
+  [ "${#OCI_LAYER_DIGESTS[@]}" = "${#OCI_LAYER_SIZES[@]}" ] &&
+    ok "OCI layer digest/size counts agree for $ver" ||
+    bad "OCI layer digest/size counts differ for $ver"
+  BADLAYER=0
+  for d in "${OCI_LAYER_DIGESTS[@]}"; do
+    printf '%s' "$d" | grep -Eq '^sha256:[0-9a-f]{64}$' || BADLAYER=1
+  done
+  [ "$BADLAYER" = 0 ] && ok "every OCI layer digest is 64 lowercase hex for $ver" ||
+    bad "an OCI layer digest is malformed for $ver"
+done
+grep -q 'oci_manifest_url "$OCI_MANIFEST_DIGEST"' "$LAB_DIR/oci.sh" &&
+  grep -q 'verify_sha256' "$LAB_DIR/oci.sh" &&
+  ok "OCI fetch addresses the manifest by digest and verifies blobs" ||
+  bad "OCI fetch is not digest-addressed/verified"
+
+# ---------------------------------------------------------------------------
+# 6c. The shipped calibration profile is internally consistent.
+# ---------------------------------------------------------------------------
+PROFILE=$LAB_DIR/calibration/php-8.4.26-apache-trixie.json
+if [ -f "$PROFILE" ] && jq -e . "$PROFILE" >/dev/null 2>&1; then
+  ok "calibration profile parses"
+  [ "$(jq -r '.php_version' "$PROFILE")" = "$PHP_VULN" ] &&
+    ok "calibration profile targets PHP $PHP_VULN" ||
+    bad "calibration profile targets the wrong PHP version"
+  if [ "$(jq -r 'if .stage3.verified == true and (.stage3.htdata // "") != "" and ((.stage3.pads // []) | length) > 0 then 1 else 0 end' "$PROFILE")" = 1 ]; then
+    ok "calibration profile carries a verified stage-3 geometry"
+  else
+    bad "calibration profile has no complete verified stage-3 geometry"
+  fi
+  norm_hex() { printf '0x%x' "$((16#${1#0x}))"; }
+  if [ -f "$IMAGES/php2shell-vuln/offsets.env" ]; then
+    if read_offsets "$IMAGES/php2shell-vuln" &&
+      [ "$(norm_hex "${ZIF_OFFSET:-0}")" = "$(norm_hex "$(jq -r '.libphp.zif_system' "$PROFILE")")" ] &&
+      [ "$(norm_hex "${DTOR_OFFSET:-0}")" = "$(norm_hex "$(jq -r '.libphp.zval_ptr_dtor' "$PROFILE")")" ]; then
+      ok "profile offsets match the built vulnerable image"
+    else
+      bad "profile offsets do not match the built vulnerable image"
+    fi
+  else
+    ok "vulnerable image not built yet; profile/image offset comparison skipped"
+  fi
+else
+  bad "calibration profile is missing or malformed"
 fi
 
 # ---------------------------------------------------------------------------

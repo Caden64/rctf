@@ -53,18 +53,11 @@ UPSTREAM_URL=https://github.com/9bie/php2shell-bypass-aslr-exp.git
 # checkout. build/fetch promote that file into a run-time staging copy.
 UPSTREAM_PIN=d6f888ebd3f0e188bb662e16f23747afdf35e42f
 
-# Lab parameters (see README.md "Calibration"). These are the parameters the
-# toolkit's calibrator measured over HTTP on the official php:8.4.26-apache
-# image (Debian 12 image tag, libphp.so sha256 51663cf8... / trixie tag) and
-# on the bookworm tag (sha256 ff3ea77f..., zif 0x45a3b0, dtor 0x64eb60):
-#   stage1 N=841, forge length 63 (the toolkit profile says 79; the image
-#   yields 63), stage2 T=406, V=16.
-# Stage 3 remains build/instance dependent; the runner tries the bookworm
-# carrier layout and the explicit lab layout and reports a failure honestly.
-P2S_STAGE1_N=${P2S_STAGE1_N:-841}
-P2S_FORGE_LEN=${P2S_FORGE_LEN:-63}
-P2S_STAGE2_T=${P2S_STAGE2_T:-406}
-P2S_STAGE2_V=${P2S_STAGE2_V:-16}
+# Stage-3 and leak parameters are loaded by run.sh from the calibration
+# profile (calibration/php-8.4.26-apache-trixie.json) with P2S_STAGE1_N /
+# P2S_FORGE_LEN / P2S_STAGE2_T / P2S_STAGE2_V / P2S_STAGE3_HTDATA /
+# P2S_STAGE3_PADS overrides. Nothing here hard-codes a stage-3 layout: an
+# uncalibrated checkout must not pretend the RCE is proven.
 P2S_CHAIN_RETRIES=${P2S_CHAIN_RETRIES:-1}
 
 log() { printf '==> %s\n' "$*" >&2; }

@@ -161,12 +161,14 @@ extract_offsets() { # extract_offsets <libphp> <outfile>
   dtor=$(nm "$lib" 2>/dev/null | awk '$3 == "zval_ptr_dtor" { d = $1 } END { print d }')
   [ -n "$zif" ] || die "could not find zif_system in $lib"
   [ -n "$dtor" ] || die "could not find zval_ptr_dtor in $lib"
+  zif=$(printf '0x%x' "$((16#$zif))")
+  dtor=$(printf '0x%x' "$((16#$dtor))")
   {
-    printf 'ZIF_OFFSET=0x%s\n' "$zif"
-    printf 'DTOR_OFFSET=0x%s\n' "$dtor"
+    printf 'ZIF_OFFSET=%s\n' "$zif"
+    printf 'DTOR_OFFSET=%s\n' "$dtor"
     printf 'LIBPHP_SHA256=%s\n' "$(sha256_of "$lib")"
   } >"$out"
-  log "offsets from $(basename "$lib"): zif=0x$zif dtor=0x$dtor"
+  log "offsets from $(basename "$lib"): zif=$zif dtor=$dtor"
 }
 
 runtime_rootfs() { # runtime_rootfs <dir>
