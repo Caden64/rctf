@@ -42,6 +42,6 @@
     "php_ini": "conf.d/zz-php2shell.ini only (no php.ini; output_buffering=0; log_errors Off)",
     "workers": 1
   },
-  "notes": "Measured over HTTP with php2shell_calibrate.py's probe/sweep and its stage-3 carrier layout in a rootless user-namespace chroot running the pinned OCI image with the guest's exact Apache/php.ini. The amd64 pointer-range patch in amd64.py is required: with the toolkit's widened filter a valid 4096-byte leak parses as chunk=0x600000. Stage 3 proof: uid=33(www-data) fetched from /p. See RESULTS.md section 3.",
+  "notes": "Measured over HTTP with php2shell_calibrate.py's probe/sweep and its stage-3 carrier layout in a rootless user-namespace chroot running the pinned OCI image with the guest's exact Apache/php.ini. The amd64 pointer-range patch in amd64.py is required: with the toolkit's widened filter a valid 4096-byte leak parses as chunk=0x600000. Stage 3 proof: uid=33(www-data) fetched from /p. See RESULTS.md section 2.",
   "status": "RCE verified on the exact pinned image"
 }
