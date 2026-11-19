@@ -7,6 +7,12 @@ inside throwaway microVMs inside the throwaway `vmtest` QEMU VM. Nothing
 contacts third-party infrastructure, and no part of this directory is a
 production attack tool.
 
+The lab's visible web content is themed as the fictional **M364 outage
+service-credit portal** (see [Theming](#theming-m364-service-credit-portal)):
+a parody admin page for requesting an SLA credit after a Microsoft
+365–style outage. The theme is deliberately static-only, so the calibrated
+chain geometry is untouched.
+
 > **Authorized use only.** The chain is run against a local loopback target
 > inside a disposable VM that this harness creates and destroys. Do not point
 > the toolkit at systems you do not own or have written permission to test.
@@ -126,6 +132,7 @@ Only these paths are added to the image; everything else is the image's own:
 | `/etc/apache2/conf-enabled/zz-lab.conf`       | `DocumentRoot /www`, PHP handler for `/www`                                                  |
 | `/usr/local/etc/php/conf.d/zz-php2shell.ini`  | laboratory php.ini (8M, no `log_errors`)                                                     |
 | `/www/index.php`, `/www/version.php`          | inert landing page; version + `memory_limit` for assertions                                  |
+| `/www/index.html`, `status.html`, `m364.css`  | M364 static theme (no PHP; identical in all three images)                                    |
 | `/app/start`                                  | MMDS flag publish, `/www` ownership, `apache2-foreground`                                    |
 | `/usr/local/bin/{busybox,ip,nc}`              | boot-contract `ip route`/`ip link` (busybox from the sha256-verified shared smoke artifacts) |
 | `/rctf/{init,jq}`                             | installed by `guest/build-rootfs.sh`                                                         |
@@ -255,6 +262,65 @@ Stage 3 was also tried with the explicit deb13 "lab" layout
 the vessel variant's parameter range; those are recorded in `RESULTS.md` as
 ruled out for this image. The carrier layout is the calibrated one.
 
+## Theming (M364 service-credit portal)
+
+The lab's visible web content is themed as a parody Microsoft-style **M364
+outage service-credit portal** — the page a tenant admin would land on to
+request an SLA service credit after a Microsoft 365–style outage: an outage
+banner ("Exchange Online — degraded performance, incident `#EX2611-0442`"),
+a service-credit request form, an SLA percentage table, static status tiles
+and a footer with the fake incident number. All content is original (no
+vendor logos, no copied vendor text; "M364" is the event's own label), and
+every page footer self-labels the portal as a fictional training portal.
+
+The theme lives under the hard constraint of "Calibration and honest status"
+fact 3: **`/www/index.php` is allocation-inert AND is the chain target.**
+Any PHP allocation on the POST path — even a `session_start()` behind a
+request-method check — moves the allocator's free list and makes the
+4096-byte stage-1 Set-Cookie leak miss. Theming therefore obeys one rule:
+
+> **All themed pages are pure static files served by Apache; no PHP
+> execution may be involved in rendering the theme, and `index.php` stays
+> byte-identical.**
+
+Concretely:
+
+- `lab/www/index.php` is untouched (`<?php echo "OK\n";`, byte-identical,
+  enforced by `selftest.sh`). It remains the calibrated landing page and the
+  multipart POST target the chain drives.
+- The theme is `lab/www/index.html` (portal landing page), `status.html`
+  (static status tiles) and `m364.css`, all installed into the image as
+  plain static files by `build-oci.sh`'s shared `overlay_image`.
+- The image's own Debian `dir.conf` lists `index.html` before `index.php`,
+  so `GET /` serves the themed static portal, while every chain request
+  keeps addressing `/index.php` directly (`run.sh` passes
+  `-u http://127.0.0.1:$FWD_PORT/index.php`; `mod_dir` is never involved for
+  a direct file URL, so the theme cannot move the heap). The runner's
+  readiness and assertion flow is unchanged.
+- The credit-request form is `method="post"
+  enctype="multipart/form-data"` with themed, innocuous field names
+  (`tenant_id`, `affected_workload`, `incident_date`,
+  `impact_description`, and a `usage_export` "attach supporting usage
+  export" file input). Its action is `/index.php` — the exact inert URL the
+  exploit POSTs its crafted multipart to, so the visible form is literally
+  the exploit surface. It is not `/`: once the static `index.html` exists,
+  Apache's `mod_dir` resolves `POST /` to `index.html`, a static file that
+  answers 405, so a form pointed at `/` would never reach PHP at all.
+- The same three themed files are installed **identically into all three
+  images** (vulnerable, patched, hardened) by the shared overlay, so the
+  controls stay true negative controls of the same themed app. `run.sh`
+  asserts `GET /` is byte-identical to `lab/www/index.html` (sha256) on
+  every image and that the form still targets `/index.php`.
+- `version.php` is kept as-is: it is the runner's assertion surface and the
+  intentional player-facing version intel, linked as "System diagnostics"
+  from the themed footer.
+
+If a future pinned image ever changes the shipped `DirectoryIndex` order,
+`GET /` would silently fall back to the inert `index.php`; the runner's
+`assert_theme` fails closed on exactly that instead of letting the theme
+drift. A theme change that adds PHP execution is a hard lab regression:
+`selftest.sh` rejects any PHP tags in the themed files.
+
 ## Requirements and cost
 
 - `/dev/kvm` readable/writable on the host, with nested virtualization enabled
@@ -289,10 +355,15 @@ ruled out for this image. The carrier layout is the calibrated one.
 | `lab/lab-oci.conf`           | `/www` document root for the official guest                     |
 | `lab/php-oci.ini`            | official-guest laboratory php.ini (8M)                          |
 | `lab/php-oci-hardened.ini`   | official-guest hardened control (128M)                          |
-| `lab/www/index.php`          | allocation-inert landing page                                   |
+| `lab/www/index.php`          | allocation-inert landing page (byte-identical, never themed)    |
+| `lab/www/index.html`         | M364 themed static landing page (no PHP)                       |
+| `lab/www/status.html`        | M364 themed static status tiles (no PHP)                        |
+| `lab/www/m364.css`           | M364 theme stylesheet (static)                                 |
 | `lab/www/version.php`        | version + `memory_limit` for assertions                         |
 | `lab/app-start-oci`          | `/app/start`: flag publish + `apache2-foreground`               |
 | `lab/*` (source-build files) | Apache/PHP source-build lab configuration                       |
+| `challenge.yaml`            | event challenge registration (Firecracker instancer)           |
+| `staging-manifest.json`      | event image staging manifest (files, sha256, sizes)            |
 | `RESULTS.md`                 | dated log of what actually ran                                  |
 
 ## Not done

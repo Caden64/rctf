@@ -1,0 +1,49 @@
+# M364 outage service-credit portal — event challenge registration.
+# Format: deploy/firecracker/sample-challenge.yaml. The event image is
+# php2shell-vuln; the patched/hardened controls stay lab fixtures and are
+# never deployed to players.
+#
+# Flag flow (no secret is committed here): the event's flag provider fills
+# `flags` below; the instancer hands the flag to the agent, the agent to
+# Firecracker MMDS, and the guest /app/start copies $RCTF_FLAGS_DIR/main to
+# /www/flag.txt inside the running instance. The intended objective is to
+# read that file through the chain's RCE.
+name: M364 Outage Service-Credit Portal
+category: web
+description: >-
+  The big Exchange Online outage finally hit your tenant, and the M364 admin
+  portal owes you a service credit. Submit your credit request through the
+  intake form — it goes straight to the incident intake service.
+flags:
+  - provider: flags/static # the event wires its real flag provider here
+    config:
+      flag: rctf{REPLACE_WITH_EVENT_FLAG} # placeholder only; never a real flag
+instancerConfig:
+  instancer: firecracker # key in the rctf.d `instancers` map
+  challengeIntegrationId: fc-m364-credit # never change after launch
+  timeoutMilliseconds: 1800000
+  extendable: true
+  config:
+    image: php2shell-vuln # <imagesDir>/php2shell-vuln/{vmlinux,rootfs.ext4}; see staging-manifest.json
+    # Sizing: the lab's end-to-end runner proves this guest boots and
+    # reproduces the full chain at vcpus=1/memMiB=256/diskMiB=1024 (run.sh
+    # make_spec). The chain's OOM body is memory_limit(8M)+12M = 20 MiB, so
+    # memMiB=512 (2x the proven floor) comfortably covers Apache + PHP + the
+    # in-flight body; diskMiB=1536 fits the 768 MiB rootfs.ext4 plus writable
+    # headroom for multipart upload temp files (the credit form invites an
+    # attachment). One prefork worker is the chain's own assumption.
+    vcpus: 1
+    memMiB: 512
+    diskMiB: 1536
+    egress: false # the guest needs no network beyond its exposed endpoint
+    bootTimeoutSeconds: 180 # the lab's own instance spec; Apache binds :8080 well within it
+    readiness: { kind: http, port: 8080, path: /, expectStatus: 200 } # themed static landing page
+    env:
+      CHALLENGE: fc-m364-credit
+  expose:
+    - kind: https
+      hostPrefix: m364-credit
+      containerName: app # must be 'app' for the Firecracker instancer
+      containerPort: 8080
+      shouldDisplay: true # required: endpoints are hidden from players unless this is true
+      title: M364 Credit Portal

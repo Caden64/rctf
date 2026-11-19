@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M364 service health &mdash; current status</title>
+<link rel="stylesheet" href="/m364.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232b579a'/%3E%3Ctext x='8' y='12' font-size='9' font-family='sans-serif' font-weight='bold' fill='%23fff' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">M364</span>
+    <span class="brand-name">service health</span>
+  </div>
+  <nav class="topnav">
+    <a href="/status.html">Current status</a>
+    <a href="/">Credit requests</a>
+    <a href="/version.php" class="quiet">System diagnostics</a>
+  </nav>
+</header>
+
+<main>
+  <section class="card">
+    <h1>Current service status</h1>
+    <p class="lede">
+      Health is reported per workload and refreshed by the M364 health bot every
+      60&nbsp;seconds. Tenants affected by a degrading workload can
+      <a href="/">request a service credit</a>.
+    </p>
+
+    <div class="tiles">
+      <div class="tile tile-amber">
+        <div class="tile-title">Exchange Online<br>mail flow &amp; delivery</div>
+        <div class="tile-state">Degraded performance</div>
+        <div class="tile-ref">Incident <code>#EX2611-0442</code></div>
+      </div>
+      <div class="tile tile-yellow">
+        <div class="tile-title">Chat &amp; meetings</div>
+        <div class="tile-state">Investigating</div>
+        <div class="tile-ref">Elevated join latency for a subset of regions</div>
+      </div>
+      <div class="tile tile-green">
+        <div class="tile-title">Exchange Online<br>calendars &amp; scheduling</div>
+        <div class="tile-state">Healthy</div>
+        <div class="tile-ref">No customer impact reported</div>
+      </div>
+      <div class="tile tile-green">
+        <div class="tile-title">Files &amp; sync</div>
+        <div class="tile-state">Healthy</div>
+        <div class="tile-ref">No customer impact reported</div>
+      </div>
+      <div class="tile tile-green">
+        <div class="tile-title">Identity &amp; sign-in</div>
+        <div class="tile-state">Healthy</div>
+        <div class="tile-ref">No customer impact reported</div>
+      </div>
+      <div class="tile tile-green">
+        <div class="tile-title">M364 admin center</div>
+        <div class="tile-state">Healthy</div>
+        <div class="tile-ref">Advisory publishing operates normally</div>
+      </div>
+    </div>
+
+    <h2>Active advisory</h2>
+    <table>
+      <thead>
+        <tr><th>Incident</th><th>Workload</th><th>State</th><th>Opened (UTC)</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>#EX2611-0442</code></td>
+          <td>Exchange Online &mdash; mail flow &amp; delivery</td>
+          <td>Degraded performance</td>
+          <td>2026-11-14 02:07</td>
+        </tr>
+        <tr>
+          <td><code>INC0044151</code></td>
+          <td>Chat &amp; meetings</td>
+          <td>Investigating</td>
+          <td>2026-11-18 19:22</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="hint">
+      Status values are illustrative and are published by the training portal only.
+    </p>
+  </section>
+</main>
+
+<footer class="foot">
+  <div>
+    Incident <code>#EX2611-0442</code> &middot; tracking ref <code>INC0044128</code>
+    &middot; status refreshed 2026-11-18&nbsp;23:50&nbsp;UTC
+  </div>
+  <div class="foot-note">
+    M364 is a fictional service-health training portal. It is not affiliated with,
+    endorsed by, or connected to any real service provider.
+  </div>
+</footer>
+</body>
+</html>

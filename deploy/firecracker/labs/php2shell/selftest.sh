@@ -266,6 +266,82 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6d. M364 theming invariants: static-only themed pages, the credit form on
+#     the inert chain target, the event registration, and the staging
+#     manifest. The theme must never execute PHP: only the untouched
+#     allocation-inert index.php does, and the chain POSTs to it directly.
+# ---------------------------------------------------------------------------
+THEME_FILES=(index.html status.html m364.css)
+for f in "${THEME_FILES[@]}"; do
+  if grep -q '<?php\|<?=' "$LAB_DIR/lab/www/$f"; then
+    bad "lab/www/$f contains PHP (themed pages must be static; rendering them would move the heap)"
+  else
+    ok "lab/www/$f is pure static content (no PHP tags)"
+  fi
+  grep -q "lab/www/$f" "$LAB_DIR/build-oci.sh" &&
+    ok "build-oci.sh installs lab/www/$f into every image" ||
+    bad "build-oci.sh does not install lab/www/$f"
+done
+grep -q 'action="/index.php"' "$LAB_DIR/lab/www/index.html" &&
+  ok "credit form posts to the inert /index.php chain target" ||
+  bad "credit form lost its /index.php target"
+grep -q 'enctype="multipart/form-data"' "$LAB_DIR/lab/www/index.html" &&
+  ok "credit form is a multipart form (the visible exploit surface)" ||
+  bad "credit form is not multipart"
+# All three images share overlay_image, so the theme is identical across the
+# vulnerable and control images by construction; run.sh additionally asserts
+# GET / serves this exact file byte-for-byte on every image.
+
+CHALLENGE_YAML=$LAB_DIR/challenge.yaml
+if [ -f "$CHALLENGE_YAML" ]; then
+  ok "event challenge registration exists (challenge.yaml)"
+  for needle in 'instancer: firecracker' 'challengeIntegrationId: fc-m364-credit' \
+    'image: php2shell-vuln' 'hostPrefix: m364-credit' 'containerName: app' \
+    'readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }' \
+    'shouldDisplay: true'; do
+    grep -q "$needle" "$CHALLENGE_YAML" &&
+      ok "challenge.yaml sets $needle" ||
+      bad "challenge.yaml is missing $needle"
+  done
+  read -r CY_MEM CY_DISK <<<"$(awk '/memMiB:/ {m=$2} /diskMiB:/ {d=$2} END {print m+0, d+0}' "$CHALLENGE_YAML")"
+  [ "$CY_MEM" -ge 256 ] &&
+    ok "challenge.yaml memMiB ($CY_MEM) is at least the lab-proven 256" ||
+    bad "challenge.yaml memMiB ($CY_MEM) is undersized (the lab VM proved 256)"
+  [ "$CY_DISK" -ge 768 ] &&
+    ok "challenge.yaml diskMiB ($CY_DISK) fits the 768 MiB rootfs.ext4" ||
+    bad "challenge.yaml diskMiB ($CY_DISK) cannot hold the 768 MiB rootfs.ext4"
+else
+  ok "no challenge.yaml (lab-only checkout; event registration not required)"
+fi
+
+MANIFEST=$LAB_DIR/staging-manifest.json
+if [ -f "$MANIFEST" ]; then
+  if jq -e '.image and (.files.vmlinux.sha256 | test("^[0-9a-f]{64}$")) and
+      (.files["rootfs.ext4"].sha256 | test("^[0-9a-f]{64}$")) and
+      (.files.vmlinux.sizeBytes > 0) and (.files["rootfs.ext4"].sizeBytes > 0)' \
+    "$MANIFEST" >/dev/null 2>&1; then
+    ok "staging manifest parses with image/files/sha256/sizes"
+  else
+    bad "staging manifest is missing image/files/sha256/sizes fields"
+  fi
+  if [ -f "$IMAGES/php2shell-vuln/rootfs.ext4" ]; then
+    for fname in vmlinux rootfs.ext4; do
+      want=$(jq -r ".files[\"$fname\"].sha256" "$MANIFEST")
+      got=$(sha256_of "$IMAGES/php2shell-vuln/$fname")
+      if [ "$want" = "$got" ]; then
+        ok "staging manifest sha256 matches the built $fname"
+      else
+        bad "staging manifest sha256 of $fname is stale (rebuilds change bytes; refresh the manifest as part of the reviewed re-verification)"
+      fi
+    done
+  else
+    ok "vulnerable image not built yet; manifest/image comparison skipped"
+  fi
+else
+  ok "no staging manifest yet (generated with the verified build)"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Toolkit/upstream provenance, when the cache is populated.
 # ---------------------------------------------------------------------------
 if [ -f "$UPSTREAM_LEGACY/exploit.py" ]; then

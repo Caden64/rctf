@@ -437,6 +437,28 @@ assert_target() { # assert_target <php-version> <memory-limit> <label>
   say "target serves PHP $ver, memory_limit=$lim"
 }
 
+# The visible theme is served by Apache as a STATIC file and must be
+# byte-identical to the repository's lab/www/index.html on EVERY image: the
+# three images differ only in PHP version / memory_limit, never in visible
+# content, so the controls stay true negative controls of the same themed app.
+# The page must also keep its multipart credit form pointed at the inert
+# /index.php -- the exact URL the chain POSTs its crafted multipart to. The
+# theme itself is pure static content (no PHP execution), so this GET is
+# session-neutral and cannot disturb the warmed-state leak methodology (the
+# runner primes before every leak/chain assertion regardless).
+assert_theme() { # assert_theme <label>
+  local label=$1 want got
+  want=$(sha256_of "$LAB_DIR/lab/www/index.html")
+  got=$(vm_ssh "curl -fsS --max-time 10 -o /tmp/p2s-theme.html \
+    http://127.0.0.1:$FWD_PORT/ && sha256sum /tmp/p2s-theme.html | cut -d' ' -f1") ||
+    fail "$label: the themed landing page is not reachable at /"
+  [ "$got" = "$want" ] ||
+    fail "$label: GET / does not serve lab/www/index.html byte-for-byte (sha256 $got, expected $want)"
+  vm_ssh "grep -q 'action=\"/index.php\"' /tmp/p2s-theme.html" ||
+    fail "$label: the themed page lost its multipart form target"
+  say "PASS: $label serves the themed static landing page at / (byte-identical to lab/www/index.html)"
+}
+
 stage_toolkit() {
   local tgz
   if [ ! -d "$TOOLKIT" ] || [ ! -f "$UPSTREAM_LEGACY/exploit.py" ]; then
@@ -607,6 +629,7 @@ start_tunnel "$GIP"
 stage_toolkit
 
 assert_target "$PHP_VULN" 8M "vulnerable image"
+assert_theme "vulnerable image"
 
 say "==> asserting the CVE memory-safety primitives (stages 1-2)"
 assert_leaks_present php2shell-vuln "vulnerable PHP $PHP_VULN"
@@ -636,6 +659,7 @@ PID=$(start_instance php2shell-patched p) || fail "patched instance failed"
 GIP=$(guest_ip "$PID")
 start_tunnel "$GIP"
 assert_target "$PHP_FIXED" 8M "patched image"
+assert_theme "patched image"
 say "==> control A: the leak primitives must be absent"
 assert_leaks_absent php2shell-patched "patched PHP $PHP_FIXED"
 assert_chain_negative php2shell-patched "patched PHP $PHP_FIXED"
@@ -651,6 +675,7 @@ HID=$(start_instance php2shell-hardened h) || fail "hardened instance failed"
 GIP=$(guest_ip "$HID")
 start_tunnel "$GIP"
 assert_target "$PHP_VULN" 128M "hardened image"
+assert_theme "hardened image"
 say "==> control B: at its configured limit the 12M OOM field cannot fire,"
 say "    so the stale-id leak must be absent and the chain must fail closed"
 assert_leaks_absent php2shell-hardened "hardened php.ini"
