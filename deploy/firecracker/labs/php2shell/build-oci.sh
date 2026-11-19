@@ -18,6 +18,7 @@
 #   /etc/apache2/ports.conf                     Listen 8080
 #   /etc/apache2/conf-enabled/zz-php2shell.conf single worker, KeepAlive Off
 #   /etc/apache2/conf-enabled/zz-lab.conf       DocumentRoot /www
+#   /etc/apache2/conf-enabled/zz-m364.conf      DirectoryIndex: theme at /
 #   /usr/local/etc/php/conf.d/zz-php2shell.ini  laboratory php.ini
 #   /www/{index,version}.php, /app/start
 #   /www/{index.html,status.html,m364.css}       M364 static theme (no PHP)
@@ -29,9 +30,10 @@
 # The M364 theme is STATIC on purpose (README "Theming"): index.php must stay
 # the allocation-inert `<?php echo "OK\n";` landing page the chain was
 # calibrated against, so every themed page is served by Apache without PHP
-# execution. Debian's shipped dir.conf lists index.html before index.php, so
-# GET / serves the themed static page while the chain keeps POSTing to
-# /index.php directly.
+# execution. The image's own docker-php.conf pins index.php first in
+# DirectoryIndex, which would keep GET / on the inert page; zz-m364.conf
+# re-pins index.html first so the themed static page owns /, while the chain
+# keeps POSTing to /index.php directly (mod_dir is never on a chain path).
 #
 # Usage:
 #   ./build-oci.sh                 # build all three images (cached)
@@ -108,6 +110,12 @@ overlay_image() { # overlay_image <root> <php-ini>
     "$root/etc/apache2/conf-enabled/zz-php2shell.conf"
   install -m 0644 "$LAB_DIR/lab/lab-oci.conf" \
     "$root/etc/apache2/conf-enabled/zz-lab.conf"
+  # M364 theme: make the STATIC portal page own / (see lab/m364-oci.conf).
+  # The image's own docker-php.conf pins index.php first in DirectoryIndex;
+  # zz-m364.conf re-pins index.html first. No chain request resolves through
+  # mod_dir, so the calibrated heap is untouched.
+  install -m 0644 "$LAB_DIR/lab/m364-oci.conf" \
+    "$root/etc/apache2/conf-enabled/zz-m364.conf"
   install -m 0644 "$ini" "$root/usr/local/etc/php/conf.d/zz-php2shell.ini"
   mkdir -p "$root/www" "$root/app" "$root/usr/local/bin"
   install -m 0644 "$LAB_DIR/lab/www/index.php" "$root/www/index.php"

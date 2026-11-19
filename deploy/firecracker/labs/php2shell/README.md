@@ -130,6 +130,7 @@ Only these paths are added to the image; everything else is the image's own:
 | `/etc/apache2/ports.conf`                     | `Listen 8080`                                                                                |
 | `/etc/apache2/conf-enabled/zz-php2shell.conf` | `KeepAlive Off`, one prefork worker                                                          |
 | `/etc/apache2/conf-enabled/zz-lab.conf`       | `DocumentRoot /www`, PHP handler for `/www`                                                  |
+| `/etc/apache2/conf-enabled/zz-m364.conf`      | `DirectoryIndex index.html index.php` — themed static page owns `/`                           |
 | `/usr/local/etc/php/conf.d/zz-php2shell.ini`  | laboratory php.ini (8M, no `log_errors`)                                                     |
 | `/www/index.php`, `/www/version.php`          | inert landing page; version + `memory_limit` for assertions                                  |
 | `/www/index.html`, `status.html`, `m364.css`  | M364 static theme (no PHP; identical in all three images)                                    |
@@ -291,35 +292,47 @@ Concretely:
 - The theme is `lab/www/index.html` (portal landing page), `status.html`
   (static status tiles) and `m364.css`, all installed into the image as
   plain static files by `build-oci.sh`'s shared `overlay_image`.
-- The image's own Debian `dir.conf` lists `index.html` before `index.php`,
-  so `GET /` serves the themed static portal, while every chain request
-  keeps addressing `/index.php` directly (`run.sh` passes
-  `-u http://127.0.0.1:$FWD_PORT/index.php`; `mod_dir` is never involved for
-  a direct file URL, so the theme cannot move the heap). The runner's
-  readiness and assertion flow is unchanged.
+- Making the theme own `/` requires **one Apache-config addition** — the
+  only one the theming strictly needs. The image's own
+  `conf-enabled/docker-php.conf` pins `DirectoryIndex index.php
+  index.html`, which keeps `GET /` on the inert `index.php` even when the
+  static `index.html` exists (measured: the first re-themed run served
+  `OK\n` at `/` and failed the theme assertion). The lab therefore adds
+  `lab/m364-oci.conf` as `conf-enabled/zz-m364.conf` re-pinning
+  `DirectoryIndex index.html index.php`; `conf-enabled` is included
+  alphabetically, so the later file wins and `GET /` serves the themed
+  static portal. No shipped conf is modified.
+- This is heap-neutral for the chain: **no chain request resolves through
+  `mod_dir`.** Every exploit POST/GET addresses `/index.php` directly
+  (`run.sh` passes `-u http://127.0.0.1:$FWD_PORT/index.php`; the runner
+  probes `/version.php` and fetches `/p`), and a direct file URL never
+  consults `DirectoryIndex`. The only directory-URL request the runner
+  makes is its theme assertion `GET /`, which serves a static file with no
+  PHP execution.
 - The credit-request form is `method="post"
   enctype="multipart/form-data"` with themed, innocuous field names
   (`tenant_id`, `affected_workload`, `incident_date`,
   `impact_description`, and a `usage_export` "attach supporting usage
-  export" file input). Its action is `/index.php` — the exact inert URL the
-  exploit POSTs its crafted multipart to, so the visible form is literally
-  the exploit surface. It is not `/`: once the static `index.html` exists,
-  Apache's `mod_dir` resolves `POST /` to `index.html`, a static file that
+  export" file input). Its action is `/index.php` — the exact inert URL
+  the exploit POSTs its crafted multipart to, so the visible form is
+  literally the exploit surface. It is not `/`: under the re-pinned
+  order `POST /` resolves to the static `index.html`, a static file that
   answers 405, so a form pointed at `/` would never reach PHP at all.
-- The same three themed files are installed **identically into all three
-  images** (vulnerable, patched, hardened) by the shared overlay, so the
-  controls stay true negative controls of the same themed app. `run.sh`
-  asserts `GET /` is byte-identical to `lab/www/index.html` (sha256) on
-  every image and that the form still targets `/index.php`.
+- The same themed files and the same `zz-m364.conf` are installed
+  **identically into all three images** (vulnerable, patched, hardened) by
+  the shared overlay, so the controls stay true negative controls of the
+  same themed app. `run.sh` asserts `GET /` is byte-identical to
+  `lab/www/index.html` (sha256) on every image and that the form still
+  targets `/index.php`.
 - `version.php` is kept as-is: it is the runner's assertion surface and the
   intentional player-facing version intel, linked as "System diagnostics"
   from the themed footer.
 
-If a future pinned image ever changes the shipped `DirectoryIndex` order,
-`GET /` would silently fall back to the inert `index.php`; the runner's
-`assert_theme` fails closed on exactly that instead of letting the theme
-drift. A theme change that adds PHP execution is a hard lab regression:
-`selftest.sh` rejects any PHP tags in the themed files.
+If a future pinned image ever changes the shipped `DirectoryIndex` order
+either way, the runner's `assert_theme` fails closed on exactly that
+instead of letting the theme drift. A theme change that adds PHP execution
+is a hard lab regression: `selftest.sh` rejects any PHP tags in the themed
+files.
 
 ## Requirements and cost
 
@@ -353,6 +366,7 @@ drift. A theme change that adds PHP execution is a hard lab regression:
 | `lib.sh`                     | pinned constants, offsets/proof helpers, port allocation        |
 | `lab/apache-oci.conf`        | single-worker prefork policy for the official guest             |
 | `lab/lab-oci.conf`           | `/www` document root for the official guest                     |
+| `lab/m364-oci.conf`          | `DirectoryIndex` re-pin so the static theme owns `/`            |
 | `lab/php-oci.ini`            | official-guest laboratory php.ini (8M)                          |
 | `lab/php-oci-hardened.ini`   | official-guest hardened control (128M)                          |
 | `lab/www/index.php`          | allocation-inert landing page (byte-identical, never themed)    |

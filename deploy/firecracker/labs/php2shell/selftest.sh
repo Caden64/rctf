@@ -288,6 +288,18 @@ grep -q 'action="/index.php"' "$LAB_DIR/lab/www/index.html" &&
 grep -q 'enctype="multipart/form-data"' "$LAB_DIR/lab/www/index.html" &&
   ok "credit form is a multipart form (the visible exploit surface)" ||
   bad "credit form is not multipart"
+# The static portal must own /: the official image's own docker-php.conf
+# pins index.php first in DirectoryIndex, so the lab overlay re-pins the
+# order with lab/m364-oci.conf (installed as conf-enabled/zz-m364.conf,
+# which sorts after docker-php.conf in the conf-enabled include order).
+if grep -q '^DirectoryIndex index.html index.php$' "$LAB_DIR/lab/m364-oci.conf"; then
+  ok "m364-oci.conf re-pins DirectoryIndex index.html first (theme owns /)"
+else
+  bad "m364-oci.conf does not pin index.html before index.php in DirectoryIndex"
+fi
+grep -q 'lab/m364-oci.conf' "$LAB_DIR/build-oci.sh" &&
+  ok "build-oci.sh installs lab/m364-oci.conf into every image" ||
+  bad "build-oci.sh does not install lab/m364-oci.conf"
 # All three images share overlay_image, so the theme is identical across the
 # vulnerable and control images by construction; run.sh additionally asserts
 # GET / serves this exact file byte-for-byte on every image.
