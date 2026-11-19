@@ -126,11 +126,20 @@ assert_common_guest() { # <root> <image> <libc>
   assert_sshd_banner "$root" usr/sbin/sshd "$BANNER"
   assert_executable "$root/usr/sbin/sshd" "$image sshd"
   # OpenSSH >= 9.8 splits the privileged monitor/session code into
-  # sshd-session/ sshd-auth; the guest cannot accept a session without them.
-  assert_executable "$root/usr/libexec/openssh/sshd-session" \
-    "$image sshd-session (post-9.8 privilege separation)"
-  assert_executable "$root/usr/libexec/openssh/sshd-auth" \
-    "$image sshd-auth (post-9.8 privilege separation)"
+  # sshd-session/sshd-auth; the guest cannot accept a session without them.
+  # OE installs them directly under ${libexecdir} (recipe FILES:
+  # ${libexecdir}/sshd-session); accept the openssh/ subdir spelling too.
+  local session_ok=0 auth_ok=0
+  for p in usr/libexec/sshd-session usr/libexec/openssh/sshd-session; do
+    [ -x "$root/$p" ] && session_ok=1
+  done
+  for p in usr/libexec/sshd-auth usr/libexec/openssh/sshd-auth; do
+    [ -x "$root/$p" ] && auth_ok=1
+  done
+  [ "$session_ok" = 1 ] ||
+    die "$image: sshd-session (post-9.8 privilege separation) is missing"
+  [ "$auth_ok" = 1 ] ||
+    die "$image: sshd-auth (post-9.8 privilege separation) is missing"
   assert_executable "$root/usr/bin/ssh-keygen" "$image ssh-keygen"
   assert_executable "$root/app/start" "$image /app/start"
   require_file "$root/etc/ssh/sshd_config" "$image sshd_config"
