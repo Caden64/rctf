@@ -211,7 +211,10 @@ say 'provisioned.'
 
 # --- register the lab images ------------------------------------------------
 say '==> staging the two lab images into the agent imagesDir'
-tar czf "$WORK/lab-images.tgz" -C "$IMAGES" . || die 'could not archive the lab images'
+# Only the image directories go into the agent imagesDir; the manifest stays
+# at the documented cache path.
+tar czf "$WORK/lab-images.tgz" -C "$IMAGES" xweb-vuln xweb-patched ||
+  die 'could not archive the lab images'
 vm_ssh 'rm -rf /tmp/fc-xweb && mkdir -p /tmp/fc-xweb/images && tar xzf - -C /tmp/fc-xweb/images' \
   <"$WORK/lab-images.tgz" || die 'could not copy the lab images into the VM'
 rm -f "$WORK/lab-images.tgz"
