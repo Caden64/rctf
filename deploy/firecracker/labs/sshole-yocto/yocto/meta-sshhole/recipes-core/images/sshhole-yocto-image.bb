@@ -30,6 +30,16 @@ require recipes-core/images/core-image-minimal.bb
 # os-release: the poky identity markers the build assertions read.
 IMAGE_INSTALL:append = " openssh sshhole-lab-config os-release"
 
+# qemux86-64's qemuboot machine include adds the qemuboot image class, whose
+# EXTRA_IMAGEDEPENDS pulls in qemu-system-native (a runqemu convenience). The
+# lab boots this image under Firecracker with the pinned shared kernel, never
+# with qemu, and yocto-6.0.4's qemu-system-native 10.2 does not compile
+# against the newer kernel uapi headers of this environment (mshv_vp_registers
+# redefinition - see RESULTS.md). Dropping just that build dependency does not
+# change the image contents: the vulnerable stack (musl libc, stock openssh
+# 10.3p1 without PAM, the accounts) is unaffected.
+EXTRA_IMAGEDEPENDS:remove = "qemu-system-native qemu-helper-native:do_addto_recipe_sysroot"
+
 inherit extrausers
 
 # usermod -p writes its argument verbatim into the shadow password field, so

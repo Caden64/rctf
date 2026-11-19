@@ -207,11 +207,12 @@ run_build() { # <tclib>
       {
         printf 'bitbake: %s\n' "$(bitbake --version)"
         for spec in openssh musl glibc busybox base-passwd shadow; do
-          v=$(bitbake-getvar -r "$spec" PV 2>/dev/null | sed -n 's/^PV = "//;s/"$//p' | head -n 1 || true)
-          [ -n "$v" ] && printf '%s PV=%s\n' "$spec" "$v"
+          v=$(bitbake-getvar --value -r "$spec" PV 2>/dev/null || true)
+          case "$v" in '' | '# '* | *'${@'*) continue ;; esac
+          printf '%s PV=%s\n' "$spec" "$v"
         done
-        dv=$(bitbake-getvar DISTRO_VERSION 2>/dev/null | sed -n 's/^DISTRO_VERSION = "//;s/"$//p' | head -n 1 || true)
-        [ -n "$dv" ] && printf 'DISTRO_VERSION=%s\n' "$dv"
+        v=$(bitbake-getvar --value DISTRO_VERSION 2>/dev/null || true)
+        case "$v" in '' | '# '* | *'${@'*) ;; *) printf 'DISTRO_VERSION=%s\n' "$v" ;; esac
       } >"$bdir/sshhole-versions.txt" 2>/dev/null || true
     fi
   )

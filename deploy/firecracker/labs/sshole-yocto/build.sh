@@ -269,7 +269,7 @@ build_image() {
 stage_yocto_rootfs() {
   local tclib=$1
   local bdir=$YDIR/build-$tclib
-  local link=$bdir/tmp/deploy/images/qemux86-64/sshhole-yocto-image-qemux86-64.tar.xz
+  local link=$bdir/tmp/deploy/images/qemux86-64/sshhole-yocto-image-qemux86-64.rootfs.tar.xz
   require_file "$link" "the $tclib Yocto rootfs tarball"
   local real
   real=$(readlink -f "$link")
