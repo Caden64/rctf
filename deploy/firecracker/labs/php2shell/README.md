@@ -296,12 +296,23 @@ Concretely:
   only one the theming strictly needs. The image's own
   `conf-enabled/docker-php.conf` pins `DirectoryIndex index.php
   index.html`, which keeps `GET /` on the inert `index.php` even when the
-  static `index.html` exists (measured: the first re-themed run served
-  `OK\n` at `/` and failed the theme assertion). The lab therefore adds
-  `lab/m364-oci.conf` as `conf-enabled/zz-m364.conf` re-pinning
-  `DirectoryIndex index.html index.php`; `conf-enabled` is included
-  alphabetically, so the later file wins and `GET /` serves the themed
-  static portal. No shipped conf is modified.
+  static `index.html` exists. `mod_dir` **accumulates** same-context
+  `DirectoryIndex` directives (Apache docs: multiple directives add to the
+  list; to replace it you must reset it first with the `disabled` token —
+  the idiom `docker-php.conf` itself uses), so the lab adds
+  `lab/m364-oci.conf` as `conf-enabled/zz-m364.conf` with
+
+  ```apache
+  DirectoryIndex disabled
+  DirectoryIndex index.html index.php
+  ```
+
+  which resets the accumulated list and pins the static page first, so
+  `GET /` serves the themed portal. No shipped conf is modified. (Both
+  facts were measured, not assumed: a run with only an appended
+  `DirectoryIndex index.html index.php` still served `OK\n` at `/`
+  because docker-php's `index.php` stayed ahead in the accumulated
+  walk order.)
 - This is heap-neutral for the chain: **no chain request resolves through
   `mod_dir`.** Every exploit POST/GET addresses `/index.php` directly
   (`run.sh` passes `-u http://127.0.0.1:$FWD_PORT/index.php`; the runner

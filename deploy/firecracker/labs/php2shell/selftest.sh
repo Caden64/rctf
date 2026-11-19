@@ -289,13 +289,18 @@ grep -q 'enctype="multipart/form-data"' "$LAB_DIR/lab/www/index.html" &&
   ok "credit form is a multipart form (the visible exploit surface)" ||
   bad "credit form is not multipart"
 # The static portal must own /: the official image's own docker-php.conf
-# pins index.php first in DirectoryIndex, so the lab overlay re-pins the
-# order with lab/m364-oci.conf (installed as conf-enabled/zz-m364.conf,
-# which sorts after docker-php.conf in the conf-enabled include order).
-if grep -q '^DirectoryIndex index.html index.php$' "$LAB_DIR/lab/m364-oci.conf"; then
-  ok "m364-oci.conf re-pins DirectoryIndex index.html first (theme owns /)"
+# pins index.php first in DirectoryIndex, and mod_dir ACCUMULATES
+# same-context DirectoryIndex directives (Apache docs, mod_dir: to replace
+# the list you must reset it first with the `disabled` token -- the idiom
+# docker-php.conf itself uses). lab/m364-oci.conf, installed as
+# conf-enabled/zz-m364.conf (alphabetically after docker-php.conf), resets
+# and re-pins the order.
+RESET_LINE=$(grep -n '^DirectoryIndex disabled$' "$LAB_DIR/lab/m364-oci.conf" | cut -d: -f1)
+PIN_LINE=$(grep -n '^DirectoryIndex index.html index.php$' "$LAB_DIR/lab/m364-oci.conf" | cut -d: -f1)
+if [ -n "$RESET_LINE" ] && [ -n "$PIN_LINE" ] && [ "$RESET_LINE" -lt "$PIN_LINE" ]; then
+  ok "m364-oci.conf resets DirectoryIndex then pins index.html first (theme owns /)"
 else
-  bad "m364-oci.conf does not pin index.html before index.php in DirectoryIndex"
+  bad "m364-oci.conf must reset via 'DirectoryIndex disabled' BEFORE pinning 'index.html index.php'"
 fi
 grep -q 'lab/m364-oci.conf' "$LAB_DIR/build-oci.sh" &&
   ok "build-oci.sh installs lab/m364-oci.conf into every image" ||
