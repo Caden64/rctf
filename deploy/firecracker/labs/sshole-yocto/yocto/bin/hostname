@@ -1,0 +1,17 @@
+#!/bin/sh
+# Lab-provided stand-in for hostname(1), used ONLY on the bitbake PATH.
+#
+# The unprivileged build host lacks a hostname binary, and bitbake's HOSTTOOLS
+# hard-requires one to exist. This shim implements exactly the query form
+# (print the node name) that OE build machinery uses, and REFUSES any argument
+# form loudly rather than silently misbehaving (fail closed). If a real build
+# step ever needs an argument form of hostname, this shim makes it fail
+# visibly instead of producing a wrong build.
+#
+# The genuine hostname is of course present inside the guest images; this
+# shim never runs there.
+if [ "$#" -eq 0 ]; then
+  exec uname -n
+fi
+echo "sshhole-yocto hostname shim: unsupported arguments: $*" >&2
+exit 1

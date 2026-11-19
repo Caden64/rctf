@@ -1,0 +1,57 @@
+# sshhole-yocto lab build configuration.
+#
+# This template is turned into <build-dir>/conf/local.conf by yocto-build.sh
+# (the @…@ placeholders are substituted per build). It deliberately keeps the
+# poky reference distro (DISTRO=poky) so the produced rootfs is a genuine
+# Yocto / poky 6.0.4 image, and changes only what the lab needs:
+#
+#   - TCLIBC musl (vulnerable image) or glibc (control image); this is the
+#     ONLY functional difference between the two builds,
+#   - PAM is REMOVED from DISTRO_FEATURES: openssh then builds --without-pam
+#     and sshd authenticates through libc crypt() over /etc/shadow. Note the
+#     yocto-6.0.4 poky default DISTRO_FEATURES already omits 'pam'; the
+#     explicit :remove below is a fail-closed guard so a future poky default
+#     change can never silently re-enable PAM.
+#   - a tar.xz rootfs export (staged by build.sh into an ext4 image through
+#     the shared guest/build-rootfs.sh),
+#   - sysvinit, the classic core-image-minimal init manager; the rCTF guest
+#     init (init=/rctf/init) replaces it at boot anyway.
+
+MACHINE ??= "qemux86-64"
+DISTRO ?= "poky"
+TCLIBC = "@TCLIBC@"
+CONF_VERSION = "2"
+
+INIT_MANAGER = "sysvinit"
+
+# The lab only consumes the rootfs tarball; the kernel is built because
+# core-image-minimal depends on virtual/kernel, but the image boots with the
+# pinned shared smoke kernel (see the lab README).
+IMAGE_FSTYPES = "tar.xz"
+
+# Shared, pinned download/sstate caches across the musl and glibc builds.
+DL_DIR = "@DL_DIR@"
+SSTATE_DIR = "@SSTATE_DIR@"
+
+# PAM absent: sshd uses libc crypt() (the CVE-2026-123158 condition with musl).
+DISTRO_FEATURES:remove = "pam"
+
+# diffstat comes from the pinned host bootstrap (yocto/hosttools-bootstrap.sh,
+# built from the stock recipe's own pinned diffstat-1.68 tarball) and is put on
+# PATH by yocto-build.sh; chrpath/wget/rpcgen/hostname come from the pinned
+# yocto-6.0.4 buildtools tarball plus the lab hostname shim on PATH. Every
+# other host tool requirement stays at its stock setting.
+
+# Keep the build honest and small: no SDK, no extra image features.
+EXTRA_IMAGE_FEATURES = ""
+INHERIT:remove = "create-spdx"
+
+# Unprivileged builds are the norm; assert it.
+# (pseudo still needs to run as the invoking user - it does.)
+
+BB_NUMBER_THREADS = "@BB_NUMBER_THREADS@"
+PARALLEL_MAKE = "-j @BB_NUMBER_THREADS@"
+
+# The musl/glibc builds share sstate; make sure task signature changes are
+# visible.
+BB_SIGNATURE_HANDLER = "OEBasicHash"

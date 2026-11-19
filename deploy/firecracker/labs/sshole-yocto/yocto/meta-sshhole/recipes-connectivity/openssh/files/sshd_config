@@ -1,0 +1,27 @@
+# sshole-yocto lab sshd_config.
+#
+# Swapped in for the stock one through FILESEXTRAPATHS in the bbappend below:
+# the stock openssh recipe's do_configure/do_install machinery copies
+# ${UNPACKDIR}/sshd_config, and with this layer's files directory first on the
+# search path the recipe installs THIS file without any other change. The
+# recipe's sshd_hostkey_setup appends the enabled HostKey lines (ECDSA for the
+# stock PACKAGECONFIG).
+#
+# PasswordAuthentication is on and PAM is explicitly off, so sshd
+# authenticates through libc crypt() against /etc/shadow. On musl that is the
+# CVE-2026-123158 condition; the glibc control image exercises the same
+# non-PAM path with a different libc.
+
+Port 22
+ListenAddress 0.0.0.0
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+PubkeyAuthentication no
+PermitRootLogin prohibit-password
+UsePAM no
+AllowUsers alice bob
+X11Forwarding no
+PrintMotd no
+PidFile /run/sshd.pid
+LogLevel VERBOSE
+Subsystem sftp internal-sftp
