@@ -583,7 +583,8 @@ for pair in "A:$ID_A:xweb-vuln:$FLAG_A:yes" "B:$ID_B:xweb-vuln:$FLAG_B:yes" \
   "P:$ID_P:xweb-patched:$FLAG_P:no" "N:$ID_N:xweb-vuln::no"; do
   IFS=: read -r tag id image flag with_tcp <<<"$pair"
   section "creating instance $tag ($image)"
-  if create_instance "$id" "$image" "team$tag$(rand_hex)" "$flag" "$with_tcp" >/dev/null; then
+  # teamKey must match ^[a-z0-9]{8,64}$: the display tag is lowercased here.
+  if create_instance "$id" "$image" "team${tag,,}$(rand_hex)" "$flag" "$with_tcp" >/dev/null; then
     ok "instance $tag created over the agent API ($id)"
   else
     bad "instance $tag create was rejected"
