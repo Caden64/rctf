@@ -1,0 +1,44 @@
+# Event challenge registration for the rCTF platform.
+#
+# The vulnerable guest image (sshole-yocto-musl: genuine Yocto/poky yocto-6.0.4
+# with musl libc, stock openssh 10.3p1, no PAM) becomes the sshhole event
+# challenge. Per-team flags come from the platform's flags/static provider at
+# the event and are delivered to each instance ONLY through MMDS, exactly as
+# the guest contract requires: /app/start republishes the 'main' flag as
+# /run/rctf/flag.txt (tmpfs, mode 0644) so the bypassed `alice` session can
+# read it. No real flag is ever committed to this repository; the flag below
+# is a placeholder exactly like deploy/firecracker/sample-challenge.yaml.
+#
+# Image: sshole-yocto-musl under the agent's imagesDir
+# (see the lab build: deploy/firecracker/labs/sshole-yocto/build.sh).
+name: sshhole
+category: pwn
+description: >
+  A tiny Yocto Linux box runs sshd with password logins for two users:
+  alice has no password set, bob has one. Log in as alice to read the flag.
+flags:
+  - provider: flags/static
+    config:
+      flag: rctf{replace-at-event-time}
+instancerConfig:
+  instancer: firecracker # key in the rctf.d `instancers` map
+  challengeIntegrationId: fc-sshhole-yocto # never change after launch
+  timeoutMilliseconds: 1800000
+  extendable: true
+  config:
+    image: sshole-yocto-musl # <imagesDir>/sshole-yocto-musl/{vmlinux,rootfs.ext4}
+    vcpus: 1
+    memMiB: 256
+    diskMiB: 1024
+    egress: false
+    bootTimeoutSeconds: 90
+    readiness: { kind: tcp, port: 22 }
+    env:
+      CHALLENGE: fc-sshhole-yocto
+  expose:
+    - kind: tcp
+      hostPrefix: fc-sshhole-yocto
+      containerName: app # must be 'app' for the Firecracker instancer
+      containerPort: 22
+      shouldDisplay: true # required: endpoints are hidden from players unless this is true
+      title: SSH
