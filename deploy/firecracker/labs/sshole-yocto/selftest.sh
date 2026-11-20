@@ -79,6 +79,74 @@ else
   bad 'could not create the askpass helper'
 fi
 
+# --- flag-source resolution ordering (app-start) ----------------------------
+# The guest service /app/start resolves which flag file to publish. The lab
+# runner delivers provider "main"; the event platform resolves the challenge's
+# REGISTERED provider name verbatim ("flags/static" in challenge.yaml), which
+# the guest init sanitizes to "flags_static". The resolution must accept
+# both plus a single-file directory, and publish nothing for a flagless boot.
+#
+# This test extracts the REAL pick_flag_src function from the committed
+# app-start (by name, from the authoritative file) so the tested code cannot
+# drift from the shipped code. A missing function fails the selftest.
+APP_START=$HERE/yocto/meta-sshhole/recipes-core/sshhole-lab-config/files/app-start
+pick_src=$(sed -n '/^pick_flag_src() {$/,/^}$/p' "$APP_START")
+if [ -n "$pick_src" ]; then
+  # shellcheck disable=SC2317
+  eval "$pick_src"
+  if command -v pick_flag_src >/dev/null 2>&1; then
+    run_pick() { # <dir>; prints the picked file or '<none>'
+      local out
+      if out=$(pick_flag_src "$1"); then printf '%s' "$out"; else printf '%s' '<none>'; fi
+    }
+    # 1. lab runner delivery: only "main" present.
+    d=$tmp/flags-main
+    mkdir -p "$d"
+    printf 'flag-lab\n' >"$d/main"
+    [ "$(run_pick "$d")" = "$d/main" ] &&
+      ok 'flag resolution: picks main when only main exists' ||
+      bad "flag resolution: main-only case picked '$(run_pick "$d")'"
+    # 2. platform delivery: only "flags_static" present (flags/static).
+    d=$tmp/flags-static
+    mkdir -p "$d"
+    printf 'flag-event\n' >"$d/flags_static"
+    [ "$(run_pick "$d")" = "$d/flags_static" ] &&
+      ok 'flag resolution: picks flags_static (the platform delivery name)' ||
+      bad "flag resolution: flags_static case picked '$(run_pick "$d")'"
+    # 3. both present: the lab-runner "main" keeps priority.
+    printf 'flag-lab\n' >"$d/main"
+    [ "$(run_pick "$d")" = "$d/main" ] &&
+      ok 'flag resolution: main wins when both delivery names exist' ||
+      bad "flag resolution: both-present case picked '$(run_pick "$d")'"
+    # 4. a single file under any other name still publishes.
+    d=$tmp/flags-other
+    mkdir -p "$d"
+    printf 'flag-single\n' >"$d/anything-else"
+    [ "$(run_pick "$d")" = "$d/anything-else" ] &&
+      ok 'flag resolution: falls back to the single flag file' ||
+      bad "flag resolution: single-file fallback picked '$(run_pick "$d")'"
+    # 5. two files with neither delivery name: ambiguous, publish nothing.
+    printf 'flag-two\n' >"$d/second"
+    [ "$(run_pick "$d")" = '<none>' ] &&
+      ok 'flag resolution: ambiguous multi-file directory publishes nothing' ||
+      bad "flag resolution: ambiguous case picked '$(run_pick "$d")'"
+    # 6. flagless boot: empty (or missing) flags directory publishes nothing,
+    #    which keeps the documented flagless-control behaviour.
+    d=$tmp/flags-empty
+    mkdir -p "$d"
+    [ "$(run_pick "$d")" = '<none>' ] &&
+      ok 'flag resolution: flagless boot publishes nothing (service still starts)' ||
+      bad "flag resolution: flagless case picked '$(run_pick "$d")'"
+    [ "$(run_pick "$tmp/flags-missing")" = '<none>' ] &&
+      ok 'flag resolution: missing flags directory publishes nothing' ||
+      bad "flag resolution: missing-dir case picked '$(run_pick "$tmp/flags-missing")'"
+  else
+    bad 'flag resolution: could not eval pick_flag_src from app-start'
+  fi
+else
+  bad 'flag resolution: pick_flag_src is missing from the committed app-start'
+fi
+
 printf 'RESULT: sshole-yocto check-client selftest %s (%d failure(s))\n' \
   "$([ "$fail" -eq 0 ] && echo PASS || echo FAIL)" "$fail"
 [ "$fail" -eq 0 ]

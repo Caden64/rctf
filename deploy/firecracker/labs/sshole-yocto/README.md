@@ -176,15 +176,32 @@ to bob. This is the same approach the sibling Alpine lab takes.
 22, `readiness: tcp 22`, `vcpus 1`, `memMiB 256`, `diskMiB 1024`,
 `shouldDisplay: true`). Per-team flags come from the platform's
 `flags/static` provider at the event and are delivered to each instance
-**only through MMDS**. The guest init writes them root-only (0400) on the
-tmpfs `/run/rctf/flags/<provider>`; `/app/start` then opens **traversal
-only** on the tmpfs path (`chmod 0755 /run /run/rctf` — the flags directory
-itself stays 0700, so every unpublished flag remains root-only) and
-republishes the `main` flag as `/run/rctf/flag.txt` (mode 0644, same tmpfs —
-never the ext4) so the bypassed `alice` session can read it. `run.sh` asserts
-exactly that against the real instance, including that a second team's
-bypassed session reads **its own** flag and never team A's. **No real flag is
-ever committed**; the registration YAML carries the same placeholder as the
+**only through MMDS**.
+
+**Two flag delivery names, one service:** the lab runner creates instances
+with `provider: "main"`, so the guest init writes `/run/rctf/flags/main`; at
+the EVENT, rCTF resolves the challenge's registered provider name verbatim
+(`flags/static`), and the guest init's provider-name sanitization
+(`[A-Za-z0-9._-]`, `/`→`_`) puts the platform-delivered flag at
+`/run/rctf/flags/flags_static`. `/app/start` resolves both (its
+`pick_flag_src` prefers `main`, then `flags_static`, then the directory's
+single file, and publishes nothing for a flagless boot); `inner.sh` asserts
+BOTH deliveries end-to-end — the `main`-based instances in the per-image
+loop and a dedicated `flags/static` instance in the platform-path section —
+so a registration/provider mismatch cannot silently ship a flagless
+challenge. `selftest.sh` unit-tests the real `pick_flag_src` function
+(extracted by name from the committed `app-start`) for exactly this
+ordering.
+
+The guest init writes flags root-only (0400) on the tmpfs
+`/run/rctf/flags/<provider>`; `/app/start` then opens **traversal only** on
+the tmpfs path (`chmod 0755 /run /run/rctf` — the flags directory itself
+stays 0700, so every unpublished flag remains root-only) and republishes the
+resolved flag as `/run/rctf/flag.txt` (mode 0644, same tmpfs — never the
+ext4) so the bypassed `alice` session can read it. `run.sh` asserts exactly
+that against the real instance, including that a second team's bypassed
+session reads **its own** flag and never team A's. **No real flag is ever
+committed**; the registration YAML carries the same placeholder as the
 sample.
 
 ## Requirements

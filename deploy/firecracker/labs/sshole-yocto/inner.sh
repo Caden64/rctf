@@ -215,10 +215,16 @@ instance_id() { # <tag>; prints a fresh 16..32 char lowercase id
   printf 'ssholeyocto%s%s\n' "$(printf '%s' "$1" | tr -cd 'a-z0-9' | cut -c1-8)" "$(rand_hex)"
 }
 
-create_instance() { # <id> <image> <teamKey> <flag>; prints the id
-  local id=$1 image=$2 team=$3 flag=$4 now expires spec code
+create_instance() { # <id> <image> <teamKey> <flag> [provider]; prints the id
+  local id=$1 image=$2 team=$3 flag=$4 provider=${5:-main} now expires spec code
   now=$(date +%s)
   expires=$(((now + 900) * 1000))
+  # The provider name is what the platform passes through to the guest: the
+  # lab runner uses "main" (flag lands at /run/rctf/flags/main), the event
+  # platform resolves the challenge's REGISTERED provider name verbatim, so
+  # challenge.yaml's "flags/static" sanitizes to /run/rctf/flags/flags_static.
+  # /app/start resolves both; the platform-path section below asserts the
+  # flags/static delivery end-to-end.
   spec=$(cat <<JSON
 {"id":"$id","teamKey":"$team","image":"$image","vcpus":1,"memMiB":256,"diskMiB":1024,
  "egress":false,"bootTimeoutSeconds":120,
@@ -226,7 +232,7 @@ create_instance() { # <id> <image> <teamKey> <flag>; prints the id
  "env":{"CHALLENGE":"sshole-yocto"},
  "expose":[{"kind":"tcp","hostPrefix":"ssholeyocto","port":22}],
  "expiresAtMs":$expires,
- "flags":[{"provider":"main","flag":"$flag"}]}
+ "flags":[{"provider":"$provider","flag":"$flag"}]}
 JSON
 )
   INSTANCE_IDS+=("$id")
@@ -487,6 +493,50 @@ else
   else
     bad 'isolation: second instance create was rejected'
   fi
+fi
+
+# --- platform flag-name delivery --------------------------------------------
+# Fail-closed integration check for the EVENT delivery path: at the event the
+# platform resolves the challenge's REGISTERED provider name verbatim, and
+# challenge.yaml registers "flags/static" (getFlagsForTeam ->
+# firecracker-instancer -> controller -> agent -> MMDS). The guest init
+# sanitizes the provider name to a file name ([A-Za-z0-9._-], '/' -> '_'), so
+# the platform-delivered flag lands at /run/rctf/flags/flags_static, NOT at
+# .../main. /app/start must still publish it through the normal challenge
+# path, and the two-prompt bypass must read the exact per-run flag.
+section 'platform flag-name delivery (provider flags/static)'
+id_p=$(instance_id 'plat')
+team_p=$(rand_hex)
+[ "${#team_p}" -ge 8 ] || team_p="${team_p}00000000"
+flag_p="rctf{sshole-yocto-platform-$(rand_hex)$(rand_hex)}"
+if create_instance "$id_p" sshole-yocto-musl "$team_p" "$flag_p" flags/static >/dev/null; then
+  if wait_running "$id_p" 240; then
+    ep_p=$(endpoint_of "$id_p")
+    host_p=${ep_p% *}
+    port_p=${ep_p#* }
+    ok "platform-path instance $id_p (provider flags/static) is running at $host_p:$port_p"
+    probe "$host_p" "$port_p" alice wrong-then-long 'cat /run/rctf/flag.txt'
+    expect_kind ACCEPT 'platform-path: bypass works on the flags/static instance'
+    got_fp=$(printf '%s\n' "$PROBE_OUT" | sed -n '1p' | sed 's/SSHOLE_STDOUT_END$//')
+    if [ "$got_fp" = "$flag_p" ]; then
+      ok 'platform-path: the flags/static-delivered flag is published byte-exact'
+    else
+      bad "platform-path: flag mismatch: got '${got_fp:-<empty>}' expected '$flag_p'"
+    fi
+    # And the published copy must be this instance's OWN flag, not any other
+    # live instance's (the instances above carry different per-run flags).
+    # Guarded expansions: earlier sections may legitimately have failed.
+    if [ "$got_fp" != "${flag:-}" ] && [ "$got_fp" != "${flag_b:-}" ] &&
+      [ "$got_fp" != "${FLAG_BY_IMAGE[sshole-yocto-musl]:-}" ]; then
+      ok 'platform-path: the published flag is this instance own, no other team flag leaked'
+    else
+      bad "platform-path: the published flag matches another instance's flag"
+    fi
+  else
+    bad 'platform-path: instance did not become ready'
+  fi
+else
+  bad 'platform-path: instance create was rejected'
 fi
 
 finish
