@@ -7,6 +7,12 @@ inside throwaway microVMs inside the throwaway `vmtest` QEMU VM. Nothing
 contacts third-party infrastructure, and no part of this directory is a
 production attack tool.
 
+The lab's visible web content is themed as the fictional **M364 outage
+service-credit portal** (see [Theming](#theming-m364-service-credit-portal)):
+a parody admin page for requesting an SLA credit after a Microsoft
+365–style outage. The theme is deliberately static-only, so the calibrated
+chain geometry is untouched.
+
 > **Authorized use only.** The chain is run against a local loopback target
 > inside a disposable VM that this harness creates and destroys. Do not point
 > the toolkit at systems you do not own or have written permission to test.
@@ -124,8 +130,11 @@ Only these paths are added to the image; everything else is the image's own:
 | `/etc/apache2/ports.conf`                     | `Listen 8080`                                                                                |
 | `/etc/apache2/conf-enabled/zz-php2shell.conf` | `KeepAlive Off`, one prefork worker                                                          |
 | `/etc/apache2/conf-enabled/zz-lab.conf`       | `DocumentRoot /www`, PHP handler for `/www`                                                  |
+| `/etc/apache2/conf-enabled/zz-m364.conf`      | `DirectoryIndex index.html index.php` — themed static page owns `/`                           |
 | `/usr/local/etc/php/conf.d/zz-php2shell.ini`  | laboratory php.ini (8M, no `log_errors`)                                                     |
 | `/www/index.php`, `/www/version.php`          | inert landing page; version + `memory_limit` for assertions                                  |
+| `/www/index.html`, `status.html`, `m364.css`  | M364 static theme (no PHP; identical in all three images)                                    |
+| `/www/incidents/EX2611-0442.html`           | static incident note (recon flag spot; the image ships it WITHOUT any flag)                   |
 | `/app/start`                                  | MMDS flag publish, `/www` ownership, `apache2-foreground`                                    |
 | `/usr/local/bin/{busybox,ip,nc}`              | boot-contract `ip route`/`ip link` (busybox from the sha256-verified shared smoke artifacts) |
 | `/rctf/{init,jq}`                             | installed by `guest/build-rootfs.sh`                                                         |
@@ -255,6 +264,158 @@ Stage 3 was also tried with the explicit deb13 "lab" layout
 the vessel variant's parameter range; those are recorded in `RESULTS.md` as
 ruled out for this image. The carrier layout is the calibrated one.
 
+## Theming (M364 service-credit portal)
+
+The lab's visible web content is themed as a parody Microsoft-style **M364
+outage service-credit portal** — the page a tenant admin would land on to
+request an SLA service credit after a Microsoft 365–style outage: an outage
+banner ("Exchange Online — degraded performance, incident `#EX2611-0442`"),
+a service-credit request form, an SLA percentage table, static status tiles
+and a footer with the fake incident number. All content is original (no
+vendor logos, no copied vendor text; "M364" is the event's own label), and
+every page footer self-labels the portal as a fictional training portal.
+
+The theme lives under the hard constraint of "Calibration and honest status"
+fact 3: **`/www/index.php` is allocation-inert AND is the chain target.**
+Any PHP allocation on the POST path — even a `session_start()` behind a
+request-method check — moves the allocator's free list and makes the
+4096-byte stage-1 Set-Cookie leak miss. Theming therefore obeys one rule:
+
+> **All themed pages are pure static files served by Apache; no PHP
+> execution may be involved in rendering the theme, and `index.php` stays
+> byte-identical.**
+
+Concretely:
+
+- `lab/www/index.php` is untouched (`<?php echo "OK\n";`, byte-identical,
+  enforced by `selftest.sh`). It remains the calibrated landing page and the
+  multipart POST target the chain drives.
+- The theme is `lab/www/index.html` (portal landing page), `status.html`
+  (static status tiles) and `m364.css`, all installed into the image as
+  plain static files by `build-oci.sh`'s shared `overlay_image`.
+- Making the theme own `/` requires **one Apache-config addition** — the
+  only one the theming strictly needs. The image's own
+  `conf-enabled/docker-php.conf` pins `DirectoryIndex index.php
+  index.html`, which keeps `GET /` on the inert `index.php` even when the
+  static `index.html` exists. `mod_dir` **accumulates** same-context
+  `DirectoryIndex` directives (Apache docs: multiple directives add to the
+  list; to replace it you must reset it first with the `disabled` token —
+  the idiom `docker-php.conf` itself uses), so the lab adds
+  `lab/m364-oci.conf` as `conf-enabled/zz-m364.conf` with
+
+  ```apache
+  DirectoryIndex disabled
+  DirectoryIndex index.html index.php
+  ```
+
+  which resets the accumulated list and pins the static page first, so
+  `GET /` serves the themed portal. No shipped conf is modified. (Both
+  facts were measured, not assumed: a run with only an appended
+  `DirectoryIndex index.html index.php` still served `OK\n` at `/`
+  because docker-php's `index.php` stayed ahead in the accumulated
+  walk order.)
+- This is heap-neutral for the chain: **no chain request resolves through
+  `mod_dir`.** Every exploit POST/GET addresses `/index.php` directly
+  (`run.sh` passes `-u http://127.0.0.1:$FWD_PORT/index.php`; the runner
+  probes `/version.php` and fetches `/p`), and a direct file URL never
+  consults `DirectoryIndex`. The only directory-URL request the runner
+  makes is its theme assertion `GET /`, which serves a static file with no
+  PHP execution.
+- The credit-request form is `method="post"
+  enctype="multipart/form-data"` with themed, innocuous field names
+  (`tenant_id`, `affected_workload`, `incident_date`,
+  `impact_description`, and a `usage_export` "attach supporting usage
+  export" file input). Its action is `/index.php` — the exact inert URL
+  the exploit POSTs its crafted multipart to, so the visible form is
+  literally the exploit surface. It is not `/`: under the re-pinned
+  order `POST /` resolves to the static `index.html`, a static file that
+  answers 405, so a form pointed at `/` would never reach PHP at all.
+- The same themed files and the same `zz-m364.conf` are installed
+  **identically into all three images** (vulnerable, patched, hardened) by
+  the shared overlay, so the controls stay true negative controls of the
+  same themed app. `run.sh` asserts `GET /` is byte-identical to
+  `lab/www/index.html` (sha256) on every image and that the form still
+  targets `/index.php`.
+- `version.php` is kept as-is: it is the runner's assertion surface and the
+  intentional player-facing version intel, linked as "System diagnostics"
+  from the themed footer.
+
+If a future pinned image ever changes the shipped `DirectoryIndex` order
+either way, the runner's `assert_theme` fails closed on exactly that
+instead of letting the theme drift. A theme change that adds PHP execution
+is a hard lab regression: `selftest.sh` rejects any PHP tags in the themed
+files.
+
+## Event registration and objective
+
+The lab ships TWO staged event records sharing the ONE image
+(`php2shell-vuln`; `staging-manifest.json` pins it once for both):
+
+- **`challenge.yaml` — `fc-m364-credit`** (the RCE stage): instancer
+  `firecracker`, one `https` expose (`hostPrefix: m364-credit`,
+  `containerName: app`, port 8080, `shouldDisplay: true`), readiness
+  `GET /` → 200 (the themed static page), `vcpus: 1`, `memMiB: 512`,
+  `diskMiB: 1536`. The per-run flag is published ONLY to
+  **`/run/flag.txt`** (tmpfs, outside the DocumentRoot; `GET /flag.txt`
+  answers 404) and the objective is to read it through the php2shell RCE.
+- **`challenge-recon.yaml` — `fc-m364-recon`** (the enumeration stage):
+  same image and sizing, `hostPrefix: m364-recon`. The per-run flag is
+  published ONLY into the unlinked static incident note
+  **`/incidents/EX2611-0442.html`** (an archived post-incident review the
+  player finds by enumerating the admin center — the incident id is
+  visible in the portal banner). `/run/flag.txt` is NOT written on this
+  record; the RCE path instead carries a documented non-flag sentinel.
+
+Both records' flags travel per-run over **MMDS only**; the shipped image
+contains no flag anywhere. The flag file name is resolved robustly because
+the two creators name it differently: the **lab runner** registers the
+provider as `main`, while the **rCTF platform** resolves the challenge's
+registered provider and passes it through verbatim — `flags/static` from
+the records — which the guest init sanitises to **`flags_static`**.
+`/app/start` resolves `main`, then `flags_static`, then the single file
+when exactly one exists; if nothing resolves, no flag is published and the
+runner's assertions fail loudly.
+
+**The env contract is the placement switch:** the instancer exports the
+record's `CHALLENGE` env verbatim, and `/app/start` reads it:
+`fc-m364-recon` → flag into the incident note (its swappable
+`M364-FLAG-SLOT` line, rewritten at boot by a static-file edit — no PHP)
+plus the sentinel on the RCE path; any other value (`fc-m364-credit`, or
+anything else) → flag only at `/run/flag.txt` and the incident note keeps
+its shipped non-flag text.
+
+The credit objective has one real constraint: the calibrated 167-byte
+carrier caps the chain's command at **14 bytes**, so the literal
+`cat /run/flag.txt>/www/p` (24 bytes) is rejected by the exploit itself.
+`/app/start` therefore exports **`F`** pointing at the objective, and the
+objective fits the budget: the recon payload `env>/www/p` reveals `F`,
+and `cat $F>/www/p` (13 bytes) reads it.
+
+One guest fact matters here (measured, see RESULTS.md): the frozen guest
+init mounts `/run` tmpfs **root-only** (`mode=0700`), so a `0644` file
+under it is unreadable by the www-data worker the chain executes as —
+`cat $F` silently produced empty proofs while `id`/`env`/`echo $F`
+succeeded. The service therefore opens traversal of the tmpfs root it
+publishes into (`chmod 0711 /run`): the raw flags directory `/run/rctf`
+(0700, init-owned) stays root-only, the flag bytes still live only on
+tmpfs, and only the published copy is reachable by known path. The frozen
+init itself is untouched; if the platform ever wants this cleaner, an
+init-level option for a service-readable publish mount would remove the
+service-side chmod (documented need, not implemented).
+
+`run.sh` asserts the full placement matrix fail-closed, for BOTH provider
+names (`main` and the raw platform string `flags/static`):
+`GET /flag.txt` and `GET /www/flag.txt` are 404 with no flag bytes
+everywhere; credit instances keep the incident note flag-free
+(`assert_incident_note_clean`), reveal `F` through the RCE without
+leaking the flag (`assert_chain_env_reveal`), and read the exact per-run
+flag through `$F` (`assert_chain_flag_read`); recon instances carry the
+exact per-run flag in the incident note (`assert_incident_flag`) and find
+the exact non-flag sentinel — never the flag — on the RCE path
+(`assert_chain_recon_intake`). The previous placement (`/www/flag.txt`)
+made `GET /flag.txt` hand the objective over plain HTTP with no exploit
+at all; that regression can no longer land silently.
+
 ## Requirements and cost
 
 - `/dev/kvm` readable/writable on the host, with nested virtualization enabled
@@ -287,12 +448,20 @@ ruled out for this image. The carrier layout is the calibrated one.
 | `lib.sh`                     | pinned constants, offsets/proof helpers, port allocation        |
 | `lab/apache-oci.conf`        | single-worker prefork policy for the official guest             |
 | `lab/lab-oci.conf`           | `/www` document root for the official guest                     |
+| `lab/m364-oci.conf`          | `DirectoryIndex` re-pin so the static theme owns `/`            |
 | `lab/php-oci.ini`            | official-guest laboratory php.ini (8M)                          |
 | `lab/php-oci-hardened.ini`   | official-guest hardened control (128M)                          |
-| `lab/www/index.php`          | allocation-inert landing page                                   |
+| `lab/www/index.php`          | allocation-inert landing page (byte-identical, never themed)    |
+| `lab/www/index.html`         | M364 themed static landing page (no PHP)                       |
+| `lab/www/status.html`        | M364 themed static status tiles (no PHP)                        |
+| `lab/www/m364.css`           | M364 theme stylesheet (static)                                 |
+| `lab/www/incidents/EX2611-0442.html` | unlinked static incident note (recon flag spot)         |
 | `lab/www/version.php`        | version + `memory_limit` for assertions                         |
-| `lab/app-start-oci`          | `/app/start`: flag publish + `apache2-foreground`               |
+| `lab/app-start-oci`          | `/app/start`: name-robust flag resolution + env-driven placement + `apache2-foreground` |
 | `lab/*` (source-build files) | Apache/PHP source-build lab configuration                       |
+| `challenge.yaml`            | event registration, credit stage (fc-m364-credit)               |
+| `challenge-recon.yaml`       | event registration, recon stage (fc-m364-recon)                |
+| `staging-manifest.json`      | event image staging manifest (files, sha256, sizes)            |
 | `RESULTS.md`                 | dated log of what actually ran                                  |
 
 ## Not done

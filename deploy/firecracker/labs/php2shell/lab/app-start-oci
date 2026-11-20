@@ -15,12 +15,86 @@ set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mkdir -p /www /tmp
 
+# --- flag resolution (lab "main", platform "flags_static"; see README) ---
 # Publish the per-instance flag (tmpfs, never baked into the image) so the
-# lab has a real objective: read it through the RCE.
-if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
-  cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
-  chmod 0644 /www/flag.txt
+# lab has a real objective. /run, NOT /www: /www is the Apache
+# DocumentRoot, so a flag copied there is served verbatim at /flag.txt
+# over plain HTTP (trivially solvable). The flag bytes live only on the
+# tmpfs.
+#
+# The guest init mounts /run tmpfs ROOT-ONLY (mode=0700: "private,
+# non-persistent /run" -- see the frozen guest contract). A 0644 file
+# under a 0700 root is unreadable by the www-data worker the chain
+# executes as (measured: `cat $F` and `ls /run` produced empty proofs
+# while `id`, `env` and `echo $F` proved the chain itself worked). Open
+# traversal of the tmpfs root this service publishes into: the raw
+# flags directory /run/rctf (0700, init-owned) stays root-only, so only
+# the published copy is reachable, by known path.
+chmod 0711 /run
+#
+# The flag SOURCE is resolved name-robustly: the lab runner registers the
+# provider as "main", but the rCTF platform resolves the challenge's
+# registered provider name and passes it through verbatim ("flags/static"
+# in challenge.yaml), which the guest init sanitises to "flags_static".
+# Order: "main", then "flags_static", then the single file in the flags
+# directory when exactly one exists. If nothing resolves, no flag is
+# published and the runner's flag assertions fail loudly.
+if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -d "$RCTF_FLAGS_DIR" ]; then
+  flag_src=
+  for cand in main flags_static; do
+    if [ -z "$flag_src" ] && [ -f "$RCTF_FLAGS_DIR/$cand" ]; then
+      flag_src=$RCTF_FLAGS_DIR/$cand
+    fi
+  done
+  if [ -z "$flag_src" ]; then
+    set -- "$RCTF_FLAGS_DIR"/*
+    if [ "$#" -eq 1 ] && [ -f "$1" ]; then
+      flag_src=$1
+    fi
+  fi
 fi
+# The staged records decide placement from the per-record CHALLENGE env
+# (the instancer exports it verbatim). fc-m364-recon: the flag is
+# published ONLY into the static incident note, and /run/flag.txt is NOT
+# written -- the RCE path must positively find a documented NON-flag
+# sentinel instead (an empty proof would be indistinguishable from a
+# probabilistic stage-3 miss). Any other value (fc-m364-credit, or
+# anything else): the flag is published ONLY to /run/flag.txt for the
+# RCE stage, and the incident note keeps its shipped non-flag text.
+M364_INTAKE_NOTE='M364 intake note: the credit reference for this incident is filed with the post-incident review.'
+if [ -n "$flag_src" ]; then
+  case "${CHALLENGE:-}" in
+    fc-m364-recon)
+      M364_FLAG_VALUE="$(cat "$flag_src")" awk '
+        index($0, "<!--M364-FLAG-SLOT-->") {
+          print "      <p class=\"note-flag\">Approved credit reference: " ENVIRON["M364_FLAG_VALUE"] "</p>"
+          next
+        }
+        { print }
+      ' /www/incidents/EX2611-0442.html >/www/incidents/.EX2611-0442.new &&
+        mv /www/incidents/.EX2611-0442.new /www/incidents/EX2611-0442.html &&
+        chmod 0644 /www/incidents/EX2611-0442.html
+      printf '%s' "$M364_INTAKE_NOTE" >/run/m364-intake.txt
+      chmod 0644 /run/m364-intake.txt
+      ;;
+    *)
+      cp "$flag_src" /run/flag.txt
+      chmod 0644 /run/flag.txt
+      ;;
+  esac
+fi
+# The objective pointer, mode-dependent: the calibrated 167-byte carrier
+# caps the RCE command at 14 bytes, so the literal path command cannot
+# be used. `env>/www/p` reveals the pointer and `cat $F>/www/p` reads
+# it. On the recon record F points at the documented non-flag sentinel,
+# which run.sh exact-matches; on the credit record it points at the
+# flag, exact-matched against the per-run MMDS value.
+case "${CHALLENGE:-}" in
+  fc-m364-recon) F_PATH=/run/m364-intake.txt ;;
+  *) F_PATH=/run/flag.txt ;;
+esac
+export F=$F_PATH
+# --- end flag resolution ---
 
 # The webroot must be writable by the worker for the out-of-band proof
 # (`id>/www/p`). The page files stay world-readable.

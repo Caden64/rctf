@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M364 service health &mdash; request a service credit</title>
+<link rel="stylesheet" href="/m364.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232b579a'/%3E%3Ctext x='8' y='12' font-size='9' font-family='sans-serif' font-weight='bold' fill='%23fff' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">M364</span>
+    <span class="brand-name">service health</span>
+  </div>
+  <nav class="topnav">
+    <a href="/status.html">Current status</a>
+    <a href="/">Credit requests</a>
+    <a href="/version.php" class="quiet">System diagnostics</a>
+  </nav>
+</header>
+
+<div class="advisory" role="alert">
+  <div class="advisory-head">
+    <span class="dot dot-amber" aria-hidden="true"></span>
+    <strong>Service advisory</strong>
+    &mdash; Exchange Online: degraded performance
+  </div>
+  <div class="advisory-body">
+    Incident <code>#EX2611-0442</code> (opened 2026-11-14&nbsp;02:07&nbsp;UTC) is affecting mail
+    flow and delivery latency for a subset of tenants. Impact is being tracked per-tenant.
+    Tenants with measurable impact may request a service credit using the form below.
+    <a href="/status.html">View current status &rarr;</a>
+  </div>
+</div>
+
+<main>
+  <section class="card">
+    <h1>Request a service credit</h1>
+    <p class="lede">
+      If your tenant recorded measurable impact during incident
+      <code>#EX2611-0442</code>, submit a credit request below. Submissions are validated
+      against your tenant&rsquo;s usage export; approved credits are applied to your next
+      invoice as a percentage of monthly fees, per the SLA schedule.
+    </p>
+
+    <form method="post" action="/index.php" enctype="multipart/form-data">
+      <fieldset>
+        <legend>Credit request</legend>
+
+        <label for="tenant-id">Tenant ID</label>
+        <input type="text" id="tenant-id" name="tenant_id"
+               placeholder="e.g. 9f3c1a77-64d2-4c0e-a1b2-77e2a4c9d011" required>
+
+        <label for="affected-workload">Affected workload</label>
+        <select id="affected-workload" name="affected_workload" required>
+          <option value="exchange-online-mail">Exchange Online &mdash; mail flow &amp; delivery</option>
+          <option value="exchange-online-cal">Exchange Online &mdash; calendars &amp; scheduling</option>
+          <option value="chat-meetings">Chat &amp; meetings</option>
+          <option value="files-sync">Files &amp; sync</option>
+          <option value="identity-signin">Identity &amp; sign-in</option>
+          <option value="admin-center">M364 admin center</option>
+        </select>
+
+        <label for="incident-date">Incident date</label>
+        <input type="date" id="incident-date" name="incident_date" value="2026-11-14" required>
+
+        <label for="impact-description">Impact description</label>
+        <textarea id="impact-description" name="impact_description" rows="5"
+                  placeholder="Describe the user-visible impact: queues, deferred mail, failed sign-ins, sync backlogs&hellip;"
+                  required></textarea>
+
+        <label for="usage-export">Attach supporting usage export</label>
+        <input type="file" id="usage-export" name="usage_export"
+               accept=".csv,.json,.zip,text/csv,application/json">
+        <p class="hint">One usage export per request. Requests without a usage export
+           take longer to validate.</p>
+
+        <button type="submit">Submit credit request</button>
+      </fieldset>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>SLA credit schedule</h2>
+    <table>
+      <thead>
+        <tr><th>Monthly availability</th><th>Service credit</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Greater than or equal to 99.9%</td><td>No credit</td></tr>
+        <tr><td>99.5% to less than 99.9%</td><td>10% of monthly fees</td></tr>
+        <tr><td>99.0% to less than 99.5%</td><td>25% of monthly fees</td></tr>
+        <tr><td>Less than 99.0%</td><td>50% of monthly fees</td></tr>
+      </tbody>
+    </table>
+    <p class="hint">
+      Availability is measured per workload, per calendar month, from the service&rsquo;s
+      own telemetry. Percentages shown are the illustrative schedule of this training
+      portal; they are not a contractual commitment.
+    </p>
+  </section>
+</main>
+
+<footer class="foot">
+  <div>
+    Incident <code>#EX2611-0442</code> &middot; tracking ref <code>INC0044128</code>
+    &middot; advisory updated 2026-11-18&nbsp;23:50&nbsp;UTC
+  </div>
+  <div class="foot-note">
+    M364 is a fictional service-health training portal. It is not affiliated with,
+    endorsed by, or connected to any real service provider.
+  </div>
+</footer>
+</body>
+</html>

@@ -350,29 +350,54 @@ api "/v1/info" | jq -c '.images' | grep -q 'php2shell-vuln' ||
 # ---------------------------------------------------------------------------
 # 4. Instance + readiness + tunnel
 # ---------------------------------------------------------------------------
-make_spec() { # make_spec <file> <id> <image>
-  local file=$1 id=$2 image=$3
+# The lab's placeholder flag (never a real secret): it is handed to the
+# instance through the agent API, reaches the guest over MMDS only, and is
+# published by /app/start to /run/flag.txt -- tmpfs, OUTSIDE the Apache
+# DocumentRoot. The runner proves the challenge objective end to end:
+# the flag is NOT web-served (assert_flag_http_absent) and IS readable
+# through the RCE (assert_chain_flag_read, `cat $F>/www/p`).
+FLAG='rctf{php2shell-lab-not-a-real-flag}'
+# The recon record's documented non-flag sentinel: /app/start writes it to
+# /run/m364-intake.txt on recon-named instances and exports F pointing at
+# it, so the "RCE finds no flag" negative is positively verifiable (an
+# empty proof would be indistinguishable from a probabilistic stage-3
+# miss). Byte-matched against lab/app-start-oci and lab/app-start.
+RECON_INTAKE_NOTE='M364 intake note: the credit reference for this incident is filed with the post-incident review.'
+# The unlinked static incident note: the fc-m364-recon record's
+# enumeration spot (the incident id is visible in the portal banner).
+INCIDENT_NOTE_URL=incidents/EX2611-0442.html
+
+make_spec() { # make_spec <file> <id> <image> [provider] [challenge]
+  local file=$1 id=$2 image=$3 provider=${4:-main} challenge=${5:-fc-m364-credit}
+  # The flag provider name: the lab default is "main"; the platform path
+  # passes the challenge's registered provider ("flags/static") through
+  # verbatim, and the guest init sanitises it to "flags_static" -- which
+  # app-start resolves. The CHALLENGE env is the per-record placement
+  # switch the guest /app/start reads (fc-m364-credit -> /run/flag.txt;
+  # fc-m364-recon -> the static incident note + non-flag sentinel). See
+  # sections 5b/5c of this runner.
   jq -n \
-    --arg id "$id" --arg image "$image" \
+    --arg id "$id" --arg image "$image" --arg flag "$FLAG" \
+    --arg provider "$provider" --arg challenge "$challenge" \
     --argjson expires "$((($(date +%s) + 3600) * 1000))" '
     {
       id: $id, teamKey: "0123456789ab", image: $image,
       vcpus: 1, memMiB: 256, diskMiB: 1024, egress: false,
       bootTimeoutSeconds: 180,
       readiness: {kind: "tcp", port: 8080},
-      env: {CHALLENGE: "php2shell"},
+      env: {CHALLENGE: $challenge},
       expose: [{kind: "tcp", hostPrefix: "web", port: 8080}],
       expiresAtMs: $expires,
-      flags: [{provider: "main", flag: "rctf{php2shell-lab-not-a-real-flag}"}]
+      flags: [{provider: $provider, flag: $flag}]
     }' >"$file"
 }
 
-start_instance() { # start_instance <image> <suffix>; prints id
-  local image=$1 suffix=$2 id spec code
+start_instance() { # start_instance <image> <suffix> [provider] [challenge]; prints id
+  local image=$1 suffix=$2 provider=${3:-main} challenge=${4:-fc-m364-credit} id spec code
   id="p2s${RUN_ID//[^a-z0-9]/}${suffix}"
   id=${id:0:62}
   spec=$(mktemp "${TMPDIR:-/tmp}/p2s-spec.XXXXXX")
-  make_spec "$spec" "$id" "$image"
+  make_spec "$spec" "$id" "$image" "$provider" "$challenge"
   code=$(api_code PUT "/v1/instances/$id" "$spec")
   rm -f "$spec"
   case "$code" in
@@ -435,6 +460,84 @@ assert_target() { # assert_target <php-version> <memory-limit> <label>
   [ "$ver" = "$want_ver" ] || fail "$label serves PHP '$ver', expected $want_ver"
   [ "$lim" = "$want_lim" ] || fail "$label has memory_limit '$lim', expected $want_lim"
   say "target serves PHP $ver, memory_limit=$lim"
+}
+
+# The visible theme is served by Apache as a STATIC file and must be
+# byte-identical to the repository's lab/www/index.html on EVERY image: the
+# three images differ only in PHP version / memory_limit, never in visible
+# content, so the controls stay true negative controls of the same themed app.
+# The page must also keep its multipart credit form pointed at the inert
+# /index.php -- the exact URL the chain POSTs its crafted multipart to. The
+# theme itself is pure static content (no PHP execution), so this GET is
+# session-neutral and cannot disturb the warmed-state leak methodology (the
+# runner primes before every leak/chain assertion regardless).
+assert_theme() { # assert_theme <label>
+  local label=$1 want got
+  want=$(sha256_of "$LAB_DIR/lab/www/index.html")
+  got=$(vm_ssh "curl -fsS --max-time 10 -o /tmp/p2s-theme.html \
+    http://127.0.0.1:$FWD_PORT/ && sha256sum /tmp/p2s-theme.html | cut -d' ' -f1") ||
+    fail "$label: the themed landing page is not reachable at /"
+  [ "$got" = "$want" ] ||
+    fail "$label: GET / does not serve lab/www/index.html byte-for-byte (sha256 $got, expected $want)"
+  vm_ssh "grep -q 'action=\"/index.php\"' /tmp/p2s-theme.html" ||
+    fail "$label: the themed page lost its multipart form target"
+  say "PASS: $label serves the themed static landing page at / (byte-identical to lab/www/index.html)"
+}
+
+# The deployed objective depends on the flag NOT being web-served: /app/start
+# publishes it to /run/flag.txt (tmpfs, OUTSIDE the /www DocumentRoot), so a
+# plain GET must answer 404 and must never contain the flag bytes. A flag
+# inside /www would be served verbatim at /flag.txt over plain HTTP and make
+# the event challenge trivially solvable (regression check for the old
+# /www/flag.txt placement). Both URL shapes are probed: /flag.txt (the old
+# DocumentRoot placement) and /www/flag.txt (which could only resolve if a
+# /www/www directory or alias ever appeared).
+assert_flag_http_absent() { # assert_flag_http_absent <label> <url-path>
+  local label=$1 upath=$2 code body
+  code=$(vm_ssh "curl -s --max-time 10 -o /tmp/p2s-flagprobe -w '%{http_code}' \
+    http://127.0.0.1:$FWD_PORT/$upath") ||
+    fail "$label: could not probe /$upath over the forward"
+  [ "$code" -eq 404 ] ||
+    fail "$label: /$upath answered HTTP $code (expected 404: the flag must never be web-served)"
+  body=$(vm_ssh 'cat /tmp/p2s-flagprobe 2>/dev/null') || body=
+  case "$body" in
+    *"$FLAG"*) fail "$label: the per-run flag was served over plain HTTP at /$upath" ;;
+  esac
+  say "PASS: $label: /$upath answers 404 and never serves the flag"
+}
+
+# The unlinked static incident note is the fc-m364-recon record's
+# enumeration spot (/incidents/EX2611-0442.html; the incident id is
+# visible in the portal banner). On CREDIT-named instances it must stay
+# the shipped non-flag page -- the flag lives only at /run/flag.txt there.
+assert_incident_note_clean() { # assert_incident_note_clean <label>
+  local label=$1 code body
+  code=$(vm_ssh "curl -s --max-time 10 -o /tmp/p2s-incident.html -w '%{http_code}' \
+    http://127.0.0.1:$FWD_PORT/$INCIDENT_NOTE_URL") ||
+    fail "$label: could not fetch the incident note"
+  [ "$code" -eq 200 ] ||
+    fail "$label: the incident note answered HTTP $code (expected the shipped static page)"
+  body=$(vm_ssh 'cat /tmp/p2s-incident.html 2>/dev/null') || body=
+  case "$body" in
+    *"$FLAG"*) fail "$label: the incident note carries the per-run flag (credit placement is broken)" ;;
+  esac
+  say "PASS: $label: the incident note is the shipped non-flag page"
+}
+
+# On RECON-named instances the delivered flag is published ONLY into that
+# static note (rewritten at boot by /app/start; the shipped image carries
+# no flag), and it must be exactly the per-run MMDS value.
+assert_incident_flag() { # assert_incident_flag <label>
+  local label=$1 code body
+  code=$(vm_ssh "curl -s --max-time 10 -o /tmp/p2s-incident.html -w '%{http_code}' \
+    http://127.0.0.1:$FWD_PORT/$INCIDENT_NOTE_URL") ||
+    fail "$label: could not fetch the incident note"
+  [ "$code" -eq 200 ] ||
+    fail "$label: the incident note answered HTTP $code (recon placement is broken)"
+  body=$(vm_ssh 'cat /tmp/p2s-incident.html 2>/dev/null') || body=
+  printf '%s' "$body" | grep -Fq "$FLAG" ||
+    fail "$label: the incident note does not contain the per-run flag (recon placement is broken)"
+  say "PASS: $label: the incident note carries the per-run flag (recon placement)"
 }
 
 stage_toolkit() {
@@ -515,15 +618,16 @@ assert_leaks_absent() { # <image> <label>
   say "PASS: $2: both leak primitives are absent"
 }
 
-run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
-  local image=$1 huge=${2:-12} zif dtor
+run_chain() { # run_chain <image> [huge-mb] [command]; prints the chain transcript
+  local image=$1 huge=${2:-12} cmd=${3:-id>/www/p} zif dtor
   read_offsets "$IMAGES/$image" || fail "no usable offsets for $image"
   zif=$ZIF_OFFSET
   dtor=$DTOR_OFFSET
   # The parameters are the measured profile values (or explicit env
   # overrides). chain.py forwards --htdata-offset, which the toolkit launcher
   # does not expose, and disables docker offset auto-detection. Stage 3 uses
-  # the toolkit's carrier branch for the official image.
+  # the toolkit's carrier branch for the official image. The command defaults
+  # to the calibrated proof payload; the flag-read assertion passes its own.
   vm_ssh "P2S_STAGE1_N=$STAGE1_N P2S_FORGE_LEN=$FORGE_LEN \
     P2S_STAGE2_T=$STAGE2_T P2S_STAGE2_V=$STAGE2_V $STAGE3_ENV \
     timeout 900 python3 /tmp/p2s/lab/chain.py \
@@ -531,7 +635,7 @@ run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
       --toolkit /tmp/p2s/toolkit --repo-dir /tmp/p2s/upstream-legacy \
       --zif-offset $zif --dtor-offset $dtor \
       --htdata-offset ${STAGE3_HTDATA:-0x690d8} \
-      --profile bookworm --command 'id>/www/p' --fetch /p \
+      --profile bookworm --command '$cmd' --fetch /p \
       --retries ${P2S_CHAIN_LEAK_RETRIES:-3} --huge-mb $huge"
 }
 
@@ -566,6 +670,143 @@ assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
     return 1
   }
   say "PASS: $label executes id as $(printf '%s' "$body" | head -1)"
+  return 0
+}
+
+# Failure diagnostics for the flag objective (fail path only): capture the
+# guest ground truth through the same proof channel, within the 14-byte
+# carrier budget. The first re-runs the exact failing payload (one more
+# probabilistic attempt: if it proves, the earlier failure was chance);
+# the second shows the objective pointer in the executing worker. Each
+# diagnostic is a full chain run, so they only fire when the flag read
+# has already failed; their output is printed into the transcript so
+# RESULTS.md can record the measured reason, not a guess.
+flag_diag() { # flag_diag <image> <label> <cmd>
+  local image=$1 label=$2 dcmd=$3 out rc body
+  prime_target "$label diagnostic"
+  out=$(run_chain "$image" 12 "$dcmd")
+  rc=$?
+  body=
+  if [ "$rc" -eq 0 ]; then
+    body=$(proof_body 2>/dev/null) || body=
+  fi
+  say "DIAG '$dcmd' rc=$rc body='$(printf '%s' "$body" | tr '\n' ' ' | head -c 300)'"
+}
+
+flag_read_diagnostics() { # flag_read_diagnostics <image> <label>
+  local image=$1 label=$2
+  flag_diag "$image" "$label" 'cat $F>/www/p'
+  flag_diag "$image" "$label" 'echo $F>/www/p'
+}
+
+# The challenge objective, end to end: the per-run MMDS flag is published to
+# /run/flag.txt (tmpfs, outside DocumentRoot; see assert_flag_http_absent),
+# and the RCE -- which executes as www-data -- must be able to read it. The
+# proof rides the established mechanism with a payload that fits the
+# calibrated carrier's 14-byte command budget (the 167-byte fake HashTable
+# caps --cmd at 14 bytes; the literal 24-byte `cat /run/flag.txt>/www/p` is
+# rejected by the exploit itself, measured in run 20261119-190956):
+# app-start exports F=/run/flag.txt, so the payload is `cat $F>/www/p`
+# (13 bytes), fetched over HTTP from /p and exact-matched against the flag
+# this runner handed to the instance through the agent API (MMDS).
+assert_chain_flag_read() { # <image> <label>; 0 only on the exact flag match
+  local image=$1 label=$2 out rc body
+  prime_target "$label flag-read chain"
+  out=$(run_chain "$image" 12 'cat $F>/www/p')
+  rc=$?
+  say "$out"
+  if [ "$rc" -ne 0 ]; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: flag-read chain did not complete)"
+    return 1
+  fi
+  if ! printf '%s' "$out" | grep -q '^PROOF:'; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: flag-read chain printed no PROOF line)"
+    return 1
+  fi
+  body=$(proof_body) || {
+    say "  ($label: could not fetch /p)"
+    return 1
+  }
+  # `cat` of the byte-exact flag file; tolerate only line endings.
+  body=$(printf '%s' "$body" | tr -d '\r\n')
+  if [ "$body" != "$FLAG" ]; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: /p did not contain the per-run flag: $body)"
+    return 1
+  fi
+  say "PASS: $label reads the per-run flag from /run/flag.txt through the RCE"
+  return 0
+}
+
+# The objective pointer must be discoverable through the RCE as well: the
+# recon payload `env>/www/p` (9 bytes -- the same length as the calibrated
+# `id>/www/p`) dumps the worker environment, which must reveal F pointing
+# at the flag file. This proves the documented player path (dump env, read
+# $F) instead of assuming it. The dump must NOT contain the flag itself.
+assert_chain_env_reveal() { # <image> <label>
+  local image=$1 label=$2 out rc body
+  prime_target "$label env-reveal chain"
+  out=$(run_chain "$image" 12 'env>/www/p')
+  rc=$?
+  say "$out"
+  [ "$rc" -eq 0 ] || {
+    say "  ($label: env-reveal chain did not complete)"
+    return 1
+  }
+  printf '%s' "$out" | grep -q '^PROOF:' || {
+    say "  ($label: env-reveal chain printed no PROOF line)"
+    return 1
+  }
+  body=$(proof_body) || {
+    say "  ($label: could not fetch /p)"
+    return 1
+  }
+  printf '%s' "$body" | grep -q 'F=/run/flag.txt' || {
+    say "  ($label: the worker env does not reveal F=/run/flag.txt)"
+    return 1
+  }
+  case "$body" in
+    *"$FLAG"*) fail "$label: the env dump contains the flag itself" ;;
+  esac
+  say "PASS: $label reveals the objective pointer F=/run/flag.txt through the RCE"
+  return 0
+}
+
+# Recon placement separation, positively verified: on a recon-named
+# instance the chain still fires (www-data, full RCE), but $F resolves to
+# the documented non-flag sentinel -- the exact-match proves both that the
+# RCE works and that the flag is NOT on the RCE path. Requiring a
+# non-empty, exact-match proof rules out a probabilistic stage-3 miss
+# masquerading as a negative.
+assert_chain_recon_intake() { # <image> <label>; 0 only on the exact sentinel match
+  local image=$1 label=$2 out rc body
+  prime_target "$label recon-intake chain"
+  out=$(run_chain "$image" 12 'cat $F>/www/p')
+  rc=$?
+  say "$out"
+  if [ "$rc" -ne 0 ]; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: recon-intake chain did not complete)"
+    return 1
+  fi
+  if ! printf '%s' "$out" | grep -q '^PROOF:'; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: recon-intake chain printed no PROOF line)"
+    return 1
+  fi
+  body=$(proof_body) || {
+    say "  ($label: could not fetch /p)"
+    return 1
+  }
+  body=$(printf '%s' "$body" | tr -d '\r\n')
+  if [ "$body" != "$RECON_INTAKE_NOTE" ]; then
+    flag_read_diagnostics "$image" "$label"
+    say "  ($label: the RCE path did not yield the documented intake note: $body)"
+    return 1
+  fi
+  say "PASS: $label: the RCE finds the non-flag intake note at \$F, not the flag"
   return 0
 }
 
@@ -607,6 +848,15 @@ start_tunnel "$GIP"
 stage_toolkit
 
 assert_target "$PHP_VULN" 8M "vulnerable image"
+assert_theme "vulnerable image"
+# The flag must never be web-served: the old placement (/www/flag.txt) made
+# GET /flag.txt hand the objective over plain HTTP. Both static-404 probes
+# run BEFORE the leak assertions; they serve no PHP and disturb nothing.
+assert_flag_http_absent "vulnerable image" flag.txt
+assert_flag_http_absent "vulnerable image" www/flag.txt
+# Credit placement: the flag lives ONLY at /run/flag.txt; the incident
+# note must stay the shipped non-flag page.
+assert_incident_note_clean "vulnerable image"
 
 say "==> asserting the CVE memory-safety primitives (stages 1-2)"
 assert_leaks_present php2shell-vuln "vulnerable PHP $PHP_VULN"
@@ -619,6 +869,21 @@ if [ "$RCE_ENABLED" = 1 ]; then
     if assert_chain_green php2shell-vuln "vulnerable PHP $PHP_VULN"; then GREEN=1; break; fi
   done
   [ "$GREEN" = 1 ] || fail "the calibrated chain did not produce the web-uid proof"
+  say "==> proving the challenge objective: the RCE must read the per-run flag"
+  ENVGREEN=0
+  for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+    say "env-reveal chain attempt $attempt/$P2S_CHAIN_RETRIES"
+    if assert_chain_env_reveal php2shell-vuln "vulnerable PHP $PHP_VULN"; then ENVGREEN=1; break; fi
+  done
+  [ "$ENVGREEN" = 1 ] ||
+    fail "the chain did not reveal the objective pointer F through the RCE"
+  FLAGGREEN=0
+  for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+    say "flag-read chain attempt $attempt/$P2S_CHAIN_RETRIES"
+    if assert_chain_flag_read php2shell-vuln "vulnerable PHP $PHP_VULN"; then FLAGGREEN=1; break; fi
+  done
+  [ "$FLAGGREEN" = 1 ] ||
+    fail "the chain could not read the per-run flag from /run/flag.txt"
 else
   say "==> stage 3 is NOT CALIBRATED: the RCE is not run and not asserted"
   [ "${P2S_REQUIRE_RCE:-0}" = 1 ] &&
@@ -629,6 +894,86 @@ vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
 TUNNEL_PID=
 
 # ---------------------------------------------------------------------------
+# 5b. Platform-name delivery: the event registers the flag provider as
+#     "flags/static"; rCTF passes that name through verbatim and the guest
+#     init sanitises it to "flags_static" -- NOT the lab runner's "main".
+#     /app/start resolves any delivery name (main, flags_static, or the
+#     single flags file). Prove the platform path end to end: a second
+#     vulnerable instance created exactly the way the platform would
+#     create it, asserting the same themed app, the same not-web-served
+#     negative, and the same RCE flag-read objective.
+# ---------------------------------------------------------------------------
+if [ "$RCE_ENABLED" = 1 ]; then
+  say "==> creating the platform-named flag instance (provider flags/static)"
+  FID=$(start_instance php2shell-vuln f flags/static) ||
+    fail "platform-named instance failed"
+  say "platform-named instance: $FID"
+  GIP=$(guest_ip "$FID")
+  [ -n "$GIP" ] || fail "no guest IP for $FID"
+  say "guest endpoint: $GIP:8080 (forwarded on 127.0.0.1:$FWD_PORT inside the VM)"
+  start_tunnel "$GIP"
+  assert_target "$PHP_VULN" 8M "platform-named image"
+  assert_theme "platform-named image"
+  assert_flag_http_absent "platform-named image" flag.txt
+  assert_flag_http_absent "platform-named image" www/flag.txt
+  assert_incident_note_clean "platform-named image"
+  say "==> platform path: the RCE objective must read the flags_static-delivered flag"
+  PLATGREEN=0
+  for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+    say "platform flag-read chain attempt $attempt/$P2S_CHAIN_RETRIES"
+    if assert_chain_flag_read php2shell-vuln "platform-named image"; then PLATGREEN=1; break; fi
+  done
+  [ "$PLATGREEN" = 1 ] ||
+    fail "the platform-named instance did not read its flag from /run/flag.txt"
+  api_code DELETE "/v1/instances/$FID" >/dev/null 2>&1 || true
+  vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
+  TUNNEL_PID=
+else
+  say "==> stage 3 not calibrated: the platform-name delivery check is skipped"
+fi
+
+# ---------------------------------------------------------------------------
+# 5c. Recon-stage placement (fc-m364-recon): the second staged record
+#     publishes the delivered flag ONLY into the unlinked static incident
+#     note (/incidents/EX2611-0442.html), leaves /run/flag.txt unwritten
+#     and puts the documented non-flag sentinel on the RCE path ($F).
+#     Both flag-delivery provider names are exercised.
+# ---------------------------------------------------------------------------
+if [ "$RCE_ENABLED" = 1 ]; then
+  for rspec in "main r" "flags/static w"; do
+    read -r rprovider rsuffix <<<"$rspec"
+    say "==> creating the recon-named instance (provider $rprovider, env fc-m364-recon)"
+    RID=$(start_instance php2shell-vuln "$rsuffix" "$rprovider" fc-m364-recon) ||
+      fail "recon-named instance ($rprovider) failed"
+    say "recon-named instance: $RID"
+    GIP=$(guest_ip "$RID")
+    [ -n "$GIP" ] || fail "no guest IP for $RID"
+    start_tunnel "$GIP"
+    assert_target "$PHP_VULN" 8M "recon image ($rprovider)"
+    assert_theme "recon image ($rprovider)"
+    assert_flag_http_absent "recon image ($rprovider)" flag.txt
+    assert_flag_http_absent "recon image ($rprovider)" www/flag.txt
+    assert_incident_flag "recon image ($rprovider)"
+    say "==> recon path: the RCE must find the non-flag intake note, not the flag"
+    RECONGREEN=0
+    for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+      say "recon intake chain attempt $attempt/$P2S_CHAIN_RETRIES"
+      if assert_chain_recon_intake php2shell-vuln "recon image ($rprovider)"; then
+        RECONGREEN=1
+        break
+      fi
+    done
+    [ "$RECONGREEN" = 1 ] ||
+      fail "the recon-named instance ($rprovider) did not verify its non-flag RCE path"
+    api_code DELETE "/v1/instances/$RID" >/dev/null 2>&1 || true
+    vm_ssh "kill $TUNNEL_PID" >/dev/null 2>&1 || true
+    TUNNEL_PID=
+  done
+else
+  say "==> stage 3 not calibrated: the recon placement checks are skipped"
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Negative control A: fixed PHP 8.4.27
 # ---------------------------------------------------------------------------
 say "==> control A: patched PHP $PHP_FIXED"
@@ -636,6 +981,7 @@ PID=$(start_instance php2shell-patched p) || fail "patched instance failed"
 GIP=$(guest_ip "$PID")
 start_tunnel "$GIP"
 assert_target "$PHP_FIXED" 8M "patched image"
+assert_theme "patched image"
 say "==> control A: the leak primitives must be absent"
 assert_leaks_absent php2shell-patched "patched PHP $PHP_FIXED"
 assert_chain_negative php2shell-patched "patched PHP $PHP_FIXED"
@@ -651,6 +997,7 @@ HID=$(start_instance php2shell-hardened h) || fail "hardened instance failed"
 GIP=$(guest_ip "$HID")
 start_tunnel "$GIP"
 assert_target "$PHP_VULN" 128M "hardened image"
+assert_theme "hardened image"
 say "==> control B: at its configured limit the 12M OOM field cannot fire,"
 say "    so the stale-id leak must be absent and the chain must fail closed"
 assert_leaks_absent php2shell-hardened "hardened php.ini"
