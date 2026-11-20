@@ -1,5 +1,72 @@
 # sshole-yocto — results
 
+## 2026-11-19 (19:16) — provider-name-robust flag delivery, FINAL PASS run
+
+Post-completion deployment review found a real integration bug, fixed and
+re-verified the same day: the lab created instances with
+`flags: [{provider: "main"}]`, and `/app/start` republished
+`$RCTF_FLAGS_DIR/main` — but at the EVENT, rCTF resolves the challenge's
+REGISTERED provider name verbatim (challenge.yaml: `flags/static`) and the
+guest init sanitizes `[^A-Za-z0-9._-]` → `_`, so the platform-delivered flag
+lands at `/run/rctf/flags/flags_static` and would sit unread.
+
+Fix (challenge-side only, no platform change, no frozen paths touched):
+
+- `/app/start` now resolves the flag source name-robustly (`pick_flag_src`):
+  `main` first (lab runner path), then `flags_static` (platform path), then
+  the directory's single file; a flagless boot still publishes nothing and
+  starts the service. Nothing else in the image changed.
+- `inner.sh` gained a fail-closed platform-path section: a real instance
+  created over the agent API with `provider: "flags/static"` (exactly what
+  the platform passes at the event) whose two-prompt bypass must read the
+  exact per-run flag from `/run/rctf/flag.txt`, and that flag must be this
+  instance's own. The existing `main`-based instances are unchanged.
+- `selftest.sh` grew 7 checks that extract the REAL `pick_flag_src` from the
+  committed `app-start` by name and test the ordering (main-only,
+  flags_static-only, both → main wins, single-file fallback, ambiguous →
+  nothing, flagless → nothing, missing dir → nothing).
+
+Commands and outcomes (all on 2026-11-19, host quiet, nothing overlapped):
+
+- `./yocto-build.sh --tclib musl && ./yocto-build.sh --tclib glibc &&
+  SSHOLE_YOCTO_SKIP_BITBAKE=1 ./build.sh` — **green** (2854 + 2872 tasks,
+  all succeeded; both images rebuilt and restaged with the new app-start).
+- `./selftest.sh` — **PASS, 21 checks / 0 failures**, exit 0.
+- `./run.sh` — **`SSHOLE_YOCTO RESULT: PASS`, 37 passed / 0 failed**,
+  exit 0, VM destroyed, overlay removed. Transcript:
+  `~/.cache/rctf-sshole-yocto/logs/run-20261119-191644-164371.log`.
+
+New checks observed in the green run (the other 33 are unchanged and still
+green, including the main-provider flag path on the musl image):
+
+- `platform-path instance … (provider flags/static) is running at
+  192.0.2.1:30003`
+- `platform-path: bypass works on the flags/static instance (ACCEPT)`
+- `platform-path: the flags/static-delivered flag is published byte-exact`
+- `platform-path: the published flag is this instance own, no other team
+  flag leaked`
+
+**Deployment re-pin (the old musl pin `eb3fc209…` now fails validation by
+design — the image content changed):**
+
+| Image               | rootfs.ext4 sha256 (this build, the pin)                          | size        |
+| ------------------- | ------------------------------------------------------------------ | ----------- |
+| `sshole-yocto-musl` | `b9f66eed6aef1507646b2706c7cc489a1fb0284f0dae9cafee23b9af277a3aba` | 268435456 B (256 MiB) |
+| `sshole-yocto-glibc`| `4ceb99dc09bbe4554fa537d1b7ba9f5f05319cb8a308e981ebf1689194d74684` | 268435456 B (256 MiB) |
+
+vmlinux unchanged: `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`
+(shared smoke kernel). Versions unchanged: bitbake 2.18.0, openssh 10.3p1,
+musl 1.2.6+git, glibc 2.43+git, busybox 1.37.0, DISTRO_VERSION 6.0.4; the
+full manifest is at `~/.cache/rctf-sshole-yocto/images/manifest.txt`.
+
+NOT RUN (this fix): the platform controller itself was not exercised (no
+controller/scheduler at the lab); the `flags/static` delivery was proven by
+creating the instance over the real agent API with the platform's provider
+name, which is the exact contract boundary the platform hands to the
+instancer. A flagless boot (`flags: []`) was not re-run in the VM; the
+flagless behavior is covered by the selftest's resolution checks plus the
+guest contract's own test suite.
+
 ## 2026-11-19 — full nested run on the development machine (FINAL, PASS)
 
 Executed for real with `/dev/kvm` available; nothing privileged ran on the
@@ -24,6 +91,10 @@ host. All commands were run from
   DNAT endpoints.
 
 ### Images built (unprivileged, genuine Yocto)
+
+> NOTE: the digests in this section are from the FIRST green run
+> (18:41). The provider-name fix changed the image; the current
+> deployment pin is the one in the 19:16 section above.
 
 `./build.sh` ran the pinned `yocto-build.sh` (bitbake 2.18.0, poky
 yocto-6.0.4 assembled from the three publisher `.sha256sum`-cross-checked
