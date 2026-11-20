@@ -243,6 +243,15 @@ assert_common_guest() { # <root> <image> <libc>
     die "$image: no busybox 'ip' applet found (MMDS route setup would fail)"
   printf '%s\n' "$found" | grep -qx '.*/nc' ||
     die "$image: no busybox 'nc' applet found (MMDS fetch would fail)"
+  # The nc applet must accept `-w`: the frozen guest init fetches MMDS with
+  # `nc -w <timeout> <host> <port>`, and the minimal stock nc rejects it (a
+  # real Firecracker boot showed the usage-error loop; see RESULTS.md). The
+  # guarantee is enforced INSIDE the pinned bitbake build: the yocto/meta-
+  # sshhole busybox bbappend fails busybox's do_configure unless the merged
+  # .config carries CONFIG_NC_EXTRA=y. There is deliberately no byte-level
+  # re-check here: poky's defconfig sets CONFIG_FEATURE_COMPRESS_USAGE, so
+  # the compiled usage strings are a gzip blob in the binary and `strings`
+  # cannot observe them.
 
   # No host key material may be baked into the image (generated at boot).
   if find "$root/etc/ssh" -name 'ssh_host_*' -print -quit | grep -q .; then
