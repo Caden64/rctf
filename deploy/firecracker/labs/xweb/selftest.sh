@@ -101,28 +101,65 @@ s.close()
 PY
 }
 
-# start_portal <variant vuln|patched> <flag-or-empty>
+selftest_hex() { od -An -N4 -tx1 /dev/urandom | tr -d ' \n'; }
+
+# start_portal <variant vuln|patched> <case>
+#   case determines which flag-delivery name(s) exist in $RCTF_FLAGS_DIR:
+#     main   -> flags/main                      (the lab runner provider name)
+#     static -> flags/flags_static              (the platform provider name:
+#               the challenge registers `flags/static`, the guest init
+#               sanitises it to `flags_static`)
+#     other  -> flags/factory_override only     (single-file fallback)
+#     both   -> flags/main AND flags/flags_static with DIFFERENT values
+#               (main must win; the other value must never appear)
+#     multi  -> two unrecognised junk files     (ambiguous -> flagless)
+#     none   -> empty directory                 (flagless)
 start_portal() {
-  local variant=$1 flag=$2 port appdir
-  appdir=$WORK/app-$variant-$flag
+  local variant=$1 case=$2 port appdir flags
+  appdir=$WORK/app-$variant-$case
   mkdir -p "$appdir"
   cp "$APP/xweb_common.py" "$appdir/xweb_common.py"
   cp "$APP/xweb_auth_$variant.py" "$appdir/xweb_auth.py"
-  local flags=$WORK/flags-$variant-$flag
+  flags=$WORK/flags-$variant-$case
   mkdir -p "$flags"
-  if [ "$flag" = withflag ]; then
-    SELFTEST_FLAG="rctf{xweb-selftest-$variant-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')}"
-    printf '%s' "$SELFTEST_FLAG" >"$flags/main"
-    chmod 0400 "$flags/main"
-  fi
-  printf 'IMAGE=xweb-selftest-%s\n' "$variant" >"$WORK/build-$variant-$flag"
+  SELFTEST_FLAG=
+  SELFTEST_LOSERS=
+  case "$case" in
+    main)
+      SELFTEST_FLAG="rctf{xweb-selftest-$variant-main-$(selftest_hex)}"
+      printf '%s' "$SELFTEST_FLAG" >"$flags/main"
+      ;;
+    static)
+      SELFTEST_FLAG="rctf{xweb-selftest-$variant-static-$(selftest_hex)}"
+      printf '%s' "$SELFTEST_FLAG" >"$flags/flags_static"
+      ;;
+    other)
+      SELFTEST_FLAG="rctf{xweb-selftest-$variant-other-$(selftest_hex)}"
+      printf '%s' "$SELFTEST_FLAG" >"$flags/factory_override"
+      ;;
+    both)
+      SELFTEST_FLAG="rctf{xweb-selftest-$variant-bothmain-$(selftest_hex)}"
+      SELFTEST_LOSERS="rctf{xweb-selftest-$variant-bothstatic-$(selftest_hex)}"
+      printf '%s' "$SELFTEST_FLAG" >"$flags/main"
+      printf '%s' "$SELFTEST_LOSERS" >"$flags/flags_static"
+      ;;
+    multi)
+      SELFTEST_LOSERS="xweb-junk-alpha-$variant xweb-junk-beta-$variant"
+      printf '%s' "xweb-junk-alpha-$variant" >"$flags/zz_alpha"
+      printf '%s' "xweb-junk-beta-$variant" >"$flags/zz_beta"
+      ;;
+    none) : ;;
+    *) bad "unknown start_portal case: $case"; return 1 ;;
+  esac
+  chmod 0400 "$flags"/* 2>/dev/null || true
+  printf 'IMAGE=xweb-selftest-%s\n' "$variant" >"$WORK/build-$variant-$case"
   port=$(pick_port)
   XWEB_PORT=$port \
-  XWEB_DB=$WORK/db-$variant-$flag.db \
-  XWEB_BUILD_FILE=$WORK/build-$variant-$flag \
+  XWEB_DB=$WORK/db-$variant-$case.db \
+  XWEB_BUILD_FILE=$WORK/build-$variant-$case \
   RCTF_FLAGS_DIR=$flags \
-  RCTF_INSTANCE_ID=selftest-$variant-$flag \
-  python3 "$appdir/xweb_common.py" >"$WORK/out-$variant-$flag.log" 2>&1 &
+  RCTF_INSTANCE_ID=selftest-$variant-$case \
+  python3 "$appdir/xweb_common.py" >"$WORK/out-$variant-$case.log" 2>&1 &
   APP_PIDS="$APP_PIDS $!"
   # wait for the portal to answer
   local i
@@ -131,10 +168,22 @@ start_portal() {
     sleep 0.2
   done
   curl -s -o /dev/null "http://127.0.0.1:$port/" ||
-    { bad "$variant/$flag: portal did not start (log: $(tail -3 "$WORK/out-$variant-$flag.log" 2>/dev/null))"; return 1; }
+    { bad "$variant/$case: portal did not start (log: $(tail -3 "$WORK/out-$variant-$case.log" 2>/dev/null))"; return 1; }
   LAST_PORT=$port
   LAST_FLAGS=$flags
   return 0
+}
+
+# assert no non-selected flags-dir value leaked into the last response.
+expect_no_losers() { # <label>
+  local label=$1 loser
+  for loser in ${SELFTEST_LOSERS:-}; do
+    if printf '%s' "$BODY" | grep -qF -- "$loser"; then
+      bad "$label: a non-selected flags-dir value leaked into the page ($loser)"
+    else
+      ok "$label: the non-selected flags-dir value did not leak ($loser)"
+    fi
+  done
 }
 
 # http_kind <port> <method> <path> [curl args...] -> sets KIND, BODY, CODE
@@ -157,11 +206,11 @@ login_flow() { # <port> <jar> <user> <pass> -> KIND/BODY of the POST
     --data-urlencode "username=$3" --data-urlencode "password=$4"
 }
 
-drive_portal() { # <variant> <withflag|noflag>
-  local variant=$1 flag=$2 port
-  start_portal "$variant" "$flag" || return 0
+drive_portal() { # <variant> <case main|static|other|both|multi|none>
+  local variant=$1 case=$2 port
+  start_portal "$variant" "$case" || return 0
   port=$LAST_PORT
-  local label="$variant/$flag"
+  local label="$variant/$case"
   local selftest_flag=${SELFTEST_FLAG:-}
 
   # login page theme markers
@@ -169,7 +218,7 @@ drive_portal() { # <variant> <withflag|noflag>
   [ "$KIND" = LOGIN ] && ok "$label: / is the themed login page" ||
     bad "$label: / classified $KIND (expected LOGIN)"
   for marker in 'XWEB-500' 'Supervisor Portal' 'FW 5.00.10' \
-    "Node: <span class=\"xweb-led\">selftest-$variant-$flag</span>"; do
+    "Node: <span class=\"xweb-led\">selftest-$variant-$case</span>"; do
     if printf '%s' "$BODY" | grep -qF -- "$marker"; then
       ok "$label: login page shows themed marker: $marker"
     else
@@ -187,7 +236,7 @@ drive_portal() { # <variant> <withflag|noflag>
   fi
 
   # default credentials
-  jar_admin=$WORK/jar-$variant-$flag-admin
+  jar_admin=$WORK/jar-$variant-$case-admin
   login_flow "$port" "$jar_admin" admin 1234
   if [ "$KIND" = REDIRECT ]; then
     ok "$label: admin/1234 authenticates (redirect to dashboard)"
@@ -203,7 +252,7 @@ drive_portal() { # <variant> <withflag|noflag>
   http_kind "$port" GET /service -b "$jar_admin"
   [ "$KIND" = SERVICE ] && ok "$label: service notes render for admin" ||
     bad "$label: service notes classified $KIND (expected SERVICE)"
-  if [ "$flag" = withflag ]; then
+  if [ -n "$selftest_flag" ]; then
     printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
       ok "$label: service notes display the per-run flag" ||
       bad "$label: service notes do NOT display the per-run flag"
@@ -212,9 +261,10 @@ drive_portal() { # <variant> <withflag|noflag>
       bad "$label: flagless build still shows a flag-shaped string" ||
       ok "$label: flagless build shows no flag-shaped string"
   fi
+  expect_no_losers "$label (service notes)"
 
   # wrong credentials (genuine negative on both builds)
-  login_flow "$port" "$WORK/jar-$variant-$flag-wrong" admin wrongcode
+  login_flow "$port" "$WORK/jar-$variant-$case-wrong" admin wrongcode
   [ "$KIND" = DENIED ] && ok "$label: wrong code is denied (genuine negative)" ||
     bad "$label: wrong code classified $KIND (expected DENIED)"
 
@@ -222,7 +272,7 @@ drive_portal() { # <variant> <withflag|noflag>
   local bypass_user bypass_pass jar_bypass
   bypass_user=$(xweb_bypass_username)
   bypass_pass=$(xweb_bypass_password)
-  jar_bypass=$WORK/jar-$variant-$flag-bypass
+  jar_bypass=$WORK/jar-$variant-$case-bypass
   login_flow "$port" "$jar_bypass" "$bypass_user" "$bypass_pass"
   if [ "$variant" = vuln ]; then
     if [ "$KIND" = REDIRECT ]; then
@@ -234,7 +284,7 @@ drive_portal() { # <variant> <withflag|noflag>
     [ "$KIND" = SERVICE ] &&
       ok "$label: bypass session reaches the admin service notes" ||
       bad "$label: bypass session classified $KIND at /service"
-    if [ "$flag" = withflag ]; then
+    if [ -n "$selftest_flag" ]; then
       printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
         ok "$label: bypass path exposes the per-run flag" ||
         bad "$label: bypass path did not expose the per-run flag"
@@ -253,7 +303,7 @@ drive_portal() { # <variant> <withflag|noflag>
     [ "$KIND" = ARCHIVE ] &&
       ok "$label: UNION archive dump renders rows" ||
       bad "$label: UNION archive dump classified $KIND (expected ARCHIVE)"
-    if [ "$flag" = withflag ]; then
+    if [ -n "$selftest_flag" ]; then
       printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
         ok "$label: UNION archive dump exposes the per-run flag" ||
         bad "$label: UNION archive dump did not expose the per-run flag"
@@ -262,6 +312,7 @@ drive_portal() { # <variant> <withflag|noflag>
         bad "$label: flagless UNION dump fabricated a flag-shaped string" ||
         ok "$label: flagless UNION dump cannot fabricate a flag"
     fi
+    expect_no_losers "$label (union archive dump)"
   else
     [ "$KIND" = ARCHIVE_EMPTY ] &&
       ok "$label: patched archive filter returns the empty state" ||
@@ -274,14 +325,14 @@ drive_portal() { # <variant> <withflag|noflag>
   # UNION through the login form (login-as-data)
   local union_user jar_union
   union_user=$(xweb_union_login_username)
-  jar_union=$WORK/jar-$variant-$flag-union
+  jar_union=$WORK/jar-$variant-$case-union
   login_flow "$port" "$jar_union" "$union_user" whatever
   if [ "$variant" = vuln ]; then
     [ "$KIND" = REDIRECT ] &&
       ok "$label: UNION login authenticates as the dumped row" ||
       bad "$label: UNION login classified $KIND (expected REDIRECT)"
     http_kind "$port" GET /dashboard -b "$jar_union"
-    if [ "$flag" = withflag ]; then
+    if [ -n "$selftest_flag" ]; then
       printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
         ok "$label: UNION login dumps the flag into the operator line" ||
         bad "$label: UNION login did not dump the flag"
@@ -307,11 +358,19 @@ drive_portal() { # <variant> <withflag|noflag>
   fi
 }
 
+# Delivery-name resolution matrix: the lab provider name, the platform
+# provider name, the single-file fallback, main-first ordering, the ambiguous
+# directory (flagless) and the empty directory (flagless).
 SELFTEST_FLAG=
-drive_portal vuln withflag
-drive_portal patched withflag
-SELFTEST_FLAG=
-drive_portal vuln noflag
+SELFTEST_LOSERS=
+drive_portal vuln main
+drive_portal patched main
+drive_portal vuln none
+drive_portal vuln static
+drive_portal patched static
+drive_portal vuln other
+drive_portal vuln both
+drive_portal vuln multi
 
 # --- 3. syntax checks ----------------------------------------------------------
 section 'lab shell pieces pass syntax checks'

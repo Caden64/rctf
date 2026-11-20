@@ -250,12 +250,13 @@ instance_id() { # <tag>; prints a fresh 16..32 char lowercase id
   printf 'xweb%s%s\n' "$1" "$(rand_hex)"
 }
 
-create_instance() { # <id> <image> <teamKey> <flag-or-empty> <tcp-expose yes|no>; prints the id
-  local id=$1 image=$2 team=$3 flag=$4 with_tcp=$5 now expires spec flags_json expose_json code
+create_instance() { # <id> <image> <teamKey> <flag-or-empty> <tcp-expose yes|no> [provider]
+  local id=$1 image=$2 team=$3 flag=$4 with_tcp=$5 provider=${6:-main}
+  local now expires spec flags_json expose_json code
   now=$(date +%s)
   expires=$(((now + 1200) * 1000))
   if [ -n "$flag" ]; then
-    flags_json="[{\"provider\":\"main\",\"flag\":\"$flag\"}]"
+    flags_json="[{\"provider\":\"$provider\",\"flag\":\"$flag\"}]"
   else
     flags_json='[]'
   fi
@@ -571,20 +572,31 @@ check_noflag_instance() {
 FLAG_A="rctf{xweb-team-a-$(rand_hex)}"
 FLAG_B="rctf{xweb-team-b-$(rand_hex)}"
 FLAG_P="rctf{xweb-team-p-$(rand_hex)}"
+# Delivered under the platform's registered provider name: rCTF resolves the
+# challenge flag entry (provider "flags/static") and the guest init sanitises
+# it to "flags_static". This instance proves the portal resolves that name.
+FLAG_S="rctf{xweb-static-$(rand_hex)}"
 
 ID_A=$(instance_id vulna) || fatal 'could not build instance id A'
 ID_B=$(instance_id vulnb) || fatal 'could not build instance id B'
 ID_P=$(instance_id pctrl) || fatal 'could not build instance id P'
 ID_N=$(instance_id noflg) || fatal 'could not build instance id N'
+ID_S=$(instance_id statc) || fatal 'could not build instance id S'
 
 declare -A HOST_OF=() TCP_OF=()
 
-for pair in "A:$ID_A:xweb-vuln:$FLAG_A:yes" "B:$ID_B:xweb-vuln:$FLAG_B:yes" \
-  "P:$ID_P:xweb-patched:$FLAG_P:no" "N:$ID_N:xweb-vuln::no"; do
-  IFS=: read -r tag id image flag with_tcp <<<"$pair"
-  section "creating instance $tag ($image)"
+# provider field: the lab instances use "main"; instance S uses the platform's
+# registered "flags/static" so the runner asserts the platform delivery name.
+for pair in "A:$ID_A:xweb-vuln:$FLAG_A:yes:main" \
+  "B:$ID_B:xweb-vuln:$FLAG_B:yes:main" \
+  "P:$ID_P:xweb-patched:$FLAG_P:no:main" \
+  "N:$ID_N:xweb-vuln::no:main" \
+  "S:$ID_S:xweb-vuln:$FLAG_S:no:flags/static"; do
+  IFS=: read -r tag id image flag with_tcp provider <<<"$pair"
+  section "creating instance $tag ($image, provider $provider)"
   # teamKey must match ^[a-z0-9]{8,64}$: the display tag is lowercased here.
-  if create_instance "$id" "$image" "team${tag,,}$(rand_hex)" "$flag" "$with_tcp" >/dev/null; then
+  if create_instance "$id" "$image" "team${tag,,}$(rand_hex)" "$flag" \
+    "$with_tcp" "$provider" >/dev/null; then
     ok "instance $tag created over the agent API ($id)"
   else
     bad "instance $tag create was rejected"
@@ -629,6 +641,41 @@ else
   bad 'the traefik route file for instance A is missing or malformed'
 fi
 
+# --- platform-named flag delivery control -------------------------------------------
+# check_static_instance <label> <id> <http-host> <flag>
+# Provisioned with provider "flags/static": rCTF resolves the challenge's
+# registered flag entry, the guest init sanitises the name to "flags_static",
+# and the portal must still deliver the flag through BOTH win paths. Fail
+# closed: a missing flag through either path fails the run.
+check_static_instance() {
+  local label=$1 id=$2 host=$3 flag=$4
+  local jar_root=/tmp/xweb-jar-$id
+  rm -f "$jar_root"*
+
+  section "platform-named flags instance $label (provider flags/static)"
+
+  probe_http "$host" GET /
+  expect_kind LOGIN "$label: published endpoint serves the portal"
+  expect_node "$id" "$label: login page reports its own node id"
+  expect_build xweb-vuln concat "$label: running guest reports the pinned build"
+
+  # Win path 1: default credentials -> admin service notes -> exact flag.
+  portal_login "$host" "$jar_root-admin" admin 1234
+  expect_kind REDIRECT \
+    "$label: admin/1234 authenticates (documented default)"
+  probe_http "$host" GET /service -b "$jar_root-admin"
+  expect_kind SERVICE "$label: admin area renders the service notes"
+  expect_flag "$flag" \
+    "$label: the platform-named flag reaches the admin service notes"
+
+  # Win path 2: unauthenticated UNION dump of the flag row -> exact flag.
+  local union_probe
+  union_probe=$(xweb_union_archive_probe)
+  probe_http "$host" GET /archive -G --data-urlencode "probe=$union_probe"
+  expect_kind ARCHIVE "$label: the UNION dump renders the service notes"
+  expect_flag "$flag" "$label: the UNION dump exposes the platform-named flag"
+}
+
 # --- run the checks -----------------------------------------------------------------
 if [ -n "${HOST_OF[A]:-}" ]; then
   check_vuln_instance 'team A' "$ID_A" "${HOST_OF[A]}" "${TCP_OF[A]:-}" "$FLAG_A" "$FLAG_B"
@@ -649,6 +696,11 @@ if [ -n "${HOST_OF[N]:-}" ]; then
   check_noflag_instance 'flagless' "$ID_N" "${HOST_OF[N]}" "$FLAG_A" "$FLAG_B" "$FLAG_P"
 else
   bad 'flagless control instance is missing; skipping its checks'
+fi
+if [ -n "${HOST_OF[S]:-}" ]; then
+  check_static_instance 'platform-named' "$ID_S" "${HOST_OF[S]}" "$FLAG_S"
+else
+  bad 'platform-named flags instance is missing; skipping its checks'
 fi
 
 # --- isolation ------------------------------------------------------------------------

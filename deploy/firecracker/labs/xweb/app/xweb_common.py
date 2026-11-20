@@ -14,9 +14,16 @@ Layout
                         app/xweb_auth_patched.py  (parameterized queries only)
 
 The flag arrives only through MMDS: /rctf/init writes it to
-$RCTF_FLAGS_DIR/main (tmpfs) and this program inserts it into the
-service-notes table at boot. The database lives on tmpfs (/run) and the flag
-never touches the ext4 rootfs.
+$RCTF_FLAGS_DIR/<sanitised provider> (tmpfs) and this program inserts it into
+the service-notes table at boot. The provider name depends on who provisioned
+the instance: the lab runner registers flags under the provider "main", while
+the platform resolves the challenge's registered flag entry — for this
+challenge `{provider: "flags/static"}` — and the guest init sanitises the
+provider name (`[^A-Za-z0-9._-]` -> "_"), so the platform-delivered flag
+lands at "flags_static". resolve_flag_path() accepts both delivery names,
+then falls back to the single file in the flags directory when exactly one
+exists; an ambiguous or empty directory boots the portal flagless. The
+database lives on tmpfs (/run) and the flag never touches the ext4 rootfs.
 
 Every page carries the machine-readable marker ids used by the runner:
 xweb-login / xweb-dashboard / xweb-service / xweb-archive / xweb-denied /
@@ -136,9 +143,42 @@ SEED_NOTES = [
 FLAG_NOTE_TITLE = 'Service note 07 — factory maintenance override'
 
 
+# Flag delivery names (MMDS provider names sanitised by /rctf/init):
+#   main          the lab runner's provider name (lab path)
+#   flags_static  the platform's registered provider `flags/static` for this
+#                 challenge, sanitised (`/` -> `_`) by the guest init
+FLAG_PROVIDER_MAIN = 'main'
+FLAG_PROVIDER_PLATFORM = 'flags_static'
+
+
+def resolve_flag_path():
+    """Pick the flag file for this boot, or None for a flagless boot.
+
+    Order: the lab provider name, then the platform provider name, then the
+    single file in the flags directory when exactly one exists. Two or more
+    unrecognised files are ambiguous and boot flagless (fail-closed, never a
+    wrong flag).
+    """
+    for name in (FLAG_PROVIDER_MAIN, FLAG_PROVIDER_PLATFORM):
+        path = os.path.join(FLAGS_DIR, name)
+        if os.path.isfile(path):
+            return path
+    try:
+        entries = sorted(os.listdir(FLAGS_DIR))
+    except OSError:
+        return None
+    files = [e for e in entries
+             if os.path.isfile(os.path.join(FLAGS_DIR, e))]
+    if len(files) == 1:
+        return os.path.join(FLAGS_DIR, files[0])
+    return None
+
+
 def read_flag():
     """Return the per-run flag delivered by MMDS via tmpfs, or None."""
-    path = os.path.join(FLAGS_DIR, 'main')
+    path = resolve_flag_path()
+    if path is None:
+        return None
     try:
         with open(path, 'rb') as fh:
             return fh.read().decode('utf-8')

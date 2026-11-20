@@ -1,13 +1,15 @@
 # xweb — results
 
 Dated record of what actually ran, on which machine, with which exact
-outcome. Anything not executed is marked **NOT RUN**.
+outcome. Anything not executed is marked **NOT RUN**. Read top-down: the
+sections are newest-first, and each newer section supersedes the app and
+images of every section below it.
 
 Host (reference machine): Linux, 16 CPUs, 54 GiB RAM, `/dev/kvm` present and
 readable/writable, QEMU with nested virtualization working (previous
 Firecracker lab runs green on this host), ~1.7 TiB free disk.
 
-## 2026-11-19 — unprivileged selftest and image build (host)
+## 2026-11-19 — unprivileged selftest and image build (host, pre-fix)
 
 Executed for real, unprivileged, on the host.
 
@@ -44,7 +46,7 @@ Executed for real, unprivileged, on the host.
   publisher-verified tarball) before anything was built; the pin was
   corrected against the publisher's `.sha256.txt`.
 
-| Image          | Size | rootfs.ext4 sha256 (build used by the green run below)      |
+| Image          | Size | rootfs.ext4 sha256 (pre-fix build, superseded 19:16)        |
 | -------------- | ---- | ----------------------------------------------------------- |
 | `xweb-vuln`    | 256M | `728bed554a79db627aee3af8bb45a0f99f9b86f1d3e604bbced55cfafd751781` |
 | `xweb-patched` | 256M | `afeabcd25964f289c83140f1c2e195db3f0a662365c4d26e21394660d36a5d4a` |
@@ -55,12 +57,74 @@ Both share `vmlinux` sha256 `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017
 assertions tie every image back to the pinned package digests and the
 running guest reports its own build marker, which the runner asserts.
 
-## 2026-11-19 — full nested-KVM end-to-end run (green)
+## 2026-11-19 (19:16) — flag-delivery-name integration fix and re-verification (green)
+
+**Why:** deployment review found that the lab runner provisions flags under
+the provider name `main`, while the platform resolves the challenge's
+registered flag entry — `{provider: "flags/static"}` — and passes the
+provider name through to the guest, where `/rctf/init` sanitises it
+(`[^A-Za-z0-9._-]` → `_`) so the event-delivered flag lands at
+`/run/rctf/flags/flags_static`. The portal previously read `main` only, so
+the event challenge would have booted with no flag in the database and been
+unsolvable. The fix is challenge-side only (no platform change):
+
+- `app/xweb_common.py` (shared by both images, so vuln and patched stay
+  byte-identical outside the query seam) now resolves the flag file by
+  delivery name: `main` first (lab path), then `flags_static` (platform
+  path), then the single file in the flags directory when exactly one
+  exists; an empty directory boots flagless (the negative control), and two
+  or more unrecognised files are ambiguous and also boot flagless — never
+  a wrong flag.
+- `inner.sh` gained a fifth instance ("S", `xweb-vuln`) provisioned with
+  `provider: "flags/static"` over the real agent API, with fail-closed
+  assertions that the exact per-run flag reaches BOTH win paths: the
+  default-credentials admin service notes and the unauthenticated UNION
+  dump. The existing `main`-based instances and assertions are unchanged.
+- `selftest.sh` grew a delivery-name resolution matrix (176 checks, see
+  below); the README documents the two delivery names and the resolution
+  order.
+
+Executed for real, in order, after the fix:
+
+- `./selftest.sh` → **176 passed, 0 failed**, exit 0. New coverage:
+  `main`, platform-named `flags_static`, single-file fallback,
+  `main`-first ordering (a second, differently-named flag value in the
+  directory must never appear in any page), ambiguous-directory boot
+  (flagless, neither junk file leaks), and the empty directory — all
+  driven through the full payload set on both seams where applicable.
+- `./run.sh` (19:16) → **107 passed, 0 failed**; `RESULT: xweb 107
+  passed, 0 failed`; `XWEB RESULT: PASS`; exit 0; the VM was destroyed and
+  its overlay removed. Transcript:
+  `~/.cache/rctf-xweb/logs/run-20261119-191653-164754.log`.
+- Platform-path confirmation from that run (instance S, id
+  `xwebstatca01fd9d2e2`, created with `provider: "flags/static"`,
+  readiness passed through the agent's own HTTP probe):
+  - `platform-named: the platform-named flag reaches the admin service
+    notes` — PASS (default-credentials win path, exact per-run flag);
+  - `platform-named: the UNION dump exposes the platform-named flag` —
+    PASS (unauthenticated SQLi win path, exact per-run flag).
+  All pre-existing checks kept passing unchanged (teams A/B on `main`,
+  patched control, flagless control, isolation).
+
+Images rebuilt by that run (the deployment pins must be re-pinned to these;
+the previous pins `728bed55…` / `afeabcd2…` fail validation by design):
+
+| Image          | Size         | rootfs.ext4 sha256 (2026-11-19 19:16 build)                 |
+| -------------- | ------------ | ----------------------------------------------------------- |
+| `xweb-vuln`    | 268435456 B  | `a086e0269376b3f4ae6f60cad8e6abb4df85b6500b8a35bc4e00c78c406aea3a` |
+| `xweb-patched` | 268435456 B  | `4f5657b755b9220cf123cd234cb651d8180c6f115605b189032b0ebf5a46e842` |
+
+Both share `vmlinux` sha256 `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`
+(shared smoke kernel 6.1.155, unchanged). Full manifest with pinned
+package versions: `~/.cache/rctf-xweb/images/MANIFEST.txt`.
+
+## 2026-11-19 (16:26) — full nested-KVM end-to-end run (green, pre-fix)
 
 Executed for real with `/dev/kvm`; nothing privileged ran on the host. The
 run was sequenced to start in a quiet window (a sibling lab's bitbake build
 had been compiling at load 30–100 on this host earlier; this run started at
-host load ~1.9).
+host load ~1.9). This is the run of the app BEFORE the flag-delivery-name
+fix above; it validated everything except the platform provider name.
 
 - Command: `cd deploy/firecracker/labs/xweb && ./run.sh`
 - Lab VM: fresh Ubuntu 24.04 cloud image under nested KVM, unique per-run

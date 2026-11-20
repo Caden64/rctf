@@ -83,12 +83,33 @@ Both images share the pinned kernel `vmlinux-6.1.155` from `../smoke`. The
 flagless negative control is not a third image: it is `xweb-vuln` booted
 with an empty `flags` array (valid per the guest contract).
 
+### Flag delivery names (lab vs platform)
+
+The portal resolves the MMDS-written flag file by **delivery name**, and
+accepts both names it can receive:
+
+| Source                     | registered flag provider | guest file (`/rctf/init` sanitises `[^A-Za-z0-9._-]` → `_`) |
+| -------------------------- | ------------------------ | ----------------------------------------------------------- |
+| this lab's runner          | `main`                   | `$RCTF_FLAGS_DIR/main`                                       |
+| the platform (rCTF event)  | `flags/static`           | `$RCTF_FLAGS_DIR/flags_static`                              |
+
+Resolution order at boot: `main` first, then `flags_static`, then the single
+file in the flags directory when exactly one exists (a safety net for other
+provider names). An empty directory boots the portal flagless (the negative
+control), and two or more unrecognised files are treated as ambiguous and
+also boot flagless — never a wrong flag. Both images carry the identical
+shared module, so vuln and patched stay byte-identical in everything except
+the query seam. The runner asserts the platform path for real: `inner.sh`
+creates one instance whose flags use `provider: "flags/static"` and asserts
+the exact per-run flag through both win paths (default-credentials admin
+page and the unauthenticated UNION dump).
+
 The portal is a small, auditable program (three lab-authored Python files):
-`app/xweb_common.py` (HTTP service, theme, sessions, DB bootstrap) and
-`app/xweb_auth_vuln.py` / `app/xweb_auth_patched.py` (the query seam; build
-time stages exactly one of them as `/app/xweb_auth.py`). The database lives
-on tmpfs (`/run/xweb/portal.db`); the flag is read once at boot from
-`$RCTF_FLAGS_DIR/main` (MMDS-written tmpfs) and inserted as a themed
+`app/xweb_common.py` (HTTP service, theme, sessions, DB bootstrap, flag
+resolution) and `app/xweb_auth_vuln.py` / `app/xweb_auth_patched.py` (the
+query seam; build time stages exactly one of them as `/app/xweb_auth.py`).
+The database lives on tmpfs (`/run/xweb/portal.db`); the flag is read once
+at boot from the MMDS-written tmpfs directory and inserted as a themed
 service-note row. No flag ever reaches the ext4 rootfs.
 
 ### Pinned inputs and digests
