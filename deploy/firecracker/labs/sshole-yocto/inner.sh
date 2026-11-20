@@ -387,7 +387,11 @@ for image in "${IMAGES_ORDER[@]}"; do
     #    that only MMDS delivered (never committed, never on the ext4).
     probe "$host" "$port" alice wrong-then-long 'cat /run/rctf/flag.txt'
     expect_kind ACCEPT "$image: bypassed alice can read /run/rctf/flag.txt"
-    got_flag=$(printf '%s\n' "$PROBE_OUT" | sed -n '1p')
+    # The flag file is byte-exact MMDS data (jq -j, no trailing newline), so
+    # check-client's SSHOLE_STDOUT_END marker can end up glued to the last
+    # stdout line; strip it before comparing. check-client.sh itself stays
+    # byte-identical to the sibling sshole lab's copy.
+    got_flag=$(printf '%s\n' "$PROBE_OUT" | sed -n '1p' | sed 's/SSHOLE_STDOUT_END$//')
     if [ "$got_flag" = "$flag" ]; then
       ok "$image: the bypassed session prints the exact per-run MMDS flag"
     else
@@ -469,7 +473,8 @@ else
       # The isolation instance must publish ITS OWN per-run flag too.
       probe "$host_b" "$port_b" alice wrong-then-long 'cat /run/rctf/flag.txt'
       expect_kind ACCEPT 'isolation: team B bypass also works'
-      got_fb=$(printf '%s\n' "$PROBE_OUT" | sed -n '1p')
+      # Same glued-marker edge as above: strip it before comparing.
+      got_fb=$(printf '%s\n' "$PROBE_OUT" | sed -n '1p' | sed 's/SSHOLE_STDOUT_END$//')
       [ "$got_fb" = "$flag_b" ] &&
         ok 'isolation: team B endpoint prints its own per-run flag' ||
         bad "isolation: team B flag mismatch: got '${got_fb:-<empty>}' expected '$flag_b'"
