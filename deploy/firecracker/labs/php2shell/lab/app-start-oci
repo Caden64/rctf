@@ -16,10 +16,16 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mkdir -p /www /tmp
 
 # Publish the per-instance flag (tmpfs, never baked into the image) so the
-# lab has a real objective: read it through the RCE.
+# lab has a real objective: read it through the RCE. /run, NOT /www: /www
+# is the Apache DocumentRoot, so a flag copied there is served verbatim at
+# /flag.txt over plain HTTP (trivially solvable). /run/flag.txt is outside
+# DocumentRoot -- Apache never serves it -- and stays on the tmpfs, never
+# on the ext4. The chain executes as www-data (uid 33), which reads the
+# 0644 copy: `cat /run/flag.txt` through the RCE is the objective, and
+# run.sh asserts both halves (flag NOT web-served; flag readable via RCE).
 if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
-  cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
-  chmod 0644 /www/flag.txt
+  cp "$RCTF_FLAGS_DIR/main" /run/flag.txt
+  chmod 0644 /run/flag.txt
 fi
 
 # The webroot must be writable by the worker for the out-of-band proof

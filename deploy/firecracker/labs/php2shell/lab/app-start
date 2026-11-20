@@ -9,10 +9,13 @@ set -eu
 mkdir -p /www /tmp
 
 # Publish the per-instance flag (tmpfs, never baked into the image) so the
-# lab has a real objective: read it through the RCE.
+# lab has a real objective: read it through the RCE. /run, NOT /www: /www
+# is the Apache DocumentRoot, so a flag copied there is served verbatim at
+# /flag.txt over plain HTTP. /run/flag.txt is outside DocumentRoot, on the
+# tmpfs, and readable by the www-data worker the chain executes as.
 if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
-  cp "$RCTF_FLAGS_DIR/main" /www/flag.txt
-  chmod 0644 /www/flag.txt
+  cp "$RCTF_FLAGS_DIR/main" /run/flag.txt
+  chmod 0644 /run/flag.txt
 fi
 
 # The webroot must be writable by the worker for the out-of-band proof

@@ -345,6 +345,34 @@ instead of letting the theme drift. A theme change that adds PHP execution
 is a hard lab regression: `selftest.sh` rejects any PHP tags in the themed
 files.
 
+## Event registration and objective
+
+The lab doubles as the shipped event challenge (`challenge.yaml`, format of
+`../../sample-challenge.yaml`): instancer `firecracker`, integration id
+`fc-m364-credit`, image `php2shell-vuln`, one `https` expose
+(`hostPrefix: m364-credit`, `containerName: app`, port 8080,
+`shouldDisplay: true`), readiness `GET /` → 200 (the themed static page),
+`vcpus: 1`, `memMiB: 512`, `diskMiB: 1536`. `staging-manifest.json` records
+the built event image's file names, sha256 digests and sizes for the
+deployment tooling; rebuilds change `rootfs.ext4` bytes, so the manifest is
+refreshed as part of the reviewed re-verification (enforced by
+`selftest.sh` when both are present).
+
+The per-run flag reaches the guest over **MMDS only**: `init` writes it to
+`/run/rctf/flags/main` on the verified tmpfs, and `/app/start` publishes a
+0644 copy to **`/run/flag.txt`** — tmpfs, *outside* the Apache
+DocumentRoot. `GET /flag.txt` therefore answers 404 and the flag never
+lands on the ext4; the objective is to read it through the RCE (the chain
+executes as www-data, which reads the tmpfs copy). `run.sh` asserts both
+halves fail-closed on the vulnerable image: plain HTTP must **not** serve
+the flag (`assert_flag_http_absent`, 404 + no flag bytes, probed at
+`/flag.txt` and `/www/flag.txt`), and the calibrated chain must be able to
+read it (`assert_chain_flag_read`: the `cat /run/flag.txt>/www/p` payload,
+fetched over HTTP and exact-matched against the flag the runner itself
+handed to the instance through the agent API). The previous placement
+(`/www/flag.txt`) made `GET /flag.txt` hand the objective over plain HTTP
+with no exploit at all; that regression can no longer land silently.
+
 ## Requirements and cost
 
 - `/dev/kvm` readable/writable on the host, with nested virtualization enabled
@@ -385,7 +413,7 @@ files.
 | `lab/www/status.html`        | M364 themed static status tiles (no PHP)                        |
 | `lab/www/m364.css`           | M364 theme stylesheet (static)                                 |
 | `lab/www/version.php`        | version + `memory_limit` for assertions                         |
-| `lab/app-start-oci`          | `/app/start`: flag publish + `apache2-foreground`               |
+| `lab/app-start-oci`          | `/app/start`: flag publish to `/run` (tmpfs, never web-served) + `apache2-foreground` |
 | `lab/*` (source-build files) | Apache/PHP source-build lab configuration                       |
 | `challenge.yaml`            | event challenge registration (Firecracker instancer)           |
 | `staging-manifest.json`      | event image staging manifest (files, sha256, sizes)            |

@@ -305,6 +305,30 @@ fi
 grep -q 'lab/m364-oci.conf' "$LAB_DIR/build-oci.sh" &&
   ok "build-oci.sh installs lab/m364-oci.conf into every image" ||
   bad "build-oci.sh does not install lab/m364-oci.conf"
+# The per-run flag must be published OUTSIDE the Apache DocumentRoot and
+# off the ext4: /run/flag.txt (tmpfs, readable by the www-data worker the
+# chain executes as), never /www/flag.txt -- which GET /flag.txt would
+# serve verbatim over plain HTTP, making the event challenge trivially
+# solvable.
+for f in "$LAB_DIR/lab/app-start" "$LAB_DIR/lab/app-start-oci"; do
+  grep -q 'cp "$RCTF_FLAGS_DIR/main" /run/flag.txt' "$f" &&
+    ok "$(basename "$f") publishes the flag to /run/flag.txt (tmpfs, outside DocumentRoot)" ||
+    bad "$(basename "$f") does not publish the flag to /run/flag.txt"
+  if grep -q '/www/flag\.txt' "$f"; then
+    bad "$(basename "$f") still references /www/flag.txt (would be served at /flag.txt over HTTP)"
+  else
+    ok "$(basename "$f") never places the flag inside the /www DocumentRoot"
+  fi
+done
+grep -q 'assert_flag_http_absent "vulnerable image" flag.txt' "$LAB_DIR/run.sh" &&
+  ok "run.sh asserts GET /flag.txt answers 404 without the flag bytes" ||
+  bad "run.sh lacks the flag-not-web-served regression check"
+grep -q 'cat /run/flag\.txt' "$LAB_DIR/run.sh" &&
+  ok "run.sh proves the flag is readable from /run through the RCE" ||
+  bad "run.sh does not prove the flag-read objective"
+grep -q 'run/flag\.txt' "$LAB_DIR/challenge.yaml" &&
+  ok "challenge.yaml documents the /run/flag.txt objective" ||
+  bad "challenge.yaml still describes the old flag placement"
 # All three images share overlay_image, so the theme is identical across the
 # vulnerable and control images by construction; run.sh additionally asserts
 # GET / serves this exact file byte-for-byte on every image.
