@@ -134,6 +134,7 @@ Only these paths are added to the image; everything else is the image's own:
 | `/usr/local/etc/php/conf.d/zz-php2shell.ini`  | laboratory php.ini (8M, no `log_errors`)                                                     |
 | `/www/index.php`, `/www/version.php`          | inert landing page; version + `memory_limit` for assertions                                  |
 | `/www/index.html`, `status.html`, `m364.css`  | M364 static theme (no PHP; identical in all three images)                                    |
+| `/www/incidents/EX2611-0442.html`           | static incident note (recon flag spot; the image ships it WITHOUT any flag)                   |
 | `/app/start`                                  | MMDS flag publish, `/www` ownership, `apache2-foreground`                                    |
 | `/usr/local/bin/{busybox,ip,nc}`              | boot-contract `ip route`/`ip link` (busybox from the sha256-verified shared smoke artifacts) |
 | `/rctf/{init,jq}`                             | installed by `guest/build-rootfs.sh`                                                         |
@@ -347,50 +348,73 @@ files.
 
 ## Event registration and objective
 
-The lab doubles as the shipped event challenge (`challenge.yaml`, format of
-`../../sample-challenge.yaml`): instancer `firecracker`, integration id
-`fc-m364-credit`, image `php2shell-vuln`, one `https` expose
-(`hostPrefix: m364-credit`, `containerName: app`, port 8080,
-`shouldDisplay: true`), readiness `GET /` → 200 (the themed static page),
-`vcpus: 1`, `memMiB: 512`, `diskMiB: 1536`. `staging-manifest.json` records
-the built event image's file names, sha256 digests and sizes for the
-deployment tooling; rebuilds change `rootfs.ext4` bytes, so the manifest is
-refreshed as part of the reviewed re-verification (enforced by
-`selftest.sh` when both are present).
+The lab ships TWO staged event records sharing the ONE image
+(`php2shell-vuln`; `staging-manifest.json` pins it once for both):
 
-The per-run flag reaches the guest over **MMDS only**: `init` writes it to
-`/run/rctf/flags/<provider>` on the verified tmpfs, and `/app/start`
-publishes a 0644 copy to **`/run/flag.txt`** — tmpfs, *outside* the Apache
-DocumentRoot. `GET /flag.txt` therefore answers 404 and the flag never
-lands on the ext4. The provider file name is resolved robustly because the
-two creators name it differently: the **lab runner** registers the provider
-as `main` (`/run/rctf/flags/main`), while the **rCTF platform** resolves
-the challenge's registered provider and passes it through verbatim —
-`flags/static` from `challenge.yaml` — which the guest init sanitises to
-**`flags_static`**. `/app/start` resolves `main`, then `flags_static`, then
-the single file when exactly one exists; if nothing resolves, no flag is
-published and the runner's assertions fail loudly.
+- **`challenge.yaml` — `fc-m364-credit`** (the RCE stage): instancer
+  `firecracker`, one `https` expose (`hostPrefix: m364-credit`,
+  `containerName: app`, port 8080, `shouldDisplay: true`), readiness
+  `GET /` → 200 (the themed static page), `vcpus: 1`, `memMiB: 512`,
+  `diskMiB: 1536`. The per-run flag is published ONLY to
+  **`/run/flag.txt`** (tmpfs, outside the DocumentRoot; `GET /flag.txt`
+  answers 404) and the objective is to read it through the php2shell RCE.
+- **`challenge-recon.yaml` — `fc-m364-recon`** (the enumeration stage):
+  same image and sizing, `hostPrefix: m364-recon`. The per-run flag is
+  published ONLY into the unlinked static incident note
+  **`/incidents/EX2611-0442.html`** (an archived post-incident review the
+  player finds by enumerating the admin center — the incident id is
+  visible in the portal banner). `/run/flag.txt` is NOT written on this
+  record; the RCE path instead carries a documented non-flag sentinel.
 
-The objective is to read the flag through the RCE (the chain executes as
-www-data, which reads the tmpfs copy) — under one real constraint: the
-calibrated 167-byte carrier caps the chain's command at **14 bytes**, so
-the literal `cat /run/flag.txt>/www/p` (24 bytes) is rejected by the
-exploit itself. `/app/start` therefore exports **`F=/run/flag.txt`**, and
-the objective fits the budget: the recon payload `env>/www/p` (9 bytes)
-reveals `F`, and `cat $F>/www/p` (13 bytes) reads the flag. `run.sh`
-asserts every half fail-closed on the vulnerable image: plain HTTP must
-**not** serve the flag (`assert_flag_http_absent`, 404 + no flag bytes at
-`/flag.txt` and `/www/flag.txt`); the env dump must reveal
-`F=/run/flag.txt` without leaking the flag (`assert_chain_env_reveal`);
-the chain must read the exact per-run flag through `$F`
-(`assert_chain_flag_read`, exact-matched against the flag the runner
-itself handed to the instance through the agent API); and a **second,
-platform-named instance** created with the raw provider string
-`flags/static` must pass the same objective assertions, proving the
-platform delivery path (`main`-based instances and assertions are
-unchanged). The previous placement (`/www/flag.txt`) made `GET /flag.txt`
-hand the objective over plain HTTP with no exploit at all; that regression
-can no longer land silently.
+Both records' flags travel per-run over **MMDS only**; the shipped image
+contains no flag anywhere. The flag file name is resolved robustly because
+the two creators name it differently: the **lab runner** registers the
+provider as `main`, while the **rCTF platform** resolves the challenge's
+registered provider and passes it through verbatim — `flags/static` from
+the records — which the guest init sanitises to **`flags_static`**.
+`/app/start` resolves `main`, then `flags_static`, then the single file
+when exactly one exists; if nothing resolves, no flag is published and the
+runner's assertions fail loudly.
+
+**The env contract is the placement switch:** the instancer exports the
+record's `CHALLENGE` env verbatim, and `/app/start` reads it:
+`fc-m364-recon` → flag into the incident note (its swappable
+`M364-FLAG-SLOT` line, rewritten at boot by a static-file edit — no PHP)
+plus the sentinel on the RCE path; any other value (`fc-m364-credit`, or
+anything else) → flag only at `/run/flag.txt` and the incident note keeps
+its shipped non-flag text.
+
+The credit objective has one real constraint: the calibrated 167-byte
+carrier caps the chain's command at **14 bytes**, so the literal
+`cat /run/flag.txt>/www/p` (24 bytes) is rejected by the exploit itself.
+`/app/start` therefore exports **`F`** pointing at the objective, and the
+objective fits the budget: the recon payload `env>/www/p` reveals `F`,
+and `cat $F>/www/p` (13 bytes) reads it.
+
+One guest fact matters here (measured, see RESULTS.md): the frozen guest
+init mounts `/run` tmpfs **root-only** (`mode=0700`), so a `0644` file
+under it is unreadable by the www-data worker the chain executes as —
+`cat $F` silently produced empty proofs while `id`/`env`/`echo $F`
+succeeded. The service therefore opens traversal of the tmpfs root it
+publishes into (`chmod 0711 /run`): the raw flags directory `/run/rctf`
+(0700, init-owned) stays root-only, the flag bytes still live only on
+tmpfs, and only the published copy is reachable by known path. The frozen
+init itself is untouched; if the platform ever wants this cleaner, an
+init-level option for a service-readable publish mount would remove the
+service-side chmod (documented need, not implemented).
+
+`run.sh` asserts the full placement matrix fail-closed, for BOTH provider
+names (`main` and the raw platform string `flags/static`):
+`GET /flag.txt` and `GET /www/flag.txt` are 404 with no flag bytes
+everywhere; credit instances keep the incident note flag-free
+(`assert_incident_note_clean`), reveal `F` through the RCE without
+leaking the flag (`assert_chain_env_reveal`), and read the exact per-run
+flag through `$F` (`assert_chain_flag_read`); recon instances carry the
+exact per-run flag in the incident note (`assert_incident_flag`) and find
+the exact non-flag sentinel — never the flag — on the RCE path
+(`assert_chain_recon_intake`). The previous placement (`/www/flag.txt`)
+made `GET /flag.txt` hand the objective over plain HTTP with no exploit
+at all; that regression can no longer land silently.
 
 ## Requirements and cost
 
@@ -431,10 +455,12 @@ can no longer land silently.
 | `lab/www/index.html`         | M364 themed static landing page (no PHP)                       |
 | `lab/www/status.html`        | M364 themed static status tiles (no PHP)                        |
 | `lab/www/m364.css`           | M364 theme stylesheet (static)                                 |
+| `lab/www/incidents/EX2611-0442.html` | unlinked static incident note (recon flag spot)         |
 | `lab/www/version.php`        | version + `memory_limit` for assertions                         |
-| `lab/app-start-oci`          | `/app/start`: flag publish to `/run` (tmpfs, never web-served) + `apache2-foreground` |
+| `lab/app-start-oci`          | `/app/start`: name-robust flag resolution + env-driven placement + `apache2-foreground` |
 | `lab/*` (source-build files) | Apache/PHP source-build lab configuration                       |
-| `challenge.yaml`            | event challenge registration (Firecracker instancer)           |
+| `challenge.yaml`            | event registration, credit stage (fc-m364-credit)               |
+| `challenge-recon.yaml`       | event registration, recon stage (fc-m364-recon)                |
 | `staging-manifest.json`      | event image staging manifest (files, sha256, sizes)            |
 | `RESULTS.md`                 | dated log of what actually ran                                  |
 

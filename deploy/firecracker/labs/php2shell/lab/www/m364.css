@@ -156,6 +156,18 @@ th, td {
 }
 thead th { background: #eef1f5; }
 
+/* Incident-note flag row */
+.note-flag {
+  font: 0.95em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #eef6ff;
+  border: 1px solid var(--line);
+  border-left: 6px solid var(--brand);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin: 0.4rem 0 0.6rem;
+  overflow-wrap: anywhere;
+}
+
 /* Status tiles */
 .tiles {
   display: grid;

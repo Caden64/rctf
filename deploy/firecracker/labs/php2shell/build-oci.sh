@@ -22,6 +22,7 @@
 #   /usr/local/etc/php/conf.d/zz-php2shell.ini  laboratory php.ini
 #   /www/{index,version}.php, /app/start
 #   /www/{index.html,status.html,m364.css}       M364 static theme (no PHP)
+#   /www/incidents/EX2611-0442.html              static incident note (recon spot)
 #   /usr/local/bin/{busybox,ip}                 boot-contract ip route/link
 # and /rctf/{init,jq} from guest/build-rootfs.sh. No php.ini is installed: the
 # official image ships none, and output_buffering=0 is load-bearing for the
@@ -127,6 +128,13 @@ overlay_image() { # overlay_image <root> <php-ini>
   install -m 0644 "$LAB_DIR/lab/www/index.html" "$root/www/index.html"
   install -m 0644 "$LAB_DIR/lab/www/status.html" "$root/www/status.html"
   install -m 0644 "$LAB_DIR/lab/www/m364.css" "$root/www/m364.css"
+  # Unlinked static incident note: the fc-m364-recon record's flag spot.
+  # The page ships WITHOUT any flag (its slot line carries the non-flag
+  # note); /app/start rewrites the slot per run for recon-named
+  # instances. Pure static content, never executed by PHP.
+  mkdir -p "$root/www/incidents"
+  install -m 0644 "$LAB_DIR/lab/www/incidents/EX2611-0442.html" \
+    "$root/www/incidents/EX2611-0442.html"
   install -m 0755 "$LAB_DIR/lab/app-start-oci" "$root/app/start"
   # The boot contract needs `ip`/`nc`; the image has curl but no iproute2.
   # BusyBox comes from the pinned shared smoke artifacts (sha256 verified by
