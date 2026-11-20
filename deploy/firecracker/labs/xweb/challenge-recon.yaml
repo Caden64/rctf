@@ -1,0 +1,42 @@
+# XWEB-500 Portal — stage 1 of the staged pair (enumeration).
+# The SQLi / default-credentials stage is challenge.yaml (fc-xweb); both
+# records share the same xweb-vuln image and each instance carries only its
+# own platform flag. See deploy/firecracker/labs/xweb/README.md ("Staged
+# records and flag placement").
+#
+# Static per-team flags come from the platform (flags/static); the guest
+# consumes the flag only through MMDS. The placeholder below is not a real
+# flag.
+name: XWEB-500 Portal Maintenance
+category: web
+description: >-
+  The same refrigeration supervisor portal, seen by a different crew. The
+  store's compliance scan keeps flagging an "internal" area the vendor
+  portal never links to. Map the site and recover the factory maintenance
+  override code.
+flags:
+  - provider: flags/static
+    config:
+      flag: rctf{xweb-recon-placeholder-set-by-the-platform}
+instancerConfig:
+  instancer: firecracker # key in the rctf.d `instancers` map
+  challengeIntegrationId: fc-xweb-recon # never change after launch
+  timeoutMilliseconds: 1800000
+  extendable: true
+  config:
+    image: xweb-vuln # the SAME image as fc-xweb
+    vcpus: 1
+    memMiB: 256
+    diskMiB: 512
+    egress: false
+    bootTimeoutSeconds: 60
+    readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
+    env:
+      CHALLENGE: fc-xweb-recon # drives flag placement: hidden page only
+  expose:
+    - kind: https
+      hostPrefix: xweb-recon
+      containerName: app # must be 'app' for the Firecracker instancer
+      containerPort: 8080
+      shouldDisplay: true # required: endpoints are hidden from players unless this is true
+      title: XWEB-500 Portal
