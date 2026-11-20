@@ -359,19 +359,38 @@ refreshed as part of the reviewed re-verification (enforced by
 `selftest.sh` when both are present).
 
 The per-run flag reaches the guest over **MMDS only**: `init` writes it to
-`/run/rctf/flags/main` on the verified tmpfs, and `/app/start` publishes a
-0644 copy to **`/run/flag.txt`** — tmpfs, *outside* the Apache
+`/run/rctf/flags/<provider>` on the verified tmpfs, and `/app/start`
+publishes a 0644 copy to **`/run/flag.txt`** — tmpfs, *outside* the Apache
 DocumentRoot. `GET /flag.txt` therefore answers 404 and the flag never
-lands on the ext4; the objective is to read it through the RCE (the chain
-executes as www-data, which reads the tmpfs copy). `run.sh` asserts both
-halves fail-closed on the vulnerable image: plain HTTP must **not** serve
-the flag (`assert_flag_http_absent`, 404 + no flag bytes, probed at
-`/flag.txt` and `/www/flag.txt`), and the calibrated chain must be able to
-read it (`assert_chain_flag_read`: the `cat /run/flag.txt>/www/p` payload,
-fetched over HTTP and exact-matched against the flag the runner itself
-handed to the instance through the agent API). The previous placement
-(`/www/flag.txt`) made `GET /flag.txt` hand the objective over plain HTTP
-with no exploit at all; that regression can no longer land silently.
+lands on the ext4. The provider file name is resolved robustly because the
+two creators name it differently: the **lab runner** registers the provider
+as `main` (`/run/rctf/flags/main`), while the **rCTF platform** resolves
+the challenge's registered provider and passes it through verbatim —
+`flags/static` from `challenge.yaml` — which the guest init sanitises to
+**`flags_static`**. `/app/start` resolves `main`, then `flags_static`, then
+the single file when exactly one exists; if nothing resolves, no flag is
+published and the runner's assertions fail loudly.
+
+The objective is to read the flag through the RCE (the chain executes as
+www-data, which reads the tmpfs copy) — under one real constraint: the
+calibrated 167-byte carrier caps the chain's command at **14 bytes**, so
+the literal `cat /run/flag.txt>/www/p` (24 bytes) is rejected by the
+exploit itself. `/app/start` therefore exports **`F=/run/flag.txt`**, and
+the objective fits the budget: the recon payload `env>/www/p` (9 bytes)
+reveals `F`, and `cat $F>/www/p` (13 bytes) reads the flag. `run.sh`
+asserts every half fail-closed on the vulnerable image: plain HTTP must
+**not** serve the flag (`assert_flag_http_absent`, 404 + no flag bytes at
+`/flag.txt` and `/www/flag.txt`); the env dump must reveal
+`F=/run/flag.txt` without leaking the flag (`assert_chain_env_reveal`);
+the chain must read the exact per-run flag through `$F`
+(`assert_chain_flag_read`, exact-matched against the flag the runner
+itself handed to the instance through the agent API); and a **second,
+platform-named instance** created with the raw provider string
+`flags/static` must pass the same objective assertions, proving the
+platform delivery path (`main`-based instances and assertions are
+unchanged). The previous placement (`/www/flag.txt`) made `GET /flag.txt`
+hand the objective over plain HTTP with no exploit at all; that regression
+can no longer land silently.
 
 ## Requirements and cost
 

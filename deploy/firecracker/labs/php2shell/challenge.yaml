@@ -5,11 +5,15 @@
 #
 # Flag flow (no secret is committed here): the event's flag provider fills
 # `flags` below; the instancer hands the flag to the agent, the agent to
-# Firecracker MMDS, and the guest /app/start copies $RCTF_FLAGS_DIR/main to
-# /run/flag.txt -- tmpfs, OUTSIDE the Apache DocumentRoot, so GET /flag.txt
-# answers 404 and the flag never lands on the ext4. The intended objective
-# is to read it through the chain's RCE (the exploit executes as www-data,
-# which can read the 0644 tmpfs copy): `cat /run/flag.txt`.
+# Firecracker MMDS, and the guest /app/start copies the delivered flag file
+# (this challenge's registered name "flags/static", sanitised by the guest
+# init to "flags_static"; the lab runner's name is "main") to /run/flag.txt
+# -- tmpfs, OUTSIDE the Apache DocumentRoot, so GET /flag.txt answers 404
+# and the flag never lands on the ext4. The intended objective is to read
+# it through the chain's RCE (the exploit executes as www-data, which reads
+# the 0644 tmpfs copy). The calibrated carrier caps the RCE command at 14
+# bytes, so app-start exports F=/run/flag.txt: `env>/www/p` reveals the
+# pointer and `cat $F>/www/p` reads the flag.
 name: M364 Outage Service-Credit Portal
 category: web
 description: >-

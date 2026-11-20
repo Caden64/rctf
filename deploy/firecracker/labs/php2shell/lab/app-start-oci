@@ -15,18 +15,48 @@ set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mkdir -p /www /tmp
 
+# --- flag resolution (lab "main", platform "flags_static"; see README) ---
 # Publish the per-instance flag (tmpfs, never baked into the image) so the
 # lab has a real objective: read it through the RCE. /run, NOT /www: /www
 # is the Apache DocumentRoot, so a flag copied there is served verbatim at
 # /flag.txt over plain HTTP (trivially solvable). /run/flag.txt is outside
 # DocumentRoot -- Apache never serves it -- and stays on the tmpfs, never
-# on the ext4. The chain executes as www-data (uid 33), which reads the
-# 0644 copy: `cat /run/flag.txt` through the RCE is the objective, and
-# run.sh asserts both halves (flag NOT web-served; flag readable via RCE).
-if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
-  cp "$RCTF_FLAGS_DIR/main" /run/flag.txt
-  chmod 0644 /run/flag.txt
+# on the ext4.
+#
+# The flag SOURCE is resolved name-robustly: the lab runner registers the
+# provider as "main", but the rCTF platform resolves the challenge's
+# registered provider name and passes it through verbatim ("flags/static"
+# in challenge.yaml), which the guest init sanitises to "flags_static".
+# Order: "main", then "flags_static", then the single file in the flags
+# directory when exactly one exists. If nothing resolves, no flag is
+# published and the runner's flag-read assertion fails loudly.
+if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -d "$RCTF_FLAGS_DIR" ]; then
+  flag_src=
+  for cand in main flags_static; do
+    if [ -z "$flag_src" ] && [ -f "$RCTF_FLAGS_DIR/$cand" ]; then
+      flag_src=$RCTF_FLAGS_DIR/$cand
+    fi
+  done
+  if [ -z "$flag_src" ]; then
+    set -- "$RCTF_FLAGS_DIR"/*
+    if [ "$#" -eq 1 ] && [ -f "$1" ]; then
+      flag_src=$1
+    fi
+  fi
+  if [ -n "$flag_src" ]; then
+    cp "$flag_src" /run/flag.txt
+    chmod 0644 /run/flag.txt
+  fi
 fi
+# The objective must be reachable within the calibrated carrier's 14-byte
+# command budget: the 167-byte fake HashTable caps the chain's --cmd at 14
+# bytes, so the literal `cat /run/flag.txt>/www/p` (24 bytes) is rejected
+# by the exploit itself. Export a one-letter pointer instead: the recon
+# payload `env>/www/p` (9 bytes) reveals F, and `cat $F>/www/p` (13
+# bytes) reads the flag through the RCE. run.sh asserts both halves
+# fail-closed (flag NOT web-served; flag readable via the pointer).
+export F=/run/flag.txt
+# --- end flag resolution ---
 
 # The webroot must be writable by the worker for the out-of-band proof
 # (`id>/www/p`). The page files stay world-readable.

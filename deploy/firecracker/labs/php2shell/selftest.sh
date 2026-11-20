@@ -309,23 +309,76 @@ grep -q 'lab/m364-oci.conf' "$LAB_DIR/build-oci.sh" &&
 # off the ext4: /run/flag.txt (tmpfs, readable by the www-data worker the
 # chain executes as), never /www/flag.txt -- which GET /flag.txt would
 # serve verbatim over plain HTTP, making the event challenge trivially
-# solvable.
+# solvable. The SOURCE name must resolve both delivery names (lab "main";
+# platform "flags/static" sanitised by the guest init to "flags_static"),
+# and the objective must fit the calibrated carrier's 14-byte command
+# budget via the exported F pointer.
 for f in "$LAB_DIR/lab/app-start" "$LAB_DIR/lab/app-start-oci"; do
-  grep -q 'cp "$RCTF_FLAGS_DIR/main" /run/flag.txt' "$f" &&
-    ok "$(basename "$f") publishes the flag to /run/flag.txt (tmpfs, outside DocumentRoot)" ||
-    bad "$(basename "$f") does not publish the flag to /run/flag.txt"
+  base=$(basename "$f")
+  grep -q 'for cand in main flags_static' "$f" &&
+    ok "$base resolves the flag source: main first, then flags_static" ||
+    bad "$base does not resolve both flag delivery names in order"
+  grep -q 'cp "$flag_src" /run/flag.txt' "$f" &&
+    ok "$base publishes the resolved flag to /run/flag.txt (tmpfs, outside DocumentRoot)" ||
+    bad "$base does not publish the flag to /run/flag.txt"
+  grep -q 'export F=/run/flag.txt' "$f" &&
+    ok "$base exports the F objective pointer (14-byte carrier-safe)" ||
+    bad "$base does not export the F objective pointer"
   if grep -q '/www/flag\.txt' "$f"; then
-    bad "$(basename "$f") still references /www/flag.txt (would be served at /flag.txt over HTTP)"
+    bad "$base still references /www/flag.txt (would be served at /flag.txt over HTTP)"
   else
-    ok "$(basename "$f") never places the flag inside the /www DocumentRoot"
+    ok "$base never places the flag inside the /www DocumentRoot"
   fi
+  # Behavioral test: extract the shipped resolution block, redirect the
+  # publish path into the selftest sandbox, and exercise the delivery
+  # orders. A regression in the ordering logic fails here, unprivileged.
+  block=$TMP/$base.flagblock.sh
+  sed -n '/^# --- flag resolution/,/^# --- end flag resolution/p' "$f" \
+    | sed "s|/run/flag\.txt|$TMP/flag-out.txt|g" >"$block"
+  if [ -s "$block" ] && grep -q 'flag_src=' "$block"; then
+    ok "$base: flag-resolution block extracted for the sandbox test"
+  else
+    bad "$base: flag-resolution markers not found for extraction"
+    continue
+  fi
+  rm -rf "$TMP/flags-s1" "$TMP/flags-s2" "$TMP/flags-s3" "$TMP/flags-s4" "$TMP/flag-out.txt"
+  mkdir -p "$TMP/flags-s1" "$TMP/flags-s2" "$TMP/flags-s3" "$TMP/flags-s4"
+  printf 'flag-A' >"$TMP/flags-s1/main"
+  printf 'flag-B' >"$TMP/flags-s1/flags_static"
+  printf 'flag-B' >"$TMP/flags-s2/flags_static"
+  printf 'flag-C' >"$TMP/flags-s3/custom_provider"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s1 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-A" ] &&
+    ok "$base: main wins over flags_static when both are delivered" ||
+    bad "$base: main did not win over flags_static"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s2 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-B" ] &&
+    ok "$base: the platform name (flags_static) is resolved alone" ||
+    bad "$base: the platform name (flags_static) was not resolved"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s3 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-C" ] &&
+    ok "$base: a single differently named flags file falls back correctly" ||
+    bad "$base: the single-file fallback is broken"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s4 sh "$block" ) >/dev/null 2>&1
+  [ ! -e "$TMP/flag-out.txt" ] &&
+    ok "$base: no flag is published when nothing resolves (fail-closed)" ||
+    bad "$base: published a flag from an empty flags directory"
 done
 grep -q 'assert_flag_http_absent "vulnerable image" flag.txt' "$LAB_DIR/run.sh" &&
   ok "run.sh asserts GET /flag.txt answers 404 without the flag bytes" ||
   bad "run.sh lacks the flag-not-web-served regression check"
-grep -q 'cat /run/flag\.txt' "$LAB_DIR/run.sh" &&
-  ok "run.sh proves the flag is readable from /run through the RCE" ||
-  bad "run.sh does not prove the flag-read objective"
+grep -q 'cat \$F>/www/p' "$LAB_DIR/run.sh" &&
+  ok "run.sh proves the flag is readable from /run through the RCE (13-byte carrier-safe payload)" ||
+  bad "run.sh does not prove the flag-read objective within the carrier budget"
+grep -q 'env>/www/p' "$LAB_DIR/run.sh" &&
+  ok "run.sh proves the F pointer is discoverable through the RCE (env dump)" ||
+  bad "run.sh does not prove the objective-pointer discovery path"
+grep -q 'flags/static' "$LAB_DIR/run.sh" &&
+  ok "run.sh exercises the platform provider name (flags/static)" ||
+  bad "run.sh does not exercise the platform flag-delivery name"
 grep -q 'run/flag\.txt' "$LAB_DIR/challenge.yaml" &&
   ok "challenge.yaml documents the /run/flag.txt objective" ||
   bad "challenge.yaml still describes the old flag placement"

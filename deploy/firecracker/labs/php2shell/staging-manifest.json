@@ -30,7 +30,7 @@
   "staging": {
     "target": "<agent imagesDir>/php2shell-vuln/",
     "guestContract": "deploy/firecracker/guest/README.md (image contract v1): vmlinux and rootfs.ext4 must be regular files, root-or-agent-owned, not group/world-writable; image names match ^[a-z0-9][a-z0-9._-]{0,62}$; rootfs.ext4 must fit the challenge's diskMiB (challenge.yaml: 1536)",
-    "flagFlow": "MMDS -> /run/rctf/flags/main (guest init, tmpfs) -> /run/flag.txt (0644, /app/start). Outside the Apache DocumentRoot: GET /flag.txt answers 404 (asserted by the lab runner); the intended objective is `cat /run/flag.txt` through the RCE. The flag never lands on the ext4 rootfs and is never web-served.",
+    "flagFlow": "MMDS -> /run/rctf/flags/<provider> (guest init, tmpfs; the platform passes this challenge's registered provider name 'flags/static' through verbatim, sanitised by init to 'flags_static'; the lab runner's name is 'main') -> /run/flag.txt (0644, /app/start, resolved name-robustly). Outside the Apache DocumentRoot: GET /flag.txt answers 404 (asserted by the lab runner). The carrier caps the RCE command at 14 bytes, so app-start exports F=/run/flag.txt; the objective is `env>/www/p` recon then `cat $F>/www/p` through the RCE. The flag never lands on the ext4 rootfs and is never web-served.",
     "note": "offsets.env and meta.env are lab tooling artifacts and may be staged alongside for provenance; only vmlinux and rootfs.ext4 are required by the guest contract. rootfs.ext4 bytes are build-specific (mkfs timestamps): rebuilds produce a different sha256 and require a refreshed manifest as part of the reviewed re-verification (selftest.sh enforces this when both the manifest and a built image are present)."
   },
   "verification": {

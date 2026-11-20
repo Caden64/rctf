@@ -8,15 +8,38 @@ set -eu
 
 mkdir -p /www /tmp
 
+# --- flag resolution (lab "main", platform "flags_static"; see README) ---
 # Publish the per-instance flag (tmpfs, never baked into the image) so the
 # lab has a real objective: read it through the RCE. /run, NOT /www: /www
 # is the Apache DocumentRoot, so a flag copied there is served verbatim at
 # /flag.txt over plain HTTP. /run/flag.txt is outside DocumentRoot, on the
-# tmpfs, and readable by the www-data worker the chain executes as.
-if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -f "$RCTF_FLAGS_DIR/main" ]; then
-  cp "$RCTF_FLAGS_DIR/main" /run/flag.txt
-  chmod 0644 /run/flag.txt
+# tmpfs, readable by the www-data worker the chain executes as. The flag
+# SOURCE is resolved name-robustly: the lab runner registers "main"; the
+# rCTF platform passes the challenge's registered provider name through
+# verbatim ("flags/static"), which the guest init sanitises to
+# "flags_static"; then the single file when exactly one exists. F points
+# at the objective so it fits the calibrated 14-byte carrier budget:
+# `cat $F>/www/p` (the literal 24-byte path command is rejected).
+if [ -n "${RCTF_FLAGS_DIR:-}" ] && [ -d "$RCTF_FLAGS_DIR" ]; then
+  flag_src=
+  for cand in main flags_static; do
+    if [ -z "$flag_src" ] && [ -f "$RCTF_FLAGS_DIR/$cand" ]; then
+      flag_src=$RCTF_FLAGS_DIR/$cand
+    fi
+  done
+  if [ -z "$flag_src" ]; then
+    set -- "$RCTF_FLAGS_DIR"/*
+    if [ "$#" -eq 1 ] && [ -f "$1" ]; then
+      flag_src=$1
+    fi
+  fi
+  if [ -n "$flag_src" ]; then
+    cp "$flag_src" /run/flag.txt
+    chmod 0644 /run/flag.txt
+  fi
 fi
+export F=/run/flag.txt
+# --- end flag resolution ---
 
 # The webroot must be writable by the worker for the out-of-band proof
 # (`id>/www/p`).
