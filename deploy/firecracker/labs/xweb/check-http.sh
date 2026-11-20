@@ -47,6 +47,7 @@ xweb_badcol_archive_probe() { printf "%s" "x' UNION SELECT created FROM service_
 #     SERVICE        themed service-notes page
 #     ARCHIVE        themed archive page with rows
 #     ARCHIVE_EMPTY  themed archive page, no rows (genuine negative)
+#     MAINTENANCE    the hidden themed maintenance page
 #     NOTFOUND       themed 404
 #     REDIRECT       3xx
 #     OTHER          any other complete HTTP answer (genuine, unclassified)
@@ -76,6 +77,9 @@ classify_xweb() {
   fi
   if printf '%s' "$body" | grep -q 'id="xweb-archive"'; then
     printf 'ARCHIVE\n'; return 0
+  fi
+  if printf '%s' "$body" | grep -q 'id="xweb-maintenance"'; then
+    printf 'MAINTENANCE\n'; return 0
   fi
   if printf '%s' "$body" | grep -q 'id="xweb-login"'; then
     printf 'LOGIN\n'; return 0

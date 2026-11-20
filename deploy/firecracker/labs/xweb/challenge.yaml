@@ -1,11 +1,12 @@
-# XWEB-500 portal — the beginner ("dummy") web challenge for the rCTF
-# Firecracker instancer. One microVM per team, image xweb-vuln.
-# See deploy/firecracker/guest/README.md for the image contract and
-# deploy/firecracker/labs/xweb/README.md for the lab that verifies it.
+# XWEB-500 Portal — stage 2 of the staged pair (SQLi / default creds).
+# The enumeration stage is challenge-recon.yaml (fc-xweb-recon); both
+# records share the same xweb-vuln image and each instance carries only its
+# own platform flag. See deploy/firecracker/labs/xweb/README.md ("Staged
+# records and flag placement").
 #
 # Static per-team flags come from the platform (flags/static); the guest
-# consumes the flag only through MMDS ($RCTF_FLAGS_DIR/main on tmpfs). The
-# placeholder below is not a real flag.
+# consumes the flag only through MMDS. The placeholder below is not a real
+# flag.
 name: XWEB-500 Portal
 category: web
 description: >-
@@ -32,7 +33,7 @@ instancerConfig:
     bootTimeoutSeconds: 60
     readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
     env:
-      CHALLENGE: fc-xweb
+      CHALLENGE: fc-xweb # drives flag placement: DB service-note row only
   expose:
     - kind: https
       hostPrefix: xweb

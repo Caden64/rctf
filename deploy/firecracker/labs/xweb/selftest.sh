@@ -13,7 +13,13 @@
 #        patched build: admin/1234 -> flag (control positive path);
 #                       bypass -> DENIED; UNION archive -> ARCHIVE_EMPTY with
 #                       no flag; bad-column UNION -> ARCHIVE_EMPTY.
-#   3. the shell pieces of the lab pass syntax checks.
+#   3. the staged-record placement switch (env CHALLENGE): under
+#      fc-xweb-recon the delivered flag renders ONLY on the hidden
+#      /internal/maintenance.html page (found via robots.txt) and never via
+#      the creds/bypass/UNION paths; under the default record the flag lives
+#      ONLY in the DB service-note row and the hidden page yields nothing;
+#      the patched control applies the same switch identically.
+#   4. the shell pieces of the lab pass syntax checks.
 #
 # The portal is LAB-AUTHORED SOURCE (app/*.py). It is executed here by the
 # host's own python3 (3.14.10 on the reference machine, the same version the
@@ -81,6 +87,9 @@ expect_kind ARCHIVE 0 200 '<div class="xweb-card" id="xweb-archive"><table>' \
 expect_kind ARCHIVE_EMPTY 0 200 \
   '<div class="xweb-card" id="xweb-archive"><div id="xweb-empty">' \
   'archive page with no rows'
+expect_kind MAINTENANCE 0 200 \
+  '<div class="xweb-card" id="xweb-maintenance">' \
+  'hidden maintenance page'
 expect_kind OTHER 0 200 '<html>some other complete answer</html>' \
   'unknown themed page is genuine-but-unclassified'
 # marker precedence: a SQL fault rendered on a login page is a SQLERROR.
@@ -115,12 +124,12 @@ selftest_hex() { od -An -N4 -tx1 /dev/urandom | tr -d ' \n'; }
 #     multi  -> two unrecognised junk files     (ambiguous -> flagless)
 #     none   -> empty directory                 (flagless)
 start_portal() {
-  local variant=$1 case=$2 port appdir flags
-  appdir=$WORK/app-$variant-$case
+  local variant=$1 case=$2 placement=${3:-main} port appdir flags
+  appdir=$WORK/app-$variant-$case-$placement
   mkdir -p "$appdir"
   cp "$APP/xweb_common.py" "$appdir/xweb_common.py"
   cp "$APP/xweb_auth_$variant.py" "$appdir/xweb_auth.py"
-  flags=$WORK/flags-$variant-$case
+  flags=$WORK/flags-$variant-$case-$placement
   mkdir -p "$flags"
   SELFTEST_FLAG=
   SELFTEST_LOSERS=
@@ -152,14 +161,20 @@ start_portal() {
     *) bad "unknown start_portal case: $case"; return 1 ;;
   esac
   chmod 0400 "$flags"/* 2>/dev/null || true
-  printf 'IMAGE=xweb-selftest-%s\n' "$variant" >"$WORK/build-$variant-$case"
+  printf 'IMAGE=xweb-selftest-%s\n' "$variant" >"$WORK/build-$variant-$case-$placement"
+  # The staged-record env contract: CHALLENGE names the rCTF record and the
+  # app places the delivered flag accordingly (fc-xweb -> DB row,
+  # fc-xweb-recon -> hidden maintenance page only).
+  local challenge=fc-xweb
+  [ "$placement" = recon ] && challenge=fc-xweb-recon
   port=$(pick_port)
+  CHALLENGE=$challenge \
   XWEB_PORT=$port \
-  XWEB_DB=$WORK/db-$variant-$case.db \
-  XWEB_BUILD_FILE=$WORK/build-$variant-$case \
+  XWEB_DB=$WORK/db-$variant-$case-$placement.db \
+  XWEB_BUILD_FILE=$WORK/build-$variant-$case-$placement \
   RCTF_FLAGS_DIR=$flags \
-  RCTF_INSTANCE_ID=selftest-$variant-$case \
-  python3 "$appdir/xweb_common.py" >"$WORK/out-$variant-$case.log" 2>&1 &
+  RCTF_INSTANCE_ID=selftest-$variant-$case-$placement \
+  python3 "$appdir/xweb_common.py" >"$WORK/out-$variant-$case-$placement.log" 2>&1 &
   APP_PIDS="$APP_PIDS $!"
   # wait for the portal to answer
   local i
@@ -168,7 +183,7 @@ start_portal() {
     sleep 0.2
   done
   curl -s -o /dev/null "http://127.0.0.1:$port/" ||
-    { bad "$variant/$case: portal did not start (log: $(tail -3 "$WORK/out-$variant-$case.log" 2>/dev/null))"; return 1; }
+    { bad "$variant/$case/$placement: portal did not start (log: $(tail -3 "$WORK/out-$variant-$case-$placement.log" 2>/dev/null))"; return 1; }
   LAST_PORT=$port
   LAST_FLAGS=$flags
   return 0
@@ -206,19 +221,22 @@ login_flow() { # <port> <jar> <user> <pass> -> KIND/BODY of the POST
     --data-urlencode "username=$3" --data-urlencode "password=$4"
 }
 
-drive_portal() { # <variant> <case main|static|other|both|multi|none>
-  local variant=$1 case=$2 port
-  start_portal "$variant" "$case" || return 0
+drive_portal() { # <variant> <case main|static|other|both|multi|none> [placement main|recon]
+  local variant=$1 case=$2 placement=${3:-main} port
+  start_portal "$variant" "$case" "$placement" || return 0
   port=$LAST_PORT
   local label="$variant/$case"
+  [ "$placement" = recon ] && label="$variant/$case/recon"
   local selftest_flag=${SELFTEST_FLAG:-}
+  local is_recon=0
+  [ "$placement" = recon ] && is_recon=1
 
   # login page theme markers
   http_kind "$port" GET /
   [ "$KIND" = LOGIN ] && ok "$label: / is the themed login page" ||
     bad "$label: / classified $KIND (expected LOGIN)"
   for marker in 'XWEB-500' 'Supervisor Portal' 'FW 5.00.10' \
-    "Node: <span class=\"xweb-led\">selftest-$variant-$case</span>"; do
+    "Node: <span class=\"xweb-led\">selftest-$variant-$case-$placement</span>"; do
     if printf '%s' "$BODY" | grep -qF -- "$marker"; then
       ok "$label: login page shows themed marker: $marker"
     else
@@ -235,8 +253,34 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
     bad "$label: build comment does not report the right auth mode"
   fi
 
+  # enumeration hint + the hidden maintenance page
+  http_kind "$port" GET /robots.txt
+  [ "$KIND" = OTHER ] &&
+    ok "$label: robots.txt answers (enumeration hint)" ||
+    bad "$label: robots.txt classified $KIND (expected OTHER)"
+  printf '%s' "$BODY" | grep -qF 'Disallow: /internal/' &&
+    ok "$label: robots.txt disallows /internal/" ||
+    bad "$label: robots.txt does not disallow /internal/"
+  http_kind "$port" GET /internal/maintenance.html
+  [ "$KIND" = MAINTENANCE ] &&
+    ok "$label: the hidden maintenance page serves" ||
+    bad "$label: the hidden page classified $KIND (expected MAINTENANCE)"
+  if [ "$is_recon" = 1 ] && [ -n "$selftest_flag" ]; then
+    printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+      ok "$label: the hidden page exposes the per-run flag (recon placement)" ||
+      bad "$label: the hidden page does NOT expose the recon flag"
+  elif [ -n "$selftest_flag" ]; then
+    printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+      bad "$label: the hidden page leaked the DB flag (main placement)" ||
+      ok "$label: the hidden page does not yield the DB flag (main placement)"
+  else
+    printf '%s' "$BODY" | grep -Eq 'rctf\{' &&
+      bad "$label: the hidden page shows a flag-shaped string" ||
+      ok "$label: the hidden page shows no flag-shaped string"
+  fi
+
   # default credentials
-  jar_admin=$WORK/jar-$variant-$case-admin
+  jar_admin=$WORK/jar-$variant-$case-$placement-admin
   login_flow "$port" "$jar_admin" admin 1234
   if [ "$KIND" = REDIRECT ]; then
     ok "$label: admin/1234 authenticates (redirect to dashboard)"
@@ -252,7 +296,13 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
   http_kind "$port" GET /service -b "$jar_admin"
   [ "$KIND" = SERVICE ] && ok "$label: service notes render for admin" ||
     bad "$label: service notes classified $KIND (expected SERVICE)"
-  if [ -n "$selftest_flag" ]; then
+  if [ "$is_recon" = 1 ]; then
+    if [ -n "$selftest_flag" ]; then
+      printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+        bad "$label: the admin service notes leaked the recon flag" ||
+        ok "$label: the admin service notes do NOT yield the recon flag"
+    fi
+  elif [ -n "$selftest_flag" ]; then
     printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
       ok "$label: service notes display the per-run flag" ||
       bad "$label: service notes do NOT display the per-run flag"
@@ -264,7 +314,7 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
   expect_no_losers "$label (service notes)"
 
   # wrong credentials (genuine negative on both builds)
-  login_flow "$port" "$WORK/jar-$variant-$case-wrong" admin wrongcode
+  login_flow "$port" "$WORK/jar-$variant-$case-$placement-wrong" admin wrongcode
   [ "$KIND" = DENIED ] && ok "$label: wrong code is denied (genuine negative)" ||
     bad "$label: wrong code classified $KIND (expected DENIED)"
 
@@ -272,7 +322,7 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
   local bypass_user bypass_pass jar_bypass
   bypass_user=$(xweb_bypass_username)
   bypass_pass=$(xweb_bypass_password)
-  jar_bypass=$WORK/jar-$variant-$case-bypass
+  jar_bypass=$WORK/jar-$variant-$case-$placement-bypass
   login_flow "$port" "$jar_bypass" "$bypass_user" "$bypass_pass"
   if [ "$variant" = vuln ]; then
     if [ "$KIND" = REDIRECT ]; then
@@ -285,9 +335,15 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
       ok "$label: bypass session reaches the admin service notes" ||
       bad "$label: bypass session classified $KIND at /service"
     if [ -n "$selftest_flag" ]; then
-      printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
-        ok "$label: bypass path exposes the per-run flag" ||
-        bad "$label: bypass path did not expose the per-run flag"
+      if [ "$is_recon" = 1 ]; then
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          bad "$label: the bypass path leaked the recon flag" ||
+          ok "$label: the bypass path does NOT yield the recon flag"
+      else
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          ok "$label: bypass path exposes the per-run flag" ||
+          bad "$label: bypass path did not expose the per-run flag"
+      fi
     fi
   else
     [ "$KIND" = DENIED ] &&
@@ -304,9 +360,15 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
       ok "$label: UNION archive dump renders rows" ||
       bad "$label: UNION archive dump classified $KIND (expected ARCHIVE)"
     if [ -n "$selftest_flag" ]; then
-      printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
-        ok "$label: UNION archive dump exposes the per-run flag" ||
-        bad "$label: UNION archive dump did not expose the per-run flag"
+      if [ "$is_recon" = 1 ]; then
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          bad "$label: the UNION dump leaked the recon flag" ||
+          ok "$label: the UNION dump does NOT yield the recon flag"
+      else
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          ok "$label: UNION archive dump exposes the per-run flag" ||
+          bad "$label: UNION archive dump did not expose the per-run flag"
+      fi
     else
       printf '%s' "$BODY" | grep -Eq 'rctf\{' &&
         bad "$label: flagless UNION dump fabricated a flag-shaped string" ||
@@ -325,7 +387,7 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
   # UNION through the login form (login-as-data)
   local union_user jar_union
   union_user=$(xweb_union_login_username)
-  jar_union=$WORK/jar-$variant-$case-union
+  jar_union=$WORK/jar-$variant-$case-$placement-union
   login_flow "$port" "$jar_union" "$union_user" whatever
   if [ "$variant" = vuln ]; then
     [ "$KIND" = REDIRECT ] &&
@@ -333,9 +395,15 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
       bad "$label: UNION login classified $KIND (expected REDIRECT)"
     http_kind "$port" GET /dashboard -b "$jar_union"
     if [ -n "$selftest_flag" ]; then
-      printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
-        ok "$label: UNION login dumps the flag into the operator line" ||
-        bad "$label: UNION login did not dump the flag"
+      if [ "$is_recon" = 1 ]; then
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          bad "$label: the UNION login leaked the recon flag" ||
+          ok "$label: the UNION login does NOT yield the recon flag"
+      else
+        printf '%s' "$BODY" | grep -qF -- "$selftest_flag" &&
+          ok "$label: UNION login dumps the flag into the operator line" ||
+          bad "$label: UNION login did not dump the flag"
+      fi
     fi
   else
     [ "$KIND" = DENIED ] &&
@@ -358,9 +426,9 @@ drive_portal() { # <variant> <case main|static|other|both|multi|none>
   fi
 }
 
-# Delivery-name resolution matrix: the lab provider name, the platform
-# provider name, the single-file fallback, main-first ordering, the ambiguous
-# directory (flagless) and the empty directory (flagless).
+# Delivery-name resolution matrix (placement main): the lab provider name,
+# the platform provider name, the single-file fallback, main-first ordering,
+# the ambiguous directory (flagless) and the empty directory (flagless).
 SELFTEST_FLAG=
 SELFTEST_LOSERS=
 drive_portal vuln main
@@ -371,6 +439,12 @@ drive_portal patched static
 drive_portal vuln other
 drive_portal vuln both
 drive_portal vuln multi
+# Staged-record placement matrix: env CHALLENGE=fc-xweb-recon puts the
+# delivered flag ONLY on the hidden maintenance page (both provider names),
+# and the patched control applies the same placement switch identically.
+drive_portal vuln main recon
+drive_portal vuln static recon
+drive_portal patched main recon
 
 # --- 3. syntax checks ----------------------------------------------------------
 section 'lab shell pieces pass syntax checks'

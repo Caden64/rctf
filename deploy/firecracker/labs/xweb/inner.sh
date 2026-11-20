@@ -250,8 +250,8 @@ instance_id() { # <tag>; prints a fresh 16..32 char lowercase id
   printf 'xweb%s%s\n' "$1" "$(rand_hex)"
 }
 
-create_instance() { # <id> <image> <teamKey> <flag-or-empty> <tcp-expose yes|no> [provider]
-  local id=$1 image=$2 team=$3 flag=$4 with_tcp=$5 provider=${6:-main}
+create_instance() { # <id> <image> <teamKey> <flag-or-empty> <tcp-expose yes|no> [provider] [challenge-env]
+  local id=$1 image=$2 team=$3 flag=$4 with_tcp=$5 provider=${6:-main} challenge=${7:-fc-xweb}
   local now expires spec flags_json expose_json code
   now=$(date +%s)
   expires=$(((now + 1200) * 1000))
@@ -268,7 +268,7 @@ create_instance() { # <id> <image> <teamKey> <flag-or-empty> <tcp-expose yes|no>
 {"id":"$id","teamKey":"$team","image":"$image","vcpus":1,"memMiB":256,"diskMiB":512,
  "egress":false,"bootTimeoutSeconds":90,
  "readiness":{"kind":"http","port":8080,"path":"/","expectStatus":200},
- "env":{"CHALLENGE":"xweb"},
+ "env":{"CHALLENGE":"$challenge"},
  "expose":$expose_json,
  "expiresAtMs":$expires,
  "flags":$flags_json}
@@ -368,6 +368,23 @@ expect_flag() { # <flag> <label>
   else
     bad "$2: the exact per-run flag is not in the response"
   fi
+}
+
+expect_flag_absent() { # <flag> <label>
+  if printf '%s' "$BODY" | grep -qF -- "$1"; then
+    bad "$2: the response must not contain the flag"
+  else
+    ok "$2"
+  fi
+}
+
+# The enumeration hint and the hidden page, probed on every placement matrix.
+expect_enumeration_hint() { # <http-host> <label>
+  probe_http "$1" GET /robots.txt
+  expect_kind OTHER "$2: robots.txt answers (enumeration hint)"
+  expect_marker 'Disallow: /internal/' "$2: robots.txt disallows /internal/"
+  probe_http "$1" GET /internal/maintenance.html
+  expect_kind MAINTENANCE "$2: the hidden maintenance page serves"
 }
 
 expect_no_flag() { # <flag-or-empty> <label>
@@ -488,6 +505,13 @@ check_vuln_instance() {
   expect_kind REDIRECT "$label: UNION login authenticates as the dumped row"
   probe_http "$host" GET /dashboard -b "$jar_root-union"
   expect_flag "$flag" "$label: the UNION login dumps the flag into the operator line"
+
+  # 9. Staged-record placement (this instance carries the SQLi-stage record):
+  #    the enumeration hint exists, the hidden page serves, and it must NOT
+  #    yield the flag that lives in the DB row.
+  expect_enumeration_hint "$host" "$label"
+  expect_flag_absent "$flag" \
+    "$label: the hidden maintenance page does not yield the DB flag"
 }
 
 # --- the patched control ---------------------------------------------------------
@@ -533,6 +557,13 @@ check_patched_instance() {
 
   portal_login "$host" "$jar_root-union" "$union_user" whatever
   expect_kind DENIED "$label: the UNION login payload is denied (genuine negative)"
+
+  # The placement switch applies to the control identically: this instance
+  # carries the SQLi-stage record, so the hidden page must not yield the
+  # flag that lives in the DB row.
+  expect_enumeration_hint "$host" "$label"
+  expect_flag_absent "$flag" \
+    "$label: the hidden maintenance page does not yield the DB flag"
 }
 
 # --- flagless negative control ----------------------------------------------------
@@ -566,6 +597,8 @@ check_noflag_instance() {
   probe_http "$host" GET /archive -G --data-urlencode "probe=$union_probe"
   expect_kind ARCHIVE "$label: the UNION dump still renders the (seeded) notes"
   expect_no_flag '' "$label: the UNION dump cannot fabricate a flag"
+  expect_enumeration_hint "$host" "$label"
+  expect_no_flag '' "$label: the hidden page shows no flag-shaped string"
 }
 
 # --- create, wait, check ------------------------------------------------------------
@@ -574,29 +607,40 @@ FLAG_B="rctf{xweb-team-b-$(rand_hex)}"
 FLAG_P="rctf{xweb-team-p-$(rand_hex)}"
 # Delivered under the platform's registered provider name: rCTF resolves the
 # challenge flag entry (provider "flags/static") and the guest init sanitises
-# it to "flags_static". This instance proves the portal resolves that name.
+# it to "flags_static". Instances S and RS prove the portal resolves that
+# name, on both staged records.
 FLAG_S="rctf{xweb-static-$(rand_hex)}"
+# Recon-stage flags: delivered to instances whose env names the enumeration
+# record, so the app must place them ONLY on the hidden maintenance page.
+FLAG_R="rctf{xweb-recon-$(rand_hex)}"
+FLAG_RS="rctf{xweb-reconstatic-$(rand_hex)}"
 
 ID_A=$(instance_id vulna) || fatal 'could not build instance id A'
 ID_B=$(instance_id vulnb) || fatal 'could not build instance id B'
 ID_P=$(instance_id pctrl) || fatal 'could not build instance id P'
 ID_N=$(instance_id noflg) || fatal 'could not build instance id N'
 ID_S=$(instance_id statc) || fatal 'could not build instance id S'
+ID_R=$(instance_id recon) || fatal 'could not build instance id R'
+ID_RS=$(instance_id recs) || fatal 'could not build instance id RS'
 
 declare -A HOST_OF=() TCP_OF=()
 
-# provider field: the lab instances use "main"; instance S uses the platform's
-# registered "flags/static" so the runner asserts the platform delivery name.
-for pair in "A:$ID_A:xweb-vuln:$FLAG_A:yes:main" \
-  "B:$ID_B:xweb-vuln:$FLAG_B:yes:main" \
-  "P:$ID_P:xweb-patched:$FLAG_P:no:main" \
-  "N:$ID_N:xweb-vuln::no:main" \
-  "S:$ID_S:xweb-vuln:$FLAG_S:no:flags/static"; do
-  IFS=: read -r tag id image flag with_tcp provider <<<"$pair"
-  section "creating instance $tag ($image, provider $provider)"
+# provider field: the lab instances use "main"; S and RS use the platform's
+# registered "flags/static". challenge field: the rCTF record name exported
+# as env CHALLENGE, which drives the app's flag placement (fc-xweb = SQLi
+# stage, fc-xweb-recon = enumeration stage).
+for pair in "A:$ID_A:xweb-vuln:$FLAG_A:yes:main:fc-xweb" \
+  "B:$ID_B:xweb-vuln:$FLAG_B:yes:main:fc-xweb" \
+  "P:$ID_P:xweb-patched:$FLAG_P:no:main:fc-xweb" \
+  "N:$ID_N:xweb-vuln::no:main:fc-xweb" \
+  "S:$ID_S:xweb-vuln:$FLAG_S:no:flags/static:fc-xweb" \
+  "R:$ID_R:xweb-vuln:$FLAG_R:no:main:fc-xweb-recon" \
+  "RS:$ID_RS:xweb-vuln:$FLAG_RS:no:flags/static:fc-xweb-recon"; do
+  IFS=: read -r tag id image flag with_tcp provider challenge <<<"$pair"
+  section "creating instance $tag ($image, provider $provider, challenge $challenge)"
   # teamKey must match ^[a-z0-9]{8,64}$: the display tag is lowercased here.
   if create_instance "$id" "$image" "team${tag,,}$(rand_hex)" "$flag" \
-    "$with_tcp" "$provider" >/dev/null; then
+    "$with_tcp" "$provider" "$challenge" >/dev/null; then
     ok "instance $tag created over the agent API ($id)"
   else
     bad "instance $tag create was rejected"
@@ -674,6 +718,68 @@ check_static_instance() {
   probe_http "$host" GET /archive -G --data-urlencode "probe=$union_probe"
   expect_kind ARCHIVE "$label: the UNION dump renders the service notes"
   expect_flag "$flag" "$label: the UNION dump exposes the platform-named flag"
+
+  # This instance carries the SQLi-stage record: the hidden page must not
+  # yield the flag that lives in the DB row.
+  expect_enumeration_hint "$host" "$label"
+  expect_flag_absent "$flag" \
+    "$label: the hidden maintenance page does not yield the DB flag"
+}
+
+# --- recon-stage placement control --------------------------------------------------
+# check_placement_recon <label> <id> <http-host> <flag>
+# The instance carries the enumeration record (env CHALLENGE=fc-xweb-recon):
+# the app must place the delivered flag ONLY on the hidden, unlinked
+# maintenance page. Fail closed: the flag must NOT appear through the
+# default-credentials admin page, the ' OR 1=1 bypass or the UNION dump,
+# while all of those must still classify as genuine portal outcomes.
+check_placement_recon() {
+  local label=$1 id=$2 host=$3 flag=$4
+  local jar_root=/tmp/xweb-jar-$id
+  rm -f "$jar_root"*
+
+  section "recon placement $label (env CHALLENGE=fc-xweb-recon)"
+
+  probe_http "$host" GET /
+  expect_kind LOGIN "$label: published endpoint serves the portal"
+  expect_node "$id" "$label: login page reports its own node id"
+  expect_build xweb-vuln concat "$label: running guest reports the pinned build"
+
+  # Enumeration: robots.txt hints at /internal/, the hidden page carries the
+  # exact per-run flag and nothing else does.
+  expect_enumeration_hint "$host" "$label"
+  expect_flag "$flag" "$label: the hidden maintenance page exposes the per-run flag"
+
+  # Win paths of the OTHER record must NOT yield this record's flag, and
+  # must still classify as genuine outcomes (placeholder row in the DB).
+  portal_login "$host" "$jar_root-admin" admin 1234
+  expect_kind REDIRECT "$label: admin/1234 authenticates (documented default)"
+  probe_http "$host" GET /service -b "$jar_root-admin"
+  expect_kind SERVICE "$label: admin area renders the service notes"
+  expect_flag_absent "$flag" \
+    "$label: the admin service notes do NOT yield the recon flag"
+
+  local bypass_user bypass_pass
+  bypass_user=$(xweb_bypass_username)
+  bypass_pass=$(xweb_bypass_password)
+  portal_login "$host" "$jar_root-bypass" "$bypass_user" "$bypass_pass"
+  expect_kind REDIRECT "$label: the ' OR 1=1 bypass still authenticates"
+  probe_http "$host" GET /service -b "$jar_root-bypass"
+  expect_kind SERVICE "$label: the bypass session still reaches the admin area"
+  expect_flag_absent "$flag" \
+    "$label: the bypass path does NOT yield the recon flag"
+
+  local union_probe
+  union_probe=$(xweb_union_archive_probe)
+  probe_http "$host" GET /archive -G --data-urlencode "probe=$union_probe"
+  expect_kind ARCHIVE \
+    "$label: the UNION dump still renders the service notes (classify normally)"
+  expect_flag_absent "$flag" "$label: the UNION dump does NOT yield the recon flag"
+
+  local badcol_probe
+  badcol_probe=$(xweb_badcol_archive_probe)
+  probe_http "$host" GET /archive -G --data-urlencode "probe=$badcol_probe"
+  expect_kind SQLERROR "$label: wrong-column UNION still surfaces a genuine SQL fault"
 }
 
 # --- run the checks -----------------------------------------------------------------
@@ -701,6 +807,16 @@ if [ -n "${HOST_OF[S]:-}" ]; then
   check_static_instance 'platform-named' "$ID_S" "${HOST_OF[S]}" "$FLAG_S"
 else
   bad 'platform-named flags instance is missing; skipping its checks'
+fi
+if [ -n "${HOST_OF[R]:-}" ]; then
+  check_placement_recon 'recon record (lab provider)' "$ID_R" "${HOST_OF[R]}" "$FLAG_R"
+else
+  bad 'recon-record instance is missing; skipping its checks'
+fi
+if [ -n "${HOST_OF[RS]:-}" ]; then
+  check_placement_recon 'recon record (platform provider)' "$ID_RS" "${HOST_OF[RS]}" "$FLAG_RS"
+else
+  bad 'recon-record platform-named instance is missing; skipping its checks'
 fi
 
 # --- isolation ------------------------------------------------------------------------

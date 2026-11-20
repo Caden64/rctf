@@ -47,30 +47,40 @@ hand-started process:
    still renders the seeded service notes, but no flag-shaped string exists
    anywhere — proving the dump can only expose what the database really
    contains and the display never fabricates a flag.
-5. **Instance isolation**: two instances of the vulnerable image (two teams)
+5. **Staged-record placement**: a recon-named instance (env
+   `CHALLENGE=fc-xweb-recon`) exposes its exact per-run flag ONLY through the
+   hidden, unlinked maintenance page that enumeration (robots.txt →
+   `/internal/`) finds — the default-credentials page, the `OR 1=1` bypass
+   and the UNION dump must NOT yield it while still classifying as genuine
+   portal outcomes; a main-named instance exposes its flag ONLY through the
+   creds/SQLi paths, and its hidden page must NOT yield it. Both records are
+   covered under both flag delivery names.
+6. **Instance isolation**: two instances of the vulnerable image (two teams)
    get distinct published hostnames and distinct public TCP ports; each
    endpoint reports its own `RCTF_INSTANCE_ID` node marker, neither endpoint
    reports the other's node, and a UNION dump through team A's endpoint
    yields team A's flag and never team B's (and vice versa).
-6. **Readiness**: every instance must reach `running`, which requires the
+7. **Readiness**: every instance must reach `running`, which requires the
    agent's own HTTP readiness probe (`GET /` on guest port 8080 expecting
    200) to pass; an instance that never answers fails the run.
-7. **Fail-closed classification**: every probe outcome is classified
+8. **Fail-closed classification**: every probe outcome is classified
    (`check-http.sh`); a connection refusal, timeout, or unclassifiable
    response is INCONCLUSIVE and is always a failure. Control images prove
    the positive path, so a denial cannot be vacuous.
 
-The documented one-line summary is: **on `xweb-vuln`, `admin`/`1234` shows the
-flag and `admin' OR 1=1--` / a UNION payload dump it unauthenticated; on
-`xweb-patched` both injection paths fail closed while the default
-credentials still work.**
+The documented one-line summary is: **on the recon record the flag lives
+only on the hidden maintenance page that robots.txt leads to; on the main
+record it lives only in the DB service-note row, reachable by
+`admin`/`1234` and by SQL injection (`' OR 1=1--` bypass or a UNION dump);
+`xweb-patched` denies every injection payload on both records.**
 
 ## The two win paths for players
 
-| Path | Steps |
-| ---- | ----- |
-| Default credentials | open the portal → log in as `admin` / `1234` (documented on the commissioning-sheet hint line) → "Service notes" page shows the flag |
-| SQL injection | open the public "Diagnostics archive" → the filter parameter is injectable → `x' UNION SELECT created, title, body FROM service_notes--` renders the flag row; or bypass the login with `admin' OR 1=1--` and read the same admin page |
+| Path | Record | Steps |
+| ---- | ------ | ----- |
+| Enumeration (recon stage) | `fc-xweb-recon` | fetch `robots.txt` → notice `Disallow: /internal/` → open `/internal/maintenance.html` → the maintenance note carries the flag |
+| Default credentials | `fc-xweb` | log in as `admin` / `1234` (documented on the commissioning-sheet hint line) → "Service notes" page shows the flag |
+| SQL injection | `fc-xweb` | the public "Diagnostics archive" filter is injectable → `x' UNION SELECT created, title, body FROM service_notes--` renders the flag row; or bypass the login with `admin' OR 1=1--` and read the same admin page |
 
 ## Images
 
@@ -176,14 +186,39 @@ concurrent vmtest or lab runs do not interfere. The transcript is written
 below the lab cache and, unless the VM must be kept, the per-run VM directory
 is removed after teardown.
 
-## Event registration
+## Staged records and flag placement
 
-`challenge.yaml` registers the challenge for the platform in the
-`sample-challenge.yaml` format: instancer `firecracker`, image `xweb-vuln`,
-one `https` expose (`hostPrefix: xweb`, guest port 8080), HTTP readiness on
-`/`. Static per-team flags come from the platform (`flags/static`); the
-guest consumes them only through MMDS. The `xweb-patched` image is the
-reference control for post-event debriefs and is not player-facing.
+The event design is **two staged rCTF records sharing one image**
+(`xweb-vuln`). Each record spawns its own instance, and each instance
+carries only its own flag (that is the platform model), so the app decides
+where the one delivered flag lives from the per-record environment:
+the instancer env exports `CHALLENGE` with the record name.
+
+| Record             | env `CHALLENGE`    | Flag location                                  | Player route |
+| ------------------ | ----------------- | ---------------------------------------------- | ------------ |
+| `fc-xweb-recon`    | `fc-xweb-recon`   | **only** the hidden, unlinked maintenance page | enumerate: `robots.txt` disallows `/internal/` → `/internal/maintenance.html` |
+| `fc-xweb` (main)   | `fc-xweb` (default) | **only** the DB service-note row             | default credentials and/or SQL injection |
+
+The hidden page is pure static theme content (a plant maintenance schedule,
+original text) referenced from nowhere in the portal; `robots.txt` is its
+only discovery hint. On the recon record the DB service-note row carries a
+non-flag placeholder (themed, never flag-shaped), so the admin page, the
+`OR 1=1` bypass and the UNION dump all still classify as genuine portal
+outcomes while never yielding the flag. On the main record the hidden page
+carries an equivalent non-flag note. Both records' instances are otherwise
+identical, and the `xweb-patched` control applies the placement switch
+identically (same shared app module).
+
+The runner asserts the full placement matrix fail-closed: recon-named
+instances must expose the exact per-run flag ONLY via the hidden page
+(default-creds page, bypass and UNION dump must not yield it), and
+main-named instances must expose it ONLY via the creds/SQLi paths (the
+hidden page must not yield it). Both records are additionally covered under
+the platform's `flags/static` delivery name (see below).
+
+Event registration: `challenge.yaml` (record `fc-xweb`) and
+`challenge-recon.yaml` (record `fc-xweb-recon`) — same image, one `https`
+expose each, their own platform flags.
 
 ## Safety boundary and honesty
 

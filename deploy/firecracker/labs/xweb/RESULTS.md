@@ -9,53 +9,84 @@ Host (reference machine): Linux, 16 CPUs, 54 GiB RAM, `/dev/kvm` present and
 readable/writable, QEMU with nested virtualization working (previous
 Firecracker lab runs green on this host), ~1.7 TiB free disk.
 
-## 2026-11-19 — unprivileged selftest and image build (host, pre-fix)
+## 2026-11-19 (19:24) — staged two-record design and re-verification (green)
 
-Executed for real, unprivileged, on the host.
+**Why:** the event design was split into two staged rCTF records sharing the
+one `xweb-vuln` image — `fc-xweb-recon` (enumeration stage: the instance's
+flag is exposed only at a hidden, unlinked spot found by enumerating the
+site) and `fc-xweb` (SQLi/default-credentials stage: the flag stays only in
+the DB service-note row). Each record spawns its own instance carrying only
+its own flag, so the app must decide where the one delivered flag lives from
+the per-record instancer env (`CHALLENGE`).
 
-- Command: `cd deploy/firecracker/labs/xweb && ./selftest.sh`
-- Result: **75 passed, 0 failed**; exit 0. Covers the fail-closed classifier
-  (13 canned outcomes), the lab-authored portal source driven with the exact
-  payload set on the host python 3.14.10 (the same version the guest pins):
-  vuln-build default-creds / `OR 1=1` bypass / UNION-archive / UNION-login /
-  bad-column behaviour, patched-build denials, flagless-boot behaviour, and
-  `bash -n` / `sh -n` / `py_compile` syntax checks of every lab piece.
-  Re-run green again after the `inner.sh` fix below (still 75/0).
-- Command: `cd deploy/firecracker/labs/xweb && ./build.sh`
-- Result: **green**; exit 0 (executed twice this day; the run below rebuilt
-  the images again inside `run.sh`). Unpacked the pinned Alpine minirootfs +
-  17 verified `.apk` files with `tar` only, called
-  `../../guest/build-rootfs.sh --dir` per image, no root, no container
-  engine, no chroot, no guest binary executed on the host.
-- Build-time assertions observed passing per image: python banner `3.14.10`
-  read out of `usr/lib/libpython3.14.so.1.0` bytes, `_sqlite3` module and
-  `libsqlite3.so.0` present, musl loader present / no glibc loader, themed
-  app + schema + default credentials staged, concatenated-SQL seam asserted
-  in `xweb-vuln` and parameterized seam (with no SQL-text concatenation) in
-  `xweb-patched`, `/etc/xweb-build` identity asserted back. The built ext4
-  images were additionally inspected read-only with `debugfs` on the host:
-  `/app/xweb_auth.py` inside `xweb-vuln` shows the concatenated SQL, inside
-  `xweb-patched` the `?`-bound queries, and `/etc/xweb-build` names the
-  right image/stack/auth in both.
-- Pinned-input verification observed: Alpine minirootfs digest matched the
-  publisher's `.sha256` file; Firecracker tarball pin matched the
-  publisher's release `.sha256.txt`; every cached `.apk` re-hashed clean.
-- Development note (fail-closed pinning working as designed): an early
-  transcription error in this lab's own `FC_TARBALL_SHA256` pin was caught
-  fatally by `fetch-artifacts.sh` (digest mismatch against the cached,
-  publisher-verified tarball) before anything was built; the pin was
-  corrected against the publisher's `.sha256.txt`.
+What changed (challenge-side only):
 
-| Image          | Size | rootfs.ext4 sha256 (pre-fix build, superseded 19:16)        |
-| -------------- | ---- | ----------------------------------------------------------- |
-| `xweb-vuln`    | 256M | `728bed554a79db627aee3af8bb45a0f99f9b86f1d3e604bbced55cfafd751781` |
-| `xweb-patched` | 256M | `afeabcd25964f289c83140f1c2e195db3f0a662365c4d26e21394660d36a5d4a` |
+- `app/xweb_common.py`: an original, unlinked, theme-consistent
+  `/internal/maintenance.html` (pure static plant-maintenance content) with
+  `robots.txt` disallowing `/internal/` as the enumeration hint; and a
+  placement switch at boot — when `CHALLENGE=fc-xweb-recon` the delivered
+  flag renders ONLY in the hidden page's note block while the DB
+  service-note row carries a themed non-flag placeholder (so the admin
+  page, the `OR 1=1` bypass and the UNION dump still classify normally and
+  never yield it); under the default record the flag goes ONLY into the DB
+  row and the hidden page carries an equivalent non-flag note. No existing
+  page's behavior changed. The `xweb-patched` control applies the switch
+  identically (same shared module).
+- `inner.sh`: two new fail-closed instances — R (recon record, provider
+  `main`) and RS (recon record, provider `flags/static`) — asserting the
+  exact per-run flag is exposed ONLY via the hidden page and NOT via the
+  default-credentials admin page, the `OR 1=1` bypass or the UNION dump
+  (each of which must still classify as a genuine outcome); and the
+  enumeration hint + hidden-page assert added to every main-record instance
+  (the hidden page must NOT yield the DB flag there). The platform-naming
+  coverage from the 19:16 fix now covers both records (S = main record
+  under `flags/static`, RS = recon record under `flags/static`).
+- `selftest.sh`: a placement matrix on the host (278 checks): recon
+  placement under both delivery names, main placement under all six
+  delivery cases, the patched control under both placements, and the
+  hidden-page/robots behavior for every case.
+- `README.md`: the staged-record design and the env contract;
+  `challenge.yaml` (record `fc-xweb`) and `challenge-recon.yaml` (record
+  `fc-xweb-recon`) now register both staged records against the one image.
+
+Executed for real, in order, after the change (host load ~0.7, quiet):
+
+- `./selftest.sh` → **278 passed, 0 failed**, exit 0.
+- `./run.sh` (19:24) → **165 passed, 0 failed**; `RESULT: xweb 165
+  passed, 0 failed`; `XWEB RESULT: PASS`; exit 0; the VM was destroyed and
+  its overlay removed. Transcript:
+  `~/.cache/rctf-xweb/logs/run-20261119-192431-172425.log`.
+  Seven instances over the real agent API, all reaching `running` through
+  the agent's own HTTP readiness probe: A/B (vuln, `main`, record
+  `fc-xweb`, full win paths + hidden page must not yield), P (patched
+  control), N (flagless control, hidden page flag-free), S (vuln,
+  `flags/static`, record `fc-xweb`), R and RS (vuln, record
+  `fc-xweb-recon`, providers `main` and `flags/static`).
+
+Placement matrix confirmation from that run (exact per-run flags,
+fail-closed):
+
+| Instance | Record env                       | Hidden page | Creds page | Bypass   | UNION dump        |
+| -------- | -------------------------------- | ----------- | ---------- | -------- | ----------------- |
+| A, B     | `fc-xweb`                        | no flag     | **flag**   | **flag** | **flag**          |
+| S        | `fc-xweb` (`flags/static`)       | no flag     | **flag**   | n/a      | **flag**          |
+| P        | `fc-xweb` (patched control)      | no flag     | **flag**   | denied   | empty             |
+| N        | `fc-xweb`, no flag delivered     | no flag     | no flag    | n/a      | no flag           |
+| R        | `fc-xweb-recon`                  | **flag**    | no flag    | no flag  | no flag (rows)    |
+| RS       | `fc-xweb-recon` (`flags/static`) | **flag**    | no flag    | no flag  | no flag (rows)    |
+
+Images rebuilt by that run (the deployment pins must be re-pinned to these;
+the 19:16 pins `a086e026…` / `4f5657b7…` fail validation by design):
+
+| Image          | Size         | rootfs.ext4 sha256 (2026-11-19 19:24 build)                 |
+| -------------- | ------------ | ----------------------------------------------------------- |
+| `xweb-vuln`    | 268435456 B  | `afde9cd2a1d566d3fdb72c2159664334b5db4b582264b5b336c60bcd541faf0a` |
+| `xweb-patched` | 268435456 B  | `a3ec73af3ccec6f194abfe08cf716fbec4e6ae4fc8022447980367b5a12acad5` |
 
 Both share `vmlinux` sha256 `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`
-(the pinned shared smoke kernel 6.1.155). Bytes differ between rebuilds
-(mkfs UUID/timestamps), exactly as the sshole lab documents; the build-time
-assertions tie every image back to the pinned package digests and the
-running guest reports its own build marker, which the runner asserts.
+(shared smoke kernel 6.1.155, unchanged). Both staged records pin the SAME
+`xweb-vuln` image. Full manifest with pinned package versions:
+`~/.cache/rctf-xweb/images/MANIFEST.txt`.
 
 ## 2026-11-19 (19:16) — flag-delivery-name integration fix and re-verification (green)
 
@@ -192,3 +223,49 @@ registered) passed in that same run. The one-character-per-tag fix
 `packages/firecracker/src/agent-protocol.ts` (id, image, vcpus/mem/disk
 bounds, readiness union, expose entries, env keys, flags) before the
 re-run; no other field was non-conforming, and the re-run above is green.
+
+## 2026-11-19 (~15:00) — unprivileged selftest and image build (host, pre-fix)
+
+Executed for real, unprivileged, on the host, before the fixes above.
+
+- Command: `cd deploy/firecracker/labs/xweb && ./selftest.sh`
+- Result: **75 passed, 0 failed**; exit 0. Covers the fail-closed classifier
+  (13 canned outcomes), the lab-authored portal source driven with the exact
+  payload set on the host python 3.14.10 (the same version the guest pins):
+  vuln-build default-creds / `OR 1=1` bypass / UNION-archive / UNION-login /
+  bad-column behaviour, patched-build denials, flagless-boot behaviour, and
+  `bash -n` / `sh -n` / `py_compile` syntax checks of every lab piece.
+- Command: `cd deploy/firecracker/labs/xweb && ./build.sh`
+- Result: **green**; exit 0. Unpacked the pinned Alpine minirootfs + 17
+  verified `.apk` files with `tar` only, called
+  `../../guest/build-rootfs.sh --dir` per image, no root, no container
+  engine, no chroot, no guest binary executed on the host.
+- Build-time assertions observed passing per image: python banner `3.14.10`
+  read out of `usr/lib/libpython3.14.so.1.0` bytes, `_sqlite3` module and
+  `libsqlite3.so.0` present, musl loader present / no glibc loader, themed
+  app + schema + default credentials staged, concatenated-SQL seam asserted
+  in `xweb-vuln` and parameterized seam (with no SQL-text concatenation) in
+  `xweb-patched`, `/etc/xweb-build` identity asserted back. The built ext4
+  images were additionally inspected read-only with `debugfs` on the host:
+  `/app/xweb_auth.py` inside `xweb-vuln` shows the concatenated SQL, inside
+  `xweb-patched` the `?`-bound queries, and `/etc/xweb-build` names the
+  right image/stack/auth in both.
+- Pinned-input verification observed: Alpine minirootfs digest matched the
+  publisher's `.sha256` file; Firecracker tarball pin matched the
+  publisher's release `.sha256.txt`; every cached `.apk` re-hashed clean.
+- Development note (fail-closed pinning working as designed): an early
+  transcription error in this lab's own `FC_TARBALL_SHA256` pin was caught
+  fatally by `fetch-artifacts.sh` (digest mismatch against the cached,
+  publisher-verified tarball) before anything was built; the pin was
+  corrected against the publisher's `.sha256.txt`.
+
+| Image          | Size | rootfs.ext4 sha256 (first pre-fix build; superseded by every build above) |
+| -------------- | ---- | ----------------------------------------------------------- |
+| `xweb-vuln`    | 256M | `728bed554a79db627aee3af8bb45a0f99f9b86f1d3e604bbced55cfafd751781` |
+| `xweb-patched` | 256M | `afeabcd25964f289c83140f1c2e195db3f0a662365c4d26e21394660d36a5d4a` |
+
+Both share `vmlinux` sha256 `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`
+(the pinned shared smoke kernel 6.1.155). Bytes differ between rebuilds
+(mkfs UUID/timestamps), exactly as the sshole lab documents; the build-time
+assertions tie every image back to the pinned package digests and the
+running guest reports its own build marker, which the runner asserts.

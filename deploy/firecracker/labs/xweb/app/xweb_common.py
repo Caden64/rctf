@@ -25,9 +25,21 @@ then falls back to the single file in the flags directory when exactly one
 exists; an ambiguous or empty directory boots the portal flagless. The
 database lives on tmpfs (/run) and the flag never touches the ext4 rootfs.
 
+The portal resolves the MMDS flag by delivery name and places it by record
+stage (see README "Staged records and flag placement"):
+
+- record `fc-xweb` (default): the flag exists ONLY as the themed
+  service-note row in the database (both win paths: default credentials and
+  SQL injection); the hidden maintenance page carries a non-flag note.
+- record `fc-xweb-recon` (env `CHALLENGE=fc-xweb-recon`): the flag renders
+  ONLY on the hidden, unlinked maintenance page discovered through
+  robots.txt; the service-note row carries a non-flag placeholder so every
+  existing page and the UNION dump classify normally without ever yielding
+  the flag.
+
 Every page carries the machine-readable marker ids used by the runner:
 xweb-login / xweb-dashboard / xweb-service / xweb-archive / xweb-denied /
-xweb-sqlerror / xweb-empty, plus the build comment:
+xweb-sqlerror / xweb-empty / xweb-maintenance, plus the build comment:
     <!-- xweb build: IMAGE=<image> stack=<python> auth=<mode> -->
 """
 import html
@@ -50,6 +62,13 @@ PORT = int(os.environ.get('XWEB_PORT', '8080'))
 DB_PATH = os.environ.get('XWEB_DB', '/run/xweb/portal.db')
 FLAGS_DIR = os.environ.get('RCTF_FLAGS_DIR', '/run/rctf/flags')
 INSTANCE_ID = os.environ.get('RCTF_INSTANCE_ID', 'xweb-unknown-node')
+
+# Staged-record contract: the instancer env `CHALLENGE` names the rCTF record
+# this instance belongs to. `fc-xweb` (default) places the delivered flag in
+# the DB service-note row; `fc-xweb-recon` places it ONLY on the hidden
+# maintenance page and puts a non-flag placeholder in the DB row.
+CHALLENGE = os.environ.get('CHALLENGE', 'fc-xweb')
+RECON_CHALLENGE = 'fc-xweb-recon'
 BUILD_IMAGE = 'unknown'
 # The guest records its build identity in /etc/xweb-build (written by build.sh);
 # XWEB_BUILD_FILE lets the unprivileged host selftest point at a temp copy
@@ -142,6 +161,20 @@ SEED_NOTES = [
 
 FLAG_NOTE_TITLE = 'Service note 07 — factory maintenance override'
 
+# The DB-row placeholder shown instead of the flag on the recon record (and
+# never on the main record): themed, and never flag-shaped.
+SERVICE_NOTE_PLACEHOLDER = ('No factory override code is issued for this '
+                            'controller. Contact the service desk to '
+                            'schedule a maintenance window.')
+# The hidden-page note shown when the flag is NOT placed there.
+HIDDEN_NOTE_NOFLAG = ('Factory maintenance override code: issued per site '
+                      'by the factory service tool; none is stored on this '
+                      'controller.')
+
+# The note block on the hidden maintenance page; set per boot by the
+# staged-record placement below.
+HIDDEN_NOTE = HIDDEN_NOTE_NOFLAG
+
 
 # Flag delivery names (MMDS provider names sanitised by /rctf/init):
 #   main          the lab runner's provider name (lab path)
@@ -193,6 +226,7 @@ def db():
 
 
 def bootstrap_database():
+    global HIDDEN_NOTE
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     os.makedirs(FLAGS_DIR, exist_ok=True)
     conn = db()
@@ -216,15 +250,26 @@ def bootstrap_database():
             'VALUES (?, ?, ?, ?)', SEED_NOTES)
         flag = read_flag()
         if flag is not None:
-            # The flag exists ONLY as this themed service-note row; it is read
-            # from the MMDS-written tmpfs file and the DB itself is on tmpfs.
+            # Staged-record placement (README "Staged records and flag
+            # placement"): each rCTF record spawns its own instance carrying
+            # only its own flag, and CHALLENGE decides where the one
+            # delivered flag lives. Exactly one of the two locations ever
+            # carries it; the other side gets a non-flag text so every page,
+            # every deny path and the UNION dump still classify normally.
+            if CHALLENGE == RECON_CHALLENGE:
+                note_body = SERVICE_NOTE_PLACEHOLDER
+                HIDDEN_NOTE = ('Factory maintenance override code for this '
+                               'controller: ' + flag)
+            else:
+                note_body = ('Factory maintenance override code for this '
+                             'controller: ' + flag)
+                HIDDEN_NOTE = HIDDEN_NOTE_NOFLAG
             conn.execute(
                 'INSERT INTO service_notes (created, author, title, body) '
                 'VALUES (?, ?, ?, ?)',
                 ('2026-11-19', 'factory',
                  FLAG_NOTE_TITLE,
-                 'Factory maintenance override code for this controller: '
-                 + flag))
+                 note_body))
         conn.commit()
     finally:
         conn.close()
@@ -481,6 +526,42 @@ def not_found_page():
     return page('Not found', body)
 
 
+# --- hidden, unlinked maintenance page (original content) --------------------
+# Discovery path for the enumeration stage: /robots.txt disallows /internal/,
+# and this page is referenced from nowhere in the portal. It is fully static
+# theme content; the note block at the bottom is the only variable part and
+# carries the delivered flag exclusively on the recon record (see the
+# placement switch in bootstrap_database).
+def robots_txt():
+    return ('# XWEB-500 web console\n'
+            'User-agent: *\n'
+            'Disallow: /internal/\n')
+
+
+MAINTENANCE_WINDOWS = [
+    ('Tue 04:00-06:00', 'Cold room 01', 'Evaporator fan service'),
+    ('Wed 05:00-05:40', 'Case line A', 'Drain heater inspection'),
+    ('Thu 03:30-06:00', 'Rack 1', 'Compressor oil analysis'),
+    ('Fri 04:00-04:30', 'Blast cell 01', 'Door seal replacement'),
+    ('Mon 06:00-06:20', 'Cold room 02', 'Return probe recalibration'),
+]
+
+
+def maintenance_page():
+    rows_html = ''.join(
+        '<tr><td>%s</td><td>%s</td><td>%s</td></tr>'
+        % (html.escape(r[0]), html.escape(r[1]), html.escape(r[2]))
+        for r in MAINTENANCE_WINDOWS)
+    body = ('<div class="xweb-card" id="xweb-maintenance">\n<h2>SITE '
+            'MAINTENANCE SCHEDULE</h2>\n<p class="xweb-note">Internal '
+            'planning page kept by the plant maintenance crew; not linked '
+            'from the operator console.</p>\n<table><tr><th>window</th>'
+            '<th>area</th><th>work</th></tr>\n%s\n</table>\n'
+            '<div class="xweb-note" id="xweb-override-note">%s</div>\n'
+            '</div>\n' % (rows_html, html.escape(HIDDEN_NOTE)))
+    return page('Maintenance', body)
+
+
 # --- HTTP service -------------------------------------------------------------
 class PortalHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -499,6 +580,14 @@ class PortalHandler(BaseHTTPRequestHandler):
         self.send_header('X-XWEB-Firmware', FIRMWARE)
         for key, value in headers:
             self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_text(self, status, text, content_type):
+        data = text.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
@@ -592,6 +681,14 @@ class PortalHandler(BaseHTTPRequestHandler):
             self.redirect('/', headers=[
                 ('Set-Cookie', 'xwebsess=; Path=/; Max-Age=0')])
             return
+        if path == '/robots.txt':
+            # Enumeration hint for the recon stage: the internal planning
+            # area exists but is linked from nowhere in the portal.
+            self.send_text(200, robots_txt(), 'text/plain; charset=utf-8')
+            return
+        if path == '/internal/maintenance.html':
+            self.send_html(200, maintenance_page())
+            return
         self.send_html(404, not_found_page())
 
     def do_POST(self):
@@ -625,8 +722,8 @@ class PortalHandler(BaseHTTPRequestHandler):
 
 def main():
     have_flag = bootstrap_database()
-    print('xweb portal: image=%s auth=%s db=%s port=%d flag=%s'
-          % (BUILD_IMAGE, AUTH_MODE, DB_PATH, PORT,
+    print('xweb portal: image=%s auth=%s challenge=%s db=%s port=%d flag=%s'
+          % (BUILD_IMAGE, AUTH_MODE, CHALLENGE, DB_PATH, PORT,
              'present' if have_flag else 'absent'), flush=True)
     server = ThreadingHTTPServer(('0.0.0.0', PORT), PortalHandler)
     server.daemon_threads = True
