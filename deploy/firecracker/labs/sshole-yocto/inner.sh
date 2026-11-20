@@ -477,7 +477,7 @@ else
         ok 'isolation: team A flag is not reachable from team B' ||
         bad "isolation: team B read team A's flag"
     else
-      bad 'isolation: second instance $id_b did not become ready'
+      bad "isolation: second instance $id_b did not become ready"
     fi
   else
     bad 'isolation: second instance create was rejected'

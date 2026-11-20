@@ -28,7 +28,15 @@ chmod 0700 /run/sshd
 chown 0:0 /etc/passwd /etc/group /etc/shadow /etc/ssh /run/sshd 2>/dev/null || true
 chown 1001:1001 /home/bob 2>/dev/null || true
 
-# Publish the per-run flag for the bypassed user. /run is a verified tmpfs.
+# Publish the per-run flag for the bypassed user. /run is a verified tmpfs,
+# but the guest init mounts it 0700 and keeps $RUN_ROOT 0700 precisely so
+# flags cannot leak to non-root users. This challenge's intended path REQUIRES
+# the bypassed, non-root alice to read the flag, so open TRAVERSAL ONLY on
+# the way to the published copy: /run and /run/rctf become 0755 (they hold
+# nothing else secret; /run/rctf/env.sh is 0600 and the flags directory
+# itself stays 0700 with every unpublished flag root-only). The published copy
+# never touches the ext4 rootfs.
+chmod 0755 /run /run/rctf
 if [ -f "${RCTF_FLAGS_DIR:-/run/rctf/flags}/main" ]; then
   cp "${RCTF_FLAGS_DIR:-/run/rctf/flags}/main" /run/rctf/flag.txt
   chmod 0644 /run/rctf/flag.txt
