@@ -1,0 +1,13 @@
+#!/bin/sh
+# XWEB-500 portal lab — guest service, exec'd by /rctf/init (PID 1).
+#
+# /rctf/init has already fetched the MMDS document, written the flag to
+# $RCTF_FLAGS_DIR/main (tmpfs, 0400) and exported RCTF_INSTANCE_ID and the
+# challenge env. The portal seeds /run/xweb/portal.db ON TMPFS (the flag must
+# never reach the ext4 rootfs) and serves HTTP on ${XWEB_PORT:-8080}.
+#
+# The metadata phase is fail-closed upstream: if it failed, init never execs
+# this script, the guest panics and the instance fails readiness instead.
+set -eu
+mkdir -p /run/xweb
+exec /usr/bin/python3 /app/xweb_common.py

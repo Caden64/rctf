@@ -18,12 +18,23 @@
 #   /etc/apache2/ports.conf                     Listen 8080
 #   /etc/apache2/conf-enabled/zz-php2shell.conf single worker, KeepAlive Off
 #   /etc/apache2/conf-enabled/zz-lab.conf       DocumentRoot /www
+#   /etc/apache2/conf-enabled/zz-m364.conf      DirectoryIndex: theme at /
 #   /usr/local/etc/php/conf.d/zz-php2shell.ini  laboratory php.ini
 #   /www/{index,version}.php, /app/start
+#   /www/{index.html,status.html,m364.css}       M364 static theme (no PHP)
+#   /www/incidents/EX2611-0442.html              static incident note (recon spot)
 #   /usr/local/bin/{busybox,ip}                 boot-contract ip route/link
 # and /rctf/{init,jq} from guest/build-rootfs.sh. No php.ini is installed: the
 # official image ships none, and output_buffering=0 is load-bearing for the
 # stage-1 leak (see lab/php-oci.ini).
+#
+# The M364 theme is STATIC on purpose (README "Theming"): index.php must stay
+# the allocation-inert `<?php echo "OK\n";` landing page the chain was
+# calibrated against, so every themed page is served by Apache without PHP
+# execution. The image's own docker-php.conf pins index.php first in
+# DirectoryIndex, which would keep GET / on the inert page; zz-m364.conf
+# re-pins index.html first so the themed static page owns /, while the chain
+# keeps POSTing to /index.php directly (mod_dir is never on a chain path).
 #
 # Usage:
 #   ./build-oci.sh                 # build all three images (cached)
@@ -100,10 +111,30 @@ overlay_image() { # overlay_image <root> <php-ini>
     "$root/etc/apache2/conf-enabled/zz-php2shell.conf"
   install -m 0644 "$LAB_DIR/lab/lab-oci.conf" \
     "$root/etc/apache2/conf-enabled/zz-lab.conf"
+  # M364 theme: make the STATIC portal page own / (see lab/m364-oci.conf).
+  # The image's own docker-php.conf pins index.php first in DirectoryIndex;
+  # zz-m364.conf re-pins index.html first. No chain request resolves through
+  # mod_dir, so the calibrated heap is untouched.
+  install -m 0644 "$LAB_DIR/lab/m364-oci.conf" \
+    "$root/etc/apache2/conf-enabled/zz-m364.conf"
   install -m 0644 "$ini" "$root/usr/local/etc/php/conf.d/zz-php2shell.ini"
   mkdir -p "$root/www" "$root/app" "$root/usr/local/bin"
   install -m 0644 "$LAB_DIR/lab/www/index.php" "$root/www/index.php"
   install -m 0644 "$LAB_DIR/lab/www/version.php" "$root/www/version.php"
+  # M364 theming: STATIC files only. The theme is identical in all three
+  # images (this overlay is shared), so the patched and hardened controls
+  # remain negative controls of the same visible app. index.php above stays
+  # the two-byte-output chain target; nothing themed is executed by PHP.
+  install -m 0644 "$LAB_DIR/lab/www/index.html" "$root/www/index.html"
+  install -m 0644 "$LAB_DIR/lab/www/status.html" "$root/www/status.html"
+  install -m 0644 "$LAB_DIR/lab/www/m364.css" "$root/www/m364.css"
+  # Unlinked static incident note: the fc-m364-recon record's flag spot.
+  # The page ships WITHOUT any flag (its slot line carries the non-flag
+  # note); /app/start rewrites the slot per run for recon-named
+  # instances. Pure static content, never executed by PHP.
+  mkdir -p "$root/www/incidents"
+  install -m 0644 "$LAB_DIR/lab/www/incidents/EX2611-0442.html" \
+    "$root/www/incidents/EX2611-0442.html"
   install -m 0755 "$LAB_DIR/lab/app-start-oci" "$root/app/start"
   # The boot contract needs `ip`/`nc`; the image has curl but no iproute2.
   # BusyBox comes from the pinned shared smoke artifacts (sha256 verified by

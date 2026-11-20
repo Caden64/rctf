@@ -266,6 +266,259 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6d. M364 theming invariants: static-only themed pages, the credit form on
+#     the inert chain target, the event registration, and the staging
+#     manifest. The theme must never execute PHP: only the untouched
+#     allocation-inert index.php does, and the chain POSTs to it directly.
+# ---------------------------------------------------------------------------
+THEME_FILES=(index.html status.html m364.css)
+for f in "${THEME_FILES[@]}"; do
+  if grep -q '<?php\|<?=' "$LAB_DIR/lab/www/$f"; then
+    bad "lab/www/$f contains PHP (themed pages must be static; rendering them would move the heap)"
+  else
+    ok "lab/www/$f is pure static content (no PHP tags)"
+  fi
+  grep -q "lab/www/$f" "$LAB_DIR/build-oci.sh" &&
+    ok "build-oci.sh installs lab/www/$f into every image" ||
+    bad "build-oci.sh does not install lab/www/$f"
+done
+grep -q 'action="/index.php"' "$LAB_DIR/lab/www/index.html" &&
+  ok "credit form posts to the inert /index.php chain target" ||
+  bad "credit form lost its /index.php target"
+grep -q 'enctype="multipart/form-data"' "$LAB_DIR/lab/www/index.html" &&
+  ok "credit form is a multipart form (the visible exploit surface)" ||
+  bad "credit form is not multipart"
+# The static portal must own /: the official image's own docker-php.conf
+# pins index.php first in DirectoryIndex, and mod_dir ACCUMULATES
+# same-context DirectoryIndex directives (Apache docs, mod_dir: to replace
+# the list you must reset it first with the `disabled` token -- the idiom
+# docker-php.conf itself uses). lab/m364-oci.conf, installed as
+# conf-enabled/zz-m364.conf (alphabetically after docker-php.conf), resets
+# and re-pins the order.
+RESET_LINE=$(grep -n '^DirectoryIndex disabled$' "$LAB_DIR/lab/m364-oci.conf" | cut -d: -f1)
+PIN_LINE=$(grep -n '^DirectoryIndex index.html index.php$' "$LAB_DIR/lab/m364-oci.conf" | cut -d: -f1)
+if [ -n "$RESET_LINE" ] && [ -n "$PIN_LINE" ] && [ "$RESET_LINE" -lt "$PIN_LINE" ]; then
+  ok "m364-oci.conf resets DirectoryIndex then pins index.html first (theme owns /)"
+else
+  bad "m364-oci.conf must reset via 'DirectoryIndex disabled' BEFORE pinning 'index.html index.php'"
+fi
+grep -q 'lab/m364-oci.conf' "$LAB_DIR/build-oci.sh" &&
+  ok "build-oci.sh installs lab/m364-oci.conf into every image" ||
+  bad "build-oci.sh does not install lab/m364-oci.conf"
+# The per-run flag must be published OUTSIDE the Apache DocumentRoot and
+# off the ext4: on tmpfs, readable by the www-data worker the chain
+# executes as, never /www/flag.txt -- which GET /flag.txt would serve
+# verbatim over plain HTTP, making the event challenge trivially
+# solvable. The guest init mounts /run tmpfs root-only (mode=0700), so
+# the service must also open traversal (0711) of the tmpfs root it
+# publishes into; the raw flags directory /run/rctf (0700) stays
+# root-only. The SOURCE name must resolve both delivery names (lab
+# "main"; platform "flags/static" sanitised by the guest init to
+# "flags_static"), and the per-record CHALLENGE env drives placement:
+# fc-m364-recon -> static incident note + non-flag sentinel; anything
+# else (fc-m364-credit) -> /run/flag.txt only.
+for f in "$LAB_DIR/lab/app-start" "$LAB_DIR/lab/app-start-oci"; do
+  base=$(basename "$f")
+  grep -q 'chmod 0711 /run$' "$f" &&
+    ok "$base opens traversal of the root-only /run tmpfs (init mounts it 0700)" ||
+    bad "$base does not open /run traversal; the www-data worker cannot read any tmpfs publish"
+  grep -q 'for cand in main flags_static' "$f" &&
+    ok "$base resolves the flag source: main first, then flags_static" ||
+    bad "$base does not resolve both flag delivery names in order"
+  grep -q 'cp "$flag_src" /run/flag.txt' "$f" &&
+    ok "$base publishes the resolved flag to /run/flag.txt on credit records (tmpfs, outside DocumentRoot)" ||
+    bad "$base does not publish the flag to /run/flag.txt"
+  grep -q 'M364_INTAKE_NOTE=' "$f" &&
+    grep -q 'fc-m364-recon) F_PATH=/run/m364-intake.txt' "$f" &&
+    ok "$base writes the documented non-flag sentinel and points F at it on recon records" ||
+    bad "$base does not implement the recon placement switch"
+  if grep -q '/www/flag\.txt' "$f"; then
+    bad "$base still references /www/flag.txt (would be served at /flag.txt over HTTP)"
+  else
+    ok "$base never places the flag inside the /www DocumentRoot"
+  fi
+  # Behavioral test: extract the shipped resolution+placement block,
+  # redirect its publish paths into the selftest sandbox, and exercise
+  # the delivery orders and the per-record placement switch. A
+  # regression in either fails here, unprivileged.
+  block=$TMP/$base.flagblock.sh
+  sed -n '/^# --- flag resolution/,/^# --- end flag resolution/p' "$f" \
+    | sed "s|/run/flag\.txt|$TMP/flag-out.txt|g; s|/run/m364-intake\.txt|$TMP/intake-out.txt|g; s|/www/incidents/\.EX2611-0442\.new|$TMP/incident-out.html.new|g; s|/www/incidents/EX2611-0442\.html|$TMP/incident-out.html|g" >"$block"
+  if [ -s "$block" ] && grep -q 'flag_src=' "$block" && grep -q 'fc-m364-recon' "$block"; then
+    ok "$base: flag-resolution block extracted for the sandbox test"
+  else
+    bad "$base: flag-resolution markers not found for extraction"
+    continue
+  fi
+  cp "$LAB_DIR/lab/www/incidents/EX2611-0442.html" "$TMP/incident-template.html"
+  rm -rf "$TMP/flags-s1" "$TMP/flags-s2" "$TMP/flags-s3" "$TMP/flags-s4" \
+    "$TMP/flags-r1" "$TMP/flag-out.txt" "$TMP/intake-out.txt" "$TMP/incident-out.html"
+  mkdir -p "$TMP/flags-s1" "$TMP/flags-s2" "$TMP/flags-s3" "$TMP/flags-s4" "$TMP/flags-r1"
+  printf 'flag-A' >"$TMP/flags-s1/main"
+  printf 'flag-B' >"$TMP/flags-s1/flags_static"
+  printf 'flag-B' >"$TMP/flags-s2/flags_static"
+  printf 'flag-C' >"$TMP/flags-s3/custom_provider"
+  printf 'flag-R' >"$TMP/flags-r1/main"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s1 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-A" ] &&
+    ok "$base: main wins over flags_static when both are delivered (credit default)" ||
+    bad "$base: main did not win over flags_static"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s2 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-B" ] &&
+    ok "$base: the platform name (flags_static) is resolved alone" ||
+    bad "$base: the platform name (flags_static) was not resolved"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s3 sh "$block" ) >/dev/null 2>&1
+  [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-C" ] &&
+    ok "$base: a single differently named flags file falls back correctly" ||
+    bad "$base: the single-file fallback is broken"
+  rm -f "$TMP/flag-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-s4 sh "$block" ) >/dev/null 2>&1
+  [ ! -e "$TMP/flag-out.txt" ] && [ ! -e "$TMP/intake-out.txt" ] &&
+    ok "$base: no flag is published when nothing resolves (fail-closed)" ||
+    bad "$base: published a flag from an empty flags directory"
+  # Per-record placement switch (credit default keeps the note clean).
+  rm -f "$TMP/flag-out.txt" "$TMP/intake-out.txt"
+  ( RCTF_FLAGS_DIR=$TMP/flags-r1 CHALLENGE=fc-m364-credit sh "$block" ) >/dev/null 2>&1
+  if [ "$(cat "$TMP/flag-out.txt" 2>/dev/null)" = "flag-R" ] &&
+    [ ! -e "$TMP/intake-out.txt" ]; then
+    ok "$base: credit records publish ONLY to /run/flag.txt"
+  else
+    bad "$base: credit placement is broken"
+  fi
+  # Recon: the flag goes ONLY into the incident note; no /run/flag.txt.
+  rm -f "$TMP/flag-out.txt" "$TMP/intake-out.txt"
+  cp "$TMP/incident-template.html" "$TMP/incident-out.html"
+  ( RCTF_FLAGS_DIR=$TMP/flags-r1 CHALLENGE=fc-m364-recon sh "$block" ) >/dev/null 2>&1
+  if grep -Fq 'flag-R' "$TMP/incident-out.html" &&
+    [ ! -e "$TMP/flag-out.txt" ] &&
+    [ -s "$TMP/intake-out.txt" ] &&
+    grep -Fq 'M364 intake note' "$TMP/intake-out.txt"; then
+    ok "$base: recon records publish the flag ONLY into the incident note (+sentinel, no /run/flag.txt)"
+  else
+    bad "$base: recon placement is broken"
+  fi
+done
+# The recon sentinel must be byte-identical between the runner and the
+# shipped start scripts (the runner exact-matches what the service writes).
+NOTE_RUN=$(grep -o "^RECON_INTAKE_NOTE='.*'" "$LAB_DIR/run.sh" | head -1)
+NOTE_START=$(grep -o "^M364_INTAKE_NOTE='.*'" "$LAB_DIR/lab/app-start-oci" | head -1)
+v_run=${NOTE_RUN#RECON_INTAKE_NOTE=\'}; v_run=${v_run%\'}
+v_start=${NOTE_START#M364_INTAKE_NOTE=\'}; v_start=${v_start%\'}
+[ -n "$v_run" ] && [ "$v_run" = "$v_start" ] &&
+  ok "the recon intake note is byte-identical in run.sh and app-start" ||
+  bad "the recon intake note differs between run.sh and app-start (the exact-match assertion would fail)"
+# The incident note is a pure static page with exactly one swappable slot.
+INCIDENT_PAGE=$LAB_DIR/lab/www/incidents/EX2611-0442.html
+if grep -q '<?php\|<?=' "$INCIDENT_PAGE"; then
+  bad "the incident note contains PHP (recon spot must be static)"
+else
+  ok "the incident note is pure static content (no PHP tags)"
+fi
+[ "$(grep -c 'M364-FLAG-SLOT' "$INCIDENT_PAGE")" = 1 ] &&
+  ok "the incident note carries exactly one swappable flag slot" ||
+  bad "the incident note must carry exactly one M364-FLAG-SLOT line"
+grep -q 'lab/www/incidents/EX2611-0442.html' "$LAB_DIR/build-oci.sh" &&
+  ok "build-oci.sh installs the incident note into every image" ||
+  bad "build-oci.sh does not install the incident note"
+grep -q 'assert_flag_http_absent "vulnerable image" flag.txt' "$LAB_DIR/run.sh" &&
+  ok "run.sh asserts GET /flag.txt answers 404 without the flag bytes" ||
+  bad "run.sh lacks the flag-not-web-served regression check"
+grep -q 'cat \$F>/www/p' "$LAB_DIR/run.sh" &&
+  ok "run.sh proves the flag is readable from /run through the RCE (13-byte carrier-safe payload)" ||
+  bad "run.sh does not prove the flag-read objective within the carrier budget"
+grep -q 'env>/www/p' "$LAB_DIR/run.sh" &&
+  ok "run.sh proves the F pointer is discoverable through the RCE (env dump)" ||
+  bad "run.sh does not prove the objective-pointer discovery path"
+grep -q 'flags/static' "$LAB_DIR/run.sh" &&
+  ok "run.sh exercises the platform provider name (flags/static)" ||
+  bad "run.sh does not exercise the platform flag-delivery name"
+grep -q 'fc-m364-recon' "$LAB_DIR/run.sh" &&
+  grep -q 'assert_incident_flag' "$LAB_DIR/run.sh" &&
+  grep -q 'assert_chain_recon_intake' "$LAB_DIR/run.sh" &&
+  ok "run.sh asserts the recon placement (incident note + non-flag RCE path)" ||
+  bad "run.sh does not assert the recon placement"
+grep -q 'assert_incident_note_clean' "$LAB_DIR/run.sh" &&
+  ok "run.sh asserts credit records keep the incident note flag-free" ||
+  bad "run.sh does not assert the credit-mode incident note"
+grep -q 'run/flag\.txt' "$LAB_DIR/challenge.yaml" &&
+  ok "challenge.yaml documents the /run/flag.txt objective" ||
+  bad "challenge.yaml still describes the old flag placement"
+# The two staged records share one image and differ by env + integration id.
+CHALLENGE_CREDIT=$LAB_DIR/challenge.yaml
+CHALLENGE_RECON=$LAB_DIR/challenge-recon.yaml
+for yamlspec in "$CHALLENGE_CREDIT:fc-m364-credit:fc-m364-credit:m364-credit" \
+  "$CHALLENGE_RECON:fc-m364-recon:fc-m364-recon:m364-recon"; do
+  IFS=: read -r yfile yid yenv yprefix <<<"$yamlspec"
+  if [ -f "$yfile" ]; then
+    ok "$(basename "$yfile"): staged record $yid exists"
+    for needle in "challengeIntegrationId: $yid" 'image: php2shell-vuln' \
+      "CHALLENGE: $yenv" "hostPrefix: $yprefix" 'containerName: app' \
+      'readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }' \
+      'shouldDisplay: true'; do
+      grep -q "$needle" "$yfile" &&
+        ok "$(basename "$yfile") sets $needle" ||
+        bad "$(basename "$yfile") is missing $needle"
+    done
+  else
+    bad "staged record $yid is missing ($yfile)"
+  fi
+done
+# All three images share overlay_image, so the theme is identical across the
+# vulnerable and control images by construction; run.sh additionally asserts
+# GET / serves this exact file byte-for-byte on every image.
+
+CHALLENGE_YAML=$LAB_DIR/challenge.yaml
+if [ -f "$CHALLENGE_YAML" ]; then
+  ok "event challenge registration exists (challenge.yaml)"
+  for needle in 'instancer: firecracker' 'challengeIntegrationId: fc-m364-credit' \
+    'image: php2shell-vuln' 'hostPrefix: m364-credit' 'containerName: app' \
+    'readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }' \
+    'shouldDisplay: true'; do
+    grep -q "$needle" "$CHALLENGE_YAML" &&
+      ok "challenge.yaml sets $needle" ||
+      bad "challenge.yaml is missing $needle"
+  done
+  read -r CY_MEM CY_DISK <<<"$(awk '/memMiB:/ {m=$2} /diskMiB:/ {d=$2} END {print m+0, d+0}' "$CHALLENGE_YAML")"
+  [ "$CY_MEM" -ge 256 ] &&
+    ok "challenge.yaml memMiB ($CY_MEM) is at least the lab-proven 256" ||
+    bad "challenge.yaml memMiB ($CY_MEM) is undersized (the lab VM proved 256)"
+  [ "$CY_DISK" -ge 768 ] &&
+    ok "challenge.yaml diskMiB ($CY_DISK) fits the 768 MiB rootfs.ext4" ||
+    bad "challenge.yaml diskMiB ($CY_DISK) cannot hold the 768 MiB rootfs.ext4"
+else
+  ok "no challenge.yaml (lab-only checkout; event registration not required)"
+fi
+
+MANIFEST=$LAB_DIR/staging-manifest.json
+if [ -f "$MANIFEST" ]; then
+  if jq -e '.image and (.files.vmlinux.sha256 | test("^[0-9a-f]{64}$")) and
+      (.files["rootfs.ext4"].sha256 | test("^[0-9a-f]{64}$")) and
+      (.files.vmlinux.sizeBytes > 0) and (.files["rootfs.ext4"].sizeBytes > 0)' \
+    "$MANIFEST" >/dev/null 2>&1; then
+    ok "staging manifest parses with image/files/sha256/sizes"
+  else
+    bad "staging manifest is missing image/files/sha256/sizes fields"
+  fi
+  if [ -f "$IMAGES/php2shell-vuln/rootfs.ext4" ]; then
+    for fname in vmlinux rootfs.ext4; do
+      want=$(jq -r ".files[\"$fname\"].sha256" "$MANIFEST")
+      got=$(sha256_of "$IMAGES/php2shell-vuln/$fname")
+      if [ "$want" = "$got" ]; then
+        ok "staging manifest sha256 matches the built $fname"
+      else
+        bad "staging manifest sha256 of $fname is stale (rebuilds change bytes; refresh the manifest as part of the reviewed re-verification)"
+      fi
+    done
+  else
+    ok "vulnerable image not built yet; manifest/image comparison skipped"
+  fi
+else
+  ok "no staging manifest yet (generated with the verified build)"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Toolkit/upstream provenance, when the cache is populated.
 # ---------------------------------------------------------------------------
 if [ -f "$UPSTREAM_LEGACY/exploit.py" ]; then

@@ -1,0 +1,98 @@
+#!/bin/sh
+# sshhole-yocto guest service. Runs as root: the rCTF guest init (installed by
+# guest/build-rootfs.sh as /rctf/init) execs /app/start after it has fetched
+# the per-run MMDS metadata and written the flags to the tmpfs under
+# $RCTF_FLAGS_DIR.
+#
+# This is the event challenge's flag path: the bypassed user (alice, via the
+# CVE-2026-123158 overlong-password bypass) must be able to read the per-run
+# flag. init writes flags root-only (0400) on the tmpfs /run/rctf/flags, so
+# /app/start republishes the resolved flag as a world-readable file ON THE
+# SAME TMPFS (/run/rctf/flag.txt, mode 0644). The flag therefore never
+# touches the ext4 rootfs, exactly as the guest contract requires.
+#
+# Everything below then runs sshd in the foreground so PID 1 semantics hold.
+set -eu
+
+# sshd privilege separation directory (OE's openssh is configured with
+# --with-privsep-path=/var/run/sshd; /var/run is a symlink to /run on a poky
+# image, so create both spellings).
+mkdir -p /run/sshd
+chmod 0700 /run/sshd
+
+# mkfs.ext4 -d preserves the build user's numeric ownership, and the build
+# runs unprivileged as the lab user (uid 1000 on the build host == alice in
+# the guest). Files sshd must own as root are re-chowned here, at runtime,
+# where we run as root. /etc/shadow keeps the strict mode the distro set
+# (OE's shadow package ships 0400; ownership is the only thing fixed here).
+chown 0:0 /etc/passwd /etc/group /etc/shadow /etc/ssh /run/sshd 2>/dev/null || true
+chown 1001:1001 /home/bob 2>/dev/null || true
+
+# pick_flag_src <flags-dir>: resolve which flag file to publish. Prints the
+# chosen path and returns 0 on success; prints nothing and returns 1 when
+# there is nothing to publish.
+#
+# Flag DELIVERY names differ between the lab runner and the event platform,
+# so the resolution is name-robust:
+#   1. <dir>/main         - the lab runner creates instances with
+#                           provider "main";
+#   2. <dir>/flags_static - at the EVENT, rCTF resolves the challenge's
+#                           registered provider name verbatim
+#                           (challenge.yaml registers "flags/static") and the
+#                           guest init sanitizes everything outside
+#                           [A-Za-z0-9._-] to "_", so "flags/static" lands
+#                           at /run/rctf/flags/flags_static;
+#   3. the directory's only file - any other single-provider spelling.
+# A flagless instance (no flag file at all) publishes nothing: the service
+# still starts, exactly as the guest contract requires.
+# selftest.sh extracts THIS function from this file by name and unit-tests
+# the ordering, so the two cannot drift apart silently.
+pick_flag_src() {
+  flags_dir=$1
+  if [ -f "$flags_dir/main" ]; then
+    printf '%s\n' "$flags_dir/main"
+    return 0
+  fi
+  if [ -f "$flags_dir/flags_static" ]; then
+    printf '%s\n' "$flags_dir/flags_static"
+    return 0
+  fi
+  count=0
+  first=
+  for f in "$flags_dir"/*; do
+    [ -f "$f" ] || continue
+    count=$((count + 1))
+    if [ -z "$first" ]; then first=$f; fi
+  done
+  if [ "$count" = 1 ]; then
+    printf '%s\n' "$first"
+    return 0
+  fi
+  return 1
+}
+
+# Publish the per-run flag for the bypassed user. /run is a verified tmpfs,
+# but the guest init mounts it 0700 and keeps $RUN_ROOT 0700 precisely so
+# flags cannot leak to non-root users. This challenge's intended path REQUIRES
+# the bypassed, non-root alice to read the flag, so open TRAVERSAL ONLY on
+# the way to the published copy: /run and /run/rctf become 0755 (they hold
+# nothing else secret; /run/rctf/env.sh is 0600 and the flags directory
+# itself stays 0700 with every unpublished flag root-only). The published copy
+# never touches the ext4 rootfs.
+chmod 0755 /run /run/rctf
+flag_src=$(pick_flag_src "${RCTF_FLAGS_DIR:-/run/rctf/flags}") || flag_src=
+if [ -n "$flag_src" ]; then
+  cp "$flag_src" /run/rctf/flag.txt
+  chmod 0644 /run/rctf/flag.txt
+fi
+
+# Instance identity for the runner's endpoint-isolation probe.
+printf '%s\n' "${RCTF_INSTANCE_ID:-unknown}" >/etc/sshole-instance
+chmod 0644 /etc/sshole-instance
+
+# Host keys are generated at first boot (never baked into the image).
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+  ssh-keygen -A >/dev/null 2>&1
+fi
+
+exec /usr/sbin/sshd -D -e

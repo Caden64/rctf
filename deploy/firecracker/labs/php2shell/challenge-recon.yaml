@@ -1,0 +1,49 @@
+# M364 admin center — recon stage of the staged M364 pair. Second record
+# sharing the SAME php2shell-vuln image as challenge.yaml (fc-m364-credit).
+# Format: deploy/firecracker/sample-challenge.yaml.
+#
+# Stage design: this record's flag is published by the guest ONLY into the
+# static incident note at /incidents/EX2611-0442.html (found by looking
+# around the admin center; the incident id is visible in the outage
+# banner). The RCE path (/run/flag.txt) is deliberately left empty on this
+# record, and GET /flag.txt stays 404. The lab's run.sh asserts this exact
+# placement matrix for both provider names (main and flags/static).
+name: M364 Admin Center
+category: web
+description: >-
+  The big Exchange Online outage is over and the review board archived its
+  post-incident notes somewhere in the M364 admin center. Incident
+  #EX2611-0442 left a paper trail — find the note.
+flags:
+  - provider: flags/static # the event wires its real flag provider here
+    config:
+      flag: rctf{REPLACE_WITH_EVENT_FLAG} # placeholder only; never a real flag
+instancerConfig:
+  instancer: firecracker # key in the rctf.d `instancers` map
+  challengeIntegrationId: fc-m364-recon # never change after launch
+  timeoutMilliseconds: 1800000
+  extendable: true
+  config:
+    image: php2shell-vuln # same image as fc-m364-credit; see staging-manifest.json
+    # Same sizing as fc-m364-credit: one prefork worker is the chain's own
+    # assumption; memMiB 512 covers Apache + PHP + the 20 MiB OOM body;
+    # diskMiB 1536 fits the 768 MiB rootfs plus upload temp headroom.
+    vcpus: 1
+    memMiB: 512
+    diskMiB: 1536
+    egress: false
+    bootTimeoutSeconds: 180
+    readiness: { kind: http, port: 8080, path: /, expectStatus: 200 }
+    env:
+      # THE PLACEMENT SWITCH: /app/start publishes the delivered flag into
+      # /www/incidents/EX2611-0442.html only when CHALLENGE is
+      # fc-m364-recon; every other value (fc-m364-credit, or anything
+      # else) publishes only to /run/flag.txt for the RCE stage.
+      CHALLENGE: fc-m364-recon
+  expose:
+    - kind: https
+      hostPrefix: m364-recon
+      containerName: app # must be 'app' for the Firecracker instancer
+      containerPort: 8080
+      shouldDisplay: true # required: endpoints are hidden from players unless this is true
+      title: M364 Admin Center
