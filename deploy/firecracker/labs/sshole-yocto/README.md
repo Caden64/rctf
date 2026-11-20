@@ -123,6 +123,17 @@ pinned release; only `TCLIBC` differs between the two build directories.
   (recipe present, digest unchanged, no `CVE-2026-123158` patch) and fails
   closed if the release ever changes under it; the fallback then is pinning
   a vulnerable openssh recipe in this layer, as documented in RESULTS.md.
+- **Two build-graph adjustments in this layer, both build-time only and
+  image-content-neutral:** (1) the image recipe drops the
+  `qemux86-64` machine include's `qemu-system-native`/`qemu-helper`
+  EXTRA_IMAGEDEPENDS (a runqemu convenience the lab never uses; qemu 10.2
+  does not compile against this environment's newer kernel uapi headers);
+  (2) a busybox config fragment enables `CONFIG_NC_EXTRA`, because the frozen
+  guest init fetches MMDS with `nc -w` and poky's stock defconfig builds the
+  minimal `nc` without `-w` (a busybox `do_configure` assertion in this
+  layer fails the build if the fragment ever stops taking effect). Neither
+  touches the vulnerable stack (musl libc, stock openssh 10.3p1, no PAM,
+  the accounts).
 - **Kernel:** the images boot the pinned shared smoke kernel
   (`../smoke/`, vmlinux 6.1.155, `e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`)
   like every other lab; the **rootfs** is what must be (and is) genuine
@@ -166,11 +177,15 @@ to bob. This is the same approach the sibling Alpine lab takes.
 `shouldDisplay: true`). Per-team flags come from the platform's
 `flags/static` provider at the event and are delivered to each instance
 **only through MMDS**. The guest init writes them root-only (0400) on the
-tmpfs `/run/rctf/flags/<provider>`; `/app/start` republishes the `main`
-flag as `/run/rctf/flag.txt` (mode 0644, same tmpfs — never the ext4) so
-the bypassed `alice` session can read it. `run.sh` asserts exactly that
-against the real instance. **No real flag is ever committed**; the
-registration YAML carries the same placeholder as the sample.
+tmpfs `/run/rctf/flags/<provider>`; `/app/start` then opens **traversal
+only** on the tmpfs path (`chmod 0755 /run /run/rctf` — the flags directory
+itself stays 0700, so every unpublished flag remains root-only) and
+republishes the `main` flag as `/run/rctf/flag.txt` (mode 0644, same tmpfs —
+never the ext4) so the bypassed `alice` session can read it. `run.sh` asserts
+exactly that against the real instance, including that a second team's
+bypassed session reads **its own** flag and never team A's. **No real flag is
+ever committed**; the registration YAML carries the same placeholder as the
+sample.
 
 ## Requirements
 
