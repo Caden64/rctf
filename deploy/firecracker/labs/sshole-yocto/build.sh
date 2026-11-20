@@ -227,8 +227,13 @@ assert_common_guest() { # <root> <image> <libc>
     die "$image: alice's group entry is missing"
   grep -qx 'bob:x:1001:' "$root/etc/group" ||
     die "$image: bob's group entry is missing"
-  [ "$(stat -c %a "$root/etc/shadow")" = 600 ] ||
-    die "$image: /etc/shadow is not mode 0600"
+  # /etc/shadow must be root-only (OE's shadow package ships 0400; the Alpine
+  # sibling lab's hand-staged images used 0600 - both are strict, anything
+  # group/world-readable fails the build).
+  local smode
+  smode=$(stat -c %a "$root/etc/shadow")
+  [ "$smode" = 400 ] || [ "$smode" = 600 ] ||
+    die "$image: /etc/shadow is mode $smode, expected 0400/0600"
 
   # The rCTF guest init needs busybox ip/nc applets in the image.
   local found=

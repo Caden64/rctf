@@ -23,10 +23,10 @@ chmod 0700 /run/sshd
 # mkfs.ext4 -d preserves the build user's numeric ownership, and the build
 # runs unprivileged as the lab user (uid 1000 on the build host == alice in
 # the guest). Files sshd must own as root are re-chowned here, at runtime,
-# where we run as root. /etc/shadow must never be readable by alice.
+# where we run as root. /etc/shadow keeps the strict mode the distro set
+# (OE's shadow package ships 0400; ownership is the only thing fixed here).
 chown 0:0 /etc/passwd /etc/group /etc/shadow /etc/ssh /run/sshd 2>/dev/null || true
 chown 1001:1001 /home/bob 2>/dev/null || true
-chmod 0600 /etc/shadow
 
 # Publish the per-run flag for the bypassed user. /run is a verified tmpfs.
 if [ -f "${RCTF_FLAGS_DIR:-/run/rctf/flags}/main" ]; then
